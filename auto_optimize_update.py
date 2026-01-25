@@ -28,7 +28,7 @@ import time
 warnings.filterwarnings('ignore')
 
 # Configure logging
-logger.add('log/ml_optimizer_update.log', retention='7 days', rotation="10 MB")
+logger.add('/home/bumblebee/Project/optimize/log/ml_optimizer_update.log', retention='7 days', rotation="10 MB")
 
 # Check for GPU
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -38,9 +38,9 @@ PIN_MEMORY = True if torch.cuda.is_available() else False
 @dataclass
 class MLOptimizerConfig:
     """Configuration for the ML Optimizer"""
-    db_path: str = 'data/lending_history.db'
-    model_save_path: str = 'data/ml_models_update/'
-    cache_dir: str = 'data/ml_cache_update/'
+    db_path: str = '/home/bumblebee/Project/optimize/data/lending_history.db'
+    model_save_path: str = '/home/bumblebee/Project/optimize/data/ml_models_update/'
+    cache_dir: str = '/home/bumblebee/Project/optimize/data/ml_cache_update/'
     periods: List[int] = field(default_factory=lambda: [2, 3, 4, 5, 6, 7, 10, 14, 15, 20, 30, 60, 90, 120])
     currencies: List[str] = field(default_factory=lambda: ['fUST', 'fUSD'])
     lookback_days_list: List[int] = field(default_factory=lambda: [7, 15, 30, 60, 90])
@@ -757,6 +757,14 @@ def main():
     print(f"🚀 High-Performance ML Optimizer (RTX 5090 Ready)")
     print(f"   Device: {DEVICE}")
     
+    import shutil
+    if os.path.exists(config.model_save_path):
+        shutil.rmtree(config.model_save_path)
+        os.makedirs(config.model_save_path)
+
+    from funding_history_downloader import main as downloader
+    downloader()
+
     opt = get_optimizer()
     start = time.time()
     result = opt.find_optimal_combination()
@@ -769,7 +777,7 @@ def main():
         print(f"   Time: {dur:.2f}s")
         
         # Save files
-        with open('data/optimal_combination_update.json', 'w') as f:
+        with open('/home/bumblebee/Project/optimize/data/optimal_combination_update.json', 'w') as f:
             json.dump(result, f, indent=2, default=str)
             
         simple = {
@@ -780,7 +788,7 @@ def main():
             'expected_return': best['expected_return'],
             'timestamp': result['analysis_timestamp']
         }
-        with open('data/optimal_simple_update.json', 'w') as f:
+        with open('/home/bumblebee/Project/optimize/data/optimal_simple_update.json', 'w') as f:
             json.dump(simple, f, indent=2, default=str)
     else:
         print(f"❌ Error: {result.get('message')}")
