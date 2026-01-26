@@ -1,116 +1,139 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
 import uvicorn
 import json
 import os
-import sys
-import subprocess
-from loguru import logger
-from datetime import datetime
 import asyncio
+from datetime import datetime
+from loguru import logger
 
-# 添加父目录到 path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ml_engine.predictor import LendingPredictor
-
-app = FastAPI(title="Lending Optimization API", version="2.0")
+app = FastAPI(title="Lending Optimization API", version="3.0")
 
 DATA_FILE = "data/optimal_combination.json"
 STATUS_FILE = "data/service_status.json"
 
-# 全局 Predictor 实例 (Lazy loading)
-_predictor = None
-
-def get_predictor():
-    global _predictor
-    if _predictor is None:
-        _predictor = LendingPredictor()
-    return _predictor
-
-def update_status(status: str, details: str = ""):
+# --- 辅助函数: 状态管理 ---
+def update_status(status: str, step: str = "", details: str = ""):
+    """更新服务状态文件"""
+    info = {
+        "status": status,         # 'online' (空闲在线), 'processing' (正在运行任务), 'error' (出错)
+        "current_step": step,     # 当前正在执行的步骤
+        "last_update": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "details": details
+    }
     with open(STATUS_FILE, 'w') as f:
-        json.dump({
-            "status": status,
-            "last_update": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            "details": details
-        }, f)
+        json.dump(info, f, indent=4)
 
-async def run_pipeline():
+def get_current_status():
+    """读取当前状态"""
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {"status": "unknown", "details": "Status file not found"}
+
+# --- 核心逻辑: 全量更新流水线 ---
+async def run_full_pipeline():
     """
-    运行完整的数据更新和预测流水线
+    后台任务: 执行完整的数据更新与模型训练流程
+    步骤: 下载 -> 清洗 -> 训练 -> 预测
     """
-    logger.info("Starting pipeline update...")
-    update_status("running", "Downloading data...")
+    logger.info(">>> Starting full update pipeline...")
     
-    try:
-        # 1. 下载数据 (调用现有脚本)
-        # 使用 subprocess 调用 funding_history_downloader.py
-        # 注意：这里假设 downloader 可以在当前环境下运行
-        logger.info("Running downloader...")
-        process = await asyncio.create_subprocess_exec(
-            "python", "../funding_history_downloader.py",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
+    # 定义流水线步骤 (显示名称, 命令行指令)
+    steps = [
+        ("1. Downloading Data", ["python", "funding_history_downloader.py"]),
+        ("2. Processing Features", ["python", "ml_engine/data_processor.py"]),
+        ("3. Re-training Models", ["python", "ml_engine/model_trainer.py"]),
+        ("4. Generating Predictions", ["python", "ml_engine/predictor.py"])
+    ]
+    
+    for step_name, command in steps:
+        update_status("processing", step_name, "Executing...")
+        logger.info(f"Running: {step_name}")
         
-        if process.returncode != 0:
-            logger.error(f"Downloader failed: {stderr.decode()}")
-            update_status("error", "Downloader failed")
+        try:
+            # 使用子进程调用脚本，确保内存独立且环境干净
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            # 等待完成
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                err_msg = stderr.decode().strip() or stdout.decode().strip()
+                logger.error(f"{step_name} Failed: {err_msg}")
+                update_status("error", step_name, f"Failed: {err_msg[-200:]}") # 只记录最后200字符
+                return
+            
+        except Exception as e:
+            logger.error(f"Pipeline System Error: {e}")
+            update_status("error", step_name, str(e))
             return
 
-        # 2. 预测生成 (使用我们的高效模块)
-        logger.info("Generating recommendations...")
-        update_status("running", "Predicting...")
-        
-        predictor = get_predictor()
-        # 注意：Predictor 每次都会重新加载最新数据，因为 load_data 是读文件的
-        # 但为了效率，我们可以只让它读最新的 (目前逻辑是读全部，鉴于速度够快先保持)
-        predictor.generate_recommendations(DATA_FILE)
-        
-        update_status("idle", "Update completed successfully")
-        logger.info("Pipeline completed.")
-        
-    except Exception as e:
-        logger.error(f"Pipeline error: {e}")
-        update_status("error", str(e))
+    # 全部完成
+    logger.info("<<< Pipeline completed successfully.")
+    update_status("online", "Idle", "Last update completed at " + datetime.now().strftime('%H:%M:%S'))
 
-@app.get("/")
-def health_check():
-    status = {"status": "unknown"}
-    if os.path.exists(STATUS_FILE):
-        with open(STATUS_FILE, 'r') as f:
-            status = json.load(f)
+# --- API 接口定义 ---
+
+# 1. 确认 API 是否在线 (Health Check)
+@app.get("/status")
+def check_status():
+    """
+    返回 API 在线状态及当前后台��务进度
+    """
     return {
-        "service": "Lending Optimization API", 
-        "version": "2.0",
-        "pipeline_status": status
+        "api_online": True,
+        "service_info": get_current_status()
     }
 
-@app.get("/recommendation")
-def get_recommendation():
+# 2. 获取预测结果 JSON (Get Results)
+@app.get("/result")
+def get_result():
     """
-    获取最新的放贷组合建议
+    返回最新的预测结果 (optimal_combination.json)
     """
     if not os.path.exists(DATA_FILE):
-        return JSONResponse(status_code=404, content={"error": "No recommendations available yet. Please trigger an update."})
+        return JSONResponse(status_code=404, content={
+            "error": "No predictions found.",
+            "suggestion": "Please call /update to generate data."
+        })
     
-    with open(DATA_FILE, 'r') as f:
-        data = json.load(f)
-    return data
+    try:
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Failed to read data: {str(e)}"})
 
-@app.post("/trigger_update")
+# 3. 重新下载/训练/预测 (Trigger Update)
+@app.post("/update")
 async def trigger_update(background_tasks: BackgroundTasks):
     """
-    手动触发一次数据更新和预测
+    触发后台全量更新: 下载新数据 -> 重新训练模型 -> 生成新预测
     """
-    background_tasks.add_task(run_pipeline)
-    return {"message": "Update pipeline triggered in background."}
+    current = get_current_status()
+    if current.get("status") == "processing":
+        return JSONResponse(status_code=409, content={
+            "status": "busy",
+            "message": f"Pipeline is already running: {current.get('current_step')}"
+        })
+
+    # 添加到后台任务队列，立即响应
+    background_tasks.add_task(run_full_pipeline)
+    
+    return {
+        "status": "accepted",
+        "message": "Full update pipeline started. Check /status for progress."
+    }
 
 if __name__ == "__main__":
-    # 确保 data 目录存在
-    os.makedirs("data", exist_ok=True)
-    update_status("idle", "Service started")
-    
-    # 启动服务器
+    # 初始化状态
+    update_status("online", "Idle", "Service started")
+    # 启动服务
     uvicorn.run(app, host="0.0.0.0", port=8000)
