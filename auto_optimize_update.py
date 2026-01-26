@@ -22,7 +22,10 @@ from dataclasses import dataclass, field
 import psutil
 import multiprocessing
 import math
-from flask import Flask, jsonify, request
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import JSONResponse
+import uvicorn
+import asyncio
 import time
 
 warnings.filterwarnings('ignore')
@@ -468,7 +471,14 @@ class OptimizedPredictor:
         # Save scalers
         with open(scaler_path, 'wb') as f:
             pickle.dump({'scaler_X': self.scaler_X, 'scaler_y': self.scaler_y}, f)
-            
+
+        # Clean up GPU memory after training
+        del train_loader, val_loader, train_ds, val_ds, dataset
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("GPU memory cleaned after training")
+
         return True
 
     def predict_combination(self, currency: str, period: int):
@@ -604,7 +614,10 @@ class OptimizedPredictor:
         # Sort by score
         results.sort(key=lambda x: x['composite_score'], reverse=True)
         optimal = results[0]
-        
+
+        # Clean up GPU memory after all predictions
+        self.cleanup_gpu_memory()
+
         return {
             'optimal_combination': {
                 'currency': optimal['currency'],
@@ -641,10 +654,58 @@ class OptimizedPredictor:
         except:
             return {}
 
+    def cleanup_gpu_memory(self):
+        """Clean up GPU memory after inference/training"""
+        try:
+            # Move model to CPU to free GPU memory
+            if self.model is not None and torch.cuda.is_available():
+                self.model.cpu()
+                logger.info("Model moved to CPU")
+
+            # Clear CUDA cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                logger.info("CUDA cache cleared")
+
+            # Force garbage collection
+            gc.collect()
+
+            # Log memory stats
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(0) / 1e9
+                logger.info(f"GPU memory after cleanup: {allocated:.2f} GB")
+        except Exception as e:
+            logger.warning(f"Error during GPU cleanup: {e}")
+
 # --- API & Main ---
-app = Flask(__name__)
+app = FastAPI(title="Lending Optimization API (Update)", version="4.0")
 config = MLOptimizerConfig()
 optimizer_instance = None
+
+STATUS_FILE = '/home/bumblebee/Project/optimize/data/service_status_update.json'
+
+# --- Status Management Functions ---
+def update_status(status: str, step: str = "", details: str = ""):
+    """Update service status file"""
+    info = {
+        "status": status,  # 'online' (idle), 'processing' (running task), 'error' (error)
+        "current_step": step,
+        "last_update": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "details": details
+    }
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(info, f, indent=4)
+
+def get_current_status():
+    """Read current status"""
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {"status": "unknown", "details": "Status file not found"}
 
 def get_optimizer():
     global optimizer_instance
@@ -652,113 +713,178 @@ def get_optimizer():
         optimizer_instance = OptimizedPredictor(config)
     return optimizer_instance
 
-@app.route('/api/ml/optimize', methods=['GET'])
-def optimize():
-    opt = get_optimizer()
-    force = request.args.get('force_retrain', 'false').lower() == 'true'
-    download_history = request.args.get('download', 'false').lower() == 'true'
+# --- Background Task: Full Optimization Pipeline ---
+async def run_optimization_pipeline(force_retrain: bool = False, download_history: bool = False):
+    """
+    Background task: Execute full optimization pipeline
+    Steps: Download -> Train -> Predict
+    """
+    logger.info(">>> Starting optimization pipeline...")
+    update_status("processing", "Initializing", "Starting optimization")
 
-    if force:
-        import shutil
-        if os.path.exists(config.model_save_path):
-            shutil.rmtree(config.model_save_path)
-            os.makedirs(config.model_save_path)
-
-    if download_history:
-        # 下载最新数据
-        from funding_history_downloader import main as downloader
-        downloader()
-        
-    result = opt.find_optimal_combination()
-    
-    with open('data/optimal_combination_update.json', 'w') as f:
-        json.dump(result, f, indent=2, default=str)
-        
-    return jsonify(result)
-
-@app.route('/api/ml/optimal_combination', methods=['GET'])
-def get_optimal_combination():
-    """读取本地optimal_combination_update.json文件并返回结果"""
     try:
-        file_path = 'data/optimal_combination_update.json'
-        
-        # 检查文件是否存在
-        if not os.path.exists(file_path):
-            return jsonify({
-                'status': 'error',
-                'message': f'File not found: {file_path}',
-                'suggestions': [
-                    'Run the optimization first using /api/ml/optimize',
-                    'Check if the data directory exists',
-                    'Ensure the program has write permissions'
-                ]
-            }), 404
-        
-        # 读取JSON文件
+        # Step 1: Download data if requested
+        if download_history:
+            update_status("processing", "Downloading Data", "Fetching latest data from Bitfinex")
+            logger.info("Downloading historical data...")
+            try:
+                from funding_history_downloader import main as downloader
+                await asyncio.to_thread(downloader)
+            except Exception as e:
+                logger.error(f"Download failed: {e}")
+                update_status("error", "Download Failed", str(e))
+                return
+
+        # Step 2: Force retrain if requested
+        if force_retrain:
+            update_status("processing", "Clearing Models", "Removing old model files")
+            logger.info("Clearing old models...")
+            import shutil
+            if os.path.exists(config.model_save_path):
+                shutil.rmtree(config.model_save_path)
+                os.makedirs(config.model_save_path)
+
+        # Step 3: Run optimization
+        update_status("processing", "Training & Predicting", "Running ML optimization")
+        logger.info("Running optimization...")
+        opt = get_optimizer()
+        result = await asyncio.to_thread(opt.find_optimal_combination)
+
+        # Step 4: Save results
+        update_status("processing", "Saving Results", "Writing output files")
+        with open('data/optimal_combination_update.json', 'w') as f:
+            json.dump(result, f, indent=2, default=str)
+
+        # Save simple version
+        if result.get('status') == 'success':
+            opt_res = result['optimal_combination']
+            simple = {
+                'currency': opt_res['currency'],
+                'period': opt_res['period'],
+                'rate': opt_res['rate'],
+                'trade_probability': opt_res['trade_probability'],
+                'expected_return': opt_res['expected_return'],
+                'timestamp': result['analysis_timestamp']
+            }
+            with open('data/optimal_simple_update.json', 'w') as f:
+                json.dump(simple, f, indent=2, default=str)
+
+        logger.info("<<< Pipeline completed successfully.")
+        update_status("online", "Idle", f"Last update completed at {datetime.now().strftime('%H:%M:%S')}")
+
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}")
+        update_status("error", "Optimization Failed", str(e))
+    finally:
+        # Always clean up GPU memory after pipeline completion
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+            logger.info("Pipeline GPU cleanup completed")
+        except Exception as cleanup_error:
+            logger.warning(f"GPU cleanup error: {cleanup_error}")
+
+# --- API Endpoints ---
+
+# 1. Health Check
+@app.get("/health")
+def health():
+    """Check API health and GPU availability"""
+    return {
+        "status": "healthy",
+        "gpu": torch.cuda.is_available(),
+        "device": str(DEVICE)
+    }
+
+# 2. Status Check
+@app.get("/status")
+def check_status():
+    """
+    Return API online status and current background task progress
+    """
+    return {
+        "api_online": True,
+        "service_info": get_current_status()
+    }
+
+# 3. Get Latest Results
+@app.get("/result")
+def get_result():
+    """
+    Return latest prediction results (optimal_combination_update.json)
+    """
+    file_path = 'data/optimal_combination_update.json'
+
+    if not os.path.exists(file_path):
+        return JSONResponse(status_code=404, content={
+            "error": "No predictions found.",
+            "suggestion": "Please call /update to generate data."
+        })
+
+    try:
         with open(file_path, 'r') as f:
             data = json.load(f)
-        
-        # 添加文件信息
+
+        # Add file info
         file_info = {
             'file_path': file_path,
             'file_size_kb': os.path.getsize(file_path) / 1024,
             'last_modified': datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat(),
             'read_timestamp': datetime.now().isoformat()
         }
-        
-        # 合并数据
-        response_data = {
+
+        return {
             'status': 'success',
             'file_info': file_info,
             **data
         }
-        
-        return jsonify(response_data)
-        
     except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error for {file_path}: {e}")
-        return jsonify({
-            'status': 'error',
-            'message': 'Invalid JSON format in file',
-            'error': str(e)
-        }), 500
-        
-    except Exception as e:
-        logger.error(f"Error reading optimal_combination.json: {e}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-@app.route('/api/ml/simple_optimize', methods=['GET'])
-def simple_optimize():
-    opt = get_optimizer()
-    result = opt.find_optimal_combination()
-    if result['status'] == 'success':
-        opt_res = result['optimal_combination']
-        return jsonify({
-            'status': 'success',
-            'currency': opt_res['currency'],
-            'period': opt_res['period'],
-            'rate': opt_res['rate'],
-            'trade_probability': opt_res['trade_probability'],
-            'expected_return': opt_res['expected_return'],
-            'timestamp': result['analysis_timestamp']
+        logger.error(f"JSON decode error: {e}")
+        return JSONResponse(status_code=500, content={
+            "error": "Invalid JSON format in file",
+            "details": str(e)
         })
-    return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error reading result file: {e}")
+        return JSONResponse(status_code=500, content={
+            "error": str(e)
+        })
 
-@app.route('/api/ml/health', methods=['GET'])
-def health():
-    return jsonify({
-        'status': 'healthy',
-        'gpu': torch.cuda.is_available(),
-        'device': str(DEVICE)
-    })
+# 4. Trigger Update
+@app.post("/update")
+async def trigger_update(background_tasks: BackgroundTasks, force_retrain: bool = False, download: bool = False):
+    """
+    Trigger background full update: Download data -> Retrain model -> Generate predictions
+
+    Query parameters:
+    - force_retrain: Clear and retrain all models (default: false)
+    - download: Download latest data from Bitfinex (default: false)
+    """
+    current = get_current_status()
+    if current.get("status") == "processing":
+        return JSONResponse(status_code=409, content={
+            "status": "busy",
+            "message": f"Pipeline is already running: {current.get('current_step')}"
+        })
+
+    # Add to background task queue
+    background_tasks.add_task(run_optimization_pipeline, force_retrain, download)
+
+    return {
+        "status": "accepted",
+        "message": "Optimization pipeline started. Check /status for progress.",
+        "parameters": {
+            "force_retrain": force_retrain,
+            "download_history": download
+        }
+    }
 
 def main():
     print(f"🚀 High-Performance ML Optimizer (RTX 5090 Ready)")
     print(f"   Device: {DEVICE}")
-    
+
     import shutil
     if os.path.exists(config.model_save_path):
         shutil.rmtree(config.model_save_path)
@@ -771,17 +897,17 @@ def main():
     start = time.time()
     result = opt.find_optimal_combination()
     dur = time.time() - start
-    
+
     if result.get('status') == 'success':
         best = result['optimal_combination']
         print(f"\n✅ Optimal: {best['currency']} for {best['period']} days")
         print(f"   Rate: {best['rate']:.4f}% | Score: {result['detailed_metrics']['composite_score']:.4f}")
         print(f"   Time: {dur:.2f}s")
-        
+
         # Save files
         with open('/home/bumblebee/Project/optimize/data/optimal_combination_update.json', 'w') as f:
             json.dump(result, f, indent=2, default=str)
-            
+
         simple = {
             'currency': best['currency'],
             'period': best['period'],
@@ -798,6 +924,9 @@ def main():
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == '--api':
-        app.run(host='0.0.0.0', port=5000)
+        # Initialize status
+        update_status("online", "Idle", "Service started")
+        # Start FastAPI server
+        uvicorn.run(app, host='0.0.0.0', port=5000)
     else:
         main()
