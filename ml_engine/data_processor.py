@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict
 
 class DataProcessor:
-    def __init__(self, db_path: str = "data/lending_history.db"):
+    def __init__(self, db_path: str = "../data/lending_history.db"):
         self.db_path = db_path
         self.conn = None
 
@@ -88,17 +88,19 @@ class DataProcessor:
         # 这里为了高效，我们直接用 shift 后的 rolling
         indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=120)
         df['future_min_120'] = df['low_annual'].rolling(window=indexer).min()
-        df['future_q20_120'] = df['low_annual'].rolling(window=indexer).quantile(0.2)
         
-        # 辅助目标：未来2小时是否会暴跌？ (未来均值 < 当前价格 * 0.95)
-        df['future_mean_120'] = df['close_annual'].rolling(window=indexer).mean()
+        # Target 1: 保守成交价 (High Certainty) - 对应 "确保成交"
+        df['future_conservative'] = df['low_annual'].rolling(window=indexer).quantile(0.2)
+        
+        # Target 2: 激进成交价 (High Yield) - 对应 "收益足够高" (未来均价)
+        df['future_aggressive'] = df['close_annual'].rolling(window=indexer).mean()
         
         # 清理 NaN (因为 rolling 和 shift 会产生 NaN)
         df = df.dropna()
         
         return df
 
-    def process_currency(self, currency: str, output_dir: str = "data/processed"):
+    def process_currency(self, currency: str, output_dir: str = "../data/processed"):
         """
         处理单个币种的全流程：加载 -> 特征工程 -> 保存
         """

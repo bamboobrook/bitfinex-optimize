@@ -526,16 +526,19 @@ class OptimizedPredictor:
             # Metrics
             metrics = self.data_loader.calculate_trade_metrics(sub_df, prediction)
             
-            # Scoring Logic (Keeping original heuristics)
-            period_factor = 1.0 / (period ** 0.3)
+            # Scoring Logic (Updated: removed period factor bias)
+            # Score now based purely on yield rate and trade probability
             risk_adjustment = max(0.5, 1.0 - abs(metrics['max_drawdown']) * 3)
-            expected_return = prediction * metrics['trade_probability'] * period_factor * risk_adjustment
-            
+
+            # Expected return without period bias
+            expected_return = prediction * metrics['trade_probability'] * risk_adjustment
+
             if metrics['avg_yield'] > 0:
                 stability = 1.0 - min(1.0, metrics['std_yield'] / metrics['avg_yield'])
             else:
                 stability = 0.5
-                
+
+            # Score emphasizes high yield and high probability
             score = expected_return * (1.0 + stability * 0.5) * (1.0 + metrics['sharpe_ratio'] / 10.0)
             
             results_per_lookback.append({
@@ -545,8 +548,7 @@ class OptimizedPredictor:
                 'trade_probability': metrics['trade_probability'],
                 'expected_return': expected_return,
                 'score': score,
-                'metrics': metrics,
-                'period_factor': period_factor
+                'metrics': metrics
             })
             
         if not results_per_lookback:

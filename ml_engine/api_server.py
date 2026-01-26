@@ -7,10 +7,12 @@ import asyncio
 from datetime import datetime
 from loguru import logger
 
+logger.add('/home/bumblebee/Project/optimize/log/ml_optimizer.log', retention='7 days', rotation="10 MB")
+
 app = FastAPI(title="Lending Optimization API", version="3.0")
 
-DATA_FILE = "data/optimal_combination.json"
-STATUS_FILE = "data/service_status.json"
+DATA_FILE = "../data/optimal_combination.json"
+STATUS_FILE = "../data/service_status.json"
 
 # --- 辅助函数: 状态管理 ---
 def update_status(status: str, step: str = "", details: str = ""):
@@ -44,10 +46,10 @@ async def run_full_pipeline():
     
     # 定义流水线步骤 (显示名称, 命令行指令)
     steps = [
-        ("1. Downloading Data", ["python", "funding_history_downloader.py"]),
-        ("2. Processing Features", ["python", "ml_engine/data_processor.py"]),
-        ("3. Re-training Models", ["python", "ml_engine/model_trainer.py"]),
-        ("4. Generating Predictions", ["python", "ml_engine/predictor.py"])
+        ("1. Downloading Data", ["python", "../funding_history_downloader.py"]),
+        ("2. Processing Features", ["python", "./data_processor.py"]),
+        ("3. Re-training Models", ["python", "./model_trainer.py"]),
+        ("4. Generating Predictions", ["python", "./predictor.py"])
     ]
     
     for step_name, command in steps:
@@ -136,4 +138,4 @@ if __name__ == "__main__":
     # 初始化状态
     update_status("online", "Idle", "Service started")
     # 启动服务
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)
