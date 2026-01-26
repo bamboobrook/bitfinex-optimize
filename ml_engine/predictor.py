@@ -1,5 +1,7 @@
 import pandas as pd
 import xgboost as xgb
+import lightgbm as lgb
+from catboost import CatBoostRegressor, CatBoostClassifier
 import json
 import os
 import sys
@@ -7,138 +9,272 @@ from loguru import logger
 from datetime import datetime
 import numpy as np
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # 添加父目录到 path 以便导入
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ml_engine.data_processor import DataProcessor
 
-class LendingPredictor:
-    def __init__(self, model_dir="../data/models"):
+class EnsemblePredictor:
+    """使用集成模型的增强预测器 - 支持GPU加速和并行化"""
+
+    def __init__(self, model_dir="../data/models", max_workers=8):
         self.model_dir = model_dir
-        self.models = {} # {curr: {'conservative': model, 'aggressive': model}}
-        self.features = {}
+        self.max_workers = max_workers  # 并行worker数量
+        self.models = {}  # {curr: {model_type: {algo: model}}}
+        self.meta_info = {}  # {curr: {model_type: {weights, features, task_type}}}
         self.processor = DataProcessor()
-        
-        # 加载模型
+
+        # 加载所有模型
+        self.load_all_models()
+
+    def load_ensemble_models(self, currency: str, prefix: str):
+        """
+        加载单个集成模型的所有组件
+
+        Args:
+            currency: 币种 (fUSD, fUST)
+            prefix: 模型前缀 (model_execution_prob, model_conservative, etc.)
+        """
+        models = {}
+
+        # 加载XGBoost
+        xgb_path = os.path.join(self.model_dir, f"{currency}_{prefix}_xgb.json")
+        if os.path.exists(xgb_path):
+            models['xgb'] = xgb.Booster()
+            models['xgb'].load_model(xgb_path)
+
+        # 加载LightGBM
+        lgb_path = os.path.join(self.model_dir, f"{currency}_{prefix}_lgb.txt")
+        if os.path.exists(lgb_path):
+            models['lgb'] = lgb.Booster(model_file=lgb_path)
+
+        # 加载CatBoost
+        cat_path = os.path.join(self.model_dir, f"{currency}_{prefix}_cat.cbm")
+        meta_path = os.path.join(self.model_dir, f"{currency}_{prefix}_meta.json")
+
+        if os.path.exists(cat_path) and os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+
+            # 根据task_type加载对应的模型类型
+            if meta['task_type'] == 'classification':
+                models['cat'] = CatBoostClassifier()
+            else:
+                models['cat'] = CatBoostRegressor()
+            models['cat'].load_model(cat_path)
+
+            return models, meta
+        else:
+            logger.warning(f"Meta file not found for {currency}_{prefix}")
+            return models, None
+
+    def load_all_models(self):
+        """加载所有币种的所有模型"""
         for curr in ['fUSD', 'fUST']:
             self.models[curr] = {}
-            for m_type in ['model_conservative', 'model_aggressive']:
-                model_path = os.path.join(model_dir, f"{curr}_{m_type}.json")
-                if os.path.exists(model_path):
-                    # key simplified to 'conservative' or 'aggressive'
-                    key = m_type.split('_')[1] 
-                    self.models[curr][key] = xgb.Booster()
-                    self.models[curr][key].load_model(model_path)
-            
-            feature_path = os.path.join(model_dir, f"{curr}_features.json")
-            if os.path.exists(feature_path):
-                with open(feature_path, 'r') as f:
-                    self.features[curr] = json.load(f)
-            
-            logger.info(f"Loaded models for {curr}: {list(self.models[curr].keys())}")
+            self.meta_info[curr] = {}
+
+            for model_type in ['model_execution_prob', 'model_conservative',
+                              'model_aggressive', 'model_balanced']:
+                models, meta = self.load_ensemble_models(curr, model_type)
+
+                if models and meta:
+                    self.models[curr][model_type] = models
+                    self.meta_info[curr][model_type] = meta
+                    logger.info(f"Loaded {model_type} for {curr}")
+                else:
+                    logger.warning(f"Failed to load {model_type} for {curr}")
+
+    def predict_with_ensemble(self, X: pd.DataFrame, currency: str, model_type: str) -> np.ndarray:
+        """
+        使用集成模型进行预测
+
+        Args:
+            X: 特征数据
+            currency: 币种
+            model_type: 模型类型
+        Returns:
+            预测结果数组
+        """
+        if currency not in self.models or model_type not in self.models[currency]:
+            logger.error(f"Model not found: {currency} - {model_type}")
+            return np.array([])
+
+        models = self.models[currency][model_type]
+        meta = self.meta_info[currency][model_type]
+        weights = meta['weights']
+
+        # 获取各模型预测
+        predictions = {}
+
+        # XGBoost预测
+        if 'xgb' in models:
+            dtest = xgb.DMatrix(X)
+            predictions['xgb'] = models['xgb'].predict(dtest)
+
+        # LightGBM预测
+        if 'lgb' in models:
+            predictions['lgb'] = models['lgb'].predict(X)
+
+        # CatBoost预测
+        if 'cat' in models:
+            if meta['task_type'] == 'classification':
+                predictions['cat'] = models['cat'].predict_proba(X)[:, 1]
+            else:
+                predictions['cat'] = models['cat'].predict(X)
+
+        # 加权集成
+        ensemble_pred = np.zeros(len(X))
+        for algo, pred in predictions.items():
+            ensemble_pred += pred * weights.get(algo, 0.0)
+
+        return ensemble_pred
+
+    def predict_single_period(self, row_data: dict, feature_cols: list, currency: str) -> dict:
+        """
+        对单个period的数据进行预测（用于并行化）
+
+        Args:
+            row_data: 单行数据字典
+            feature_cols: 特征列列表
+            currency: 币种
+        Returns:
+            预测结果字典
+        """
+        # 构造特征DataFrame
+        X_single = pd.DataFrame([{col: row_data[col] for col in feature_cols}])
+
+        # 执行4个模型预测
+        pred_execution_prob = self.predict_with_ensemble(X_single, currency, 'model_execution_prob')[0]
+        pred_conservative = self.predict_with_ensemble(X_single, currency, 'model_conservative')[0]
+        pred_aggressive = self.predict_with_ensemble(X_single, currency, 'model_aggressive')[0]
+        pred_balanced = self.predict_with_ensemble(X_single, currency, 'model_balanced')[0]
+
+        # 智能定价策略
+        prob = float(pred_execution_prob)
+        p_cons = float(pred_conservative)
+        p_aggr = float(pred_aggressive)
+        p_bal = float(pred_balanced)
+
+        # 根据成交概率动态选择策略
+        if prob < 0.5:
+            base_rate = p_cons
+            strategy_desc = "High Certainty (Low Prob)"
+            confidence = "Low"
+        elif prob > 0.8:
+            base_rate = p_aggr * 0.7 + p_bal * 0.3
+            strategy_desc = "High Yield (High Prob)"
+            confidence = "High"
+        else:
+            base_rate = p_bal
+            strategy_desc = "Balanced"
+            confidence = "Medium"
+
+        # 趋势修正
+        trend = float(row_data.get('rate_chg_60', 0))
+        trend_factor = np.clip(trend / 5.0, -1.0, 1.0)
+        trend_adjustment = trend_factor * 0.15 * base_rate
+        final_rate = base_rate + trend_adjustment
+
+        # 安全边界检查
+        current_rate = float(row_data['close_annual'])
+        final_rate = np.clip(final_rate, current_rate * 0.6, current_rate * 1.1)
+
+        return {
+            "currency": currency,
+            "period": int(row_data['period']),
+            "current_rate": current_rate,
+            "predicted_rate": float(final_rate),
+            "execution_probability": prob,
+            "conservative_rate": p_cons,
+            "aggressive_rate": p_aggr,
+            "balanced_rate": p_bal,
+            "trend_factor": trend,
+            "strategy": strategy_desc,
+            "confidence": confidence,
+            "timestamp": row_data['datetime'].strftime('%Y-%m-%d %H:%M:%S')
+        }
 
     def get_latest_predictions(self):
+        """获取最新预测结果 - 并行化版本"""
         all_predictions = []
-        
+
         for curr in ['fUSD', 'fUST']:
-            if not self.models[curr]:
+            if not self.models.get(curr):
+                logger.warning(f"No models loaded for {curr}")
                 continue
-                
+
             logger.info(f"Fetching data for {curr}...")
             df = self.processor.load_data(curr)
-            
+
             if df.empty:
                 continue
-                
+
             # 特征工程
             def process_group(group):
                 return self.processor.add_technical_indicators(group)
 
             df_features = df.groupby('period', group_keys=False).apply(process_group)
-            
-            # 最新��态
+
+            # 获取每个period的最新数据
             latest_data = df_features.groupby('period').tail(1).copy()
-            feature_cols = self.features[curr]
-            
-            X_latest = latest_data[feature_cols]
-            dtest = xgb.DMatrix(X_latest)
-            
-            # 双模型预测
-            pred_cons = self.models[curr]['conservative'].predict(dtest)
-            pred_aggr = self.models[curr]['aggressive'].predict(dtest)
-            
-            # 策略融合计算
-            for idx, row in latest_data.iterrows():
-                i = latest_data.index.get_loc(idx)
-                p_cons = float(pred_cons[i])
-                p_aggr = float(pred_aggr[i])
-                
-                # 动态策略逻辑：
-                # 1. 计算动量趋势 (rate_chg_60)
-                #    如果最近1小时利率在涨 (trend > 0)，我们更倾向于 aggressive
-                #    如果最近1小时利率在跌 (trend < 0)，我们回退到 conservative
-                trend = float(row.get('rate_chg_60', 0))
-                
-                # 归一化 Trend 因子 (假设 +- 5% 年化变化是强趋势)
-                trend_factor = np.clip(trend / 5.0, -1.0, 1.0) # -1 to 1
-                
-                # 基础权重：默认偏激进 (0.6 Aggressive, 0.4 Conservative) 以满足 "收益足够高"
-                base_weight_aggr = 0.6
-                
-                # 根据趋势调整权重
-                # 趋势向上 -> 增加 Aggressive 权重
-                # 趋势向下 -> 减少 Aggressive 权重
-                final_weight_aggr = np.clip(base_weight_aggr + (trend_factor * 0.3), 0.0, 1.0)
-                
-                # 混合定价
-                target_rate = (p_aggr * final_weight_aggr) + (p_cons * (1.0 - final_weight_aggr))
-                
-                # 兜底逻辑：如果 Aggressive 比 Conservative 还低 (倒挂)，说明市场极度看空
-                # 此时直接取最小值，保证成交
-                if p_aggr < p_cons:
-                    target_rate = p_aggr
-                    strategy_desc = "Bearish Escape"
-                else:
-                    strategy_desc = f"Dynamic (Aggr Weight: {final_weight_aggr:.2f})"
-                
-                all_predictions.append({
-                    "currency": curr,
-                    "period": int(row['period']),
-                    "current_rate": float(row['close_annual']),
-                    "predicted_rate": float(target_rate),
-                    "conservative_rate": p_cons,
-                    "aggressive_rate": p_aggr,
-                    "trend_factor": trend,
-                    "strategy": strategy_desc,
-                    "timestamp": row['datetime'].strftime('%Y-%m-%d %H:%M:%S')
-                })
-        
+
+            # 准备特征
+            meta = self.meta_info[curr]['model_conservative']
+            feature_cols = meta['feature_cols']
+
+            # 并行化预测
+            logger.info(f"Starting parallel predictions for {curr} with {self.max_workers} workers...")
+
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # 创建预测任务
+                futures = []
+                for idx, row in latest_data.iterrows():
+                    row_dict = row.to_dict()
+                    future = executor.submit(self.predict_single_period, row_dict, feature_cols, curr)
+                    futures.append(future)
+
+                # 收集结果
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        all_predictions.append(result)
+                    except Exception as e:
+                        logger.error(f"Prediction failed: {e}")
+
+            logger.info(f"Completed predictions for {curr}: {len(all_predictions)} results")
+
         return all_predictions
 
     def generate_recommendations(self, output_path="../data/optimal_combination.json"):
+        """生成推荐结果并保存"""
         preds = self.get_latest_predictions()
         if not preds:
             logger.warning("No predictions generated.")
             return
-            
-        # 排序逻辑优化：
-        # 1. 过滤掉 "过低" 的利率 (比如 < 当前市场价的 50%，或者绝对值太低)
-        # 2. 按 "Predicted Rate" (收益) 降序排列 -> 满足 "收益足够高"
-        
-        # 简单过滤
-        valid_preds = [p for p in preds if p['predicted_rate'] > 1.0] # 至少大于 1%
-        
-        # 排序
-        sorted_preds = sorted(valid_preds, key=lambda x: x['predicted_rate'], reverse=True)
-        
+
+        # 排序逻辑：
+        # 1. 优先考虑成交概率 >= 0.5 的选项
+        # 2. 在成交概率合格的基础上，按预测利率降序排列
+        valid_preds = [p for p in preds if p['predicted_rate'] > 1.0]
+
+        # 按成交概率和预测利率综合排序
+        sorted_preds = sorted(
+            valid_preds,
+            key=lambda x: (x['execution_probability'] * x['predicted_rate']),
+            reverse=True
+        )
+
         result = {
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "status": 'success',
-            "strategy_info": "High Yield Priority with Dynamic Execution Safety",
+            "strategy_info": "AI-Optimized Multi-Model Ensemble with Execution Probability Modeling",
             "recommendations": []
         }
-        
+
         for i, pred in enumerate(sorted_preds[:5]):
             result["recommendations"].append({
                 "rank": i + 1,
@@ -146,21 +282,24 @@ class LendingPredictor:
                 "currency": pred['currency'],
                 "period": pred['period'],
                 "rate": round(pred['predicted_rate'], 4),
-                "confidence": "Dynamic",
+                "confidence": pred['confidence'],
                 "details": {
                     "current": round(pred['current_rate'], 4),
+                    "execution_probability": round(pred['execution_probability'], 4),
                     "conservative_floor": round(pred['conservative_rate'], 4),
                     "aggressive_target": round(pred['aggressive_rate'], 4),
-                    "trend_1h": round(pred['trend_factor'], 4)
+                    "balanced_target": round(pred['balanced_rate'], 4),
+                    "trend_1h": round(pred['trend_factor'], 4),
+                    "strategy": pred['strategy']
                 }
             })
-            
+
         with open(output_path, 'w') as f:
             json.dump(result, f, indent=4)
-        
+
         logger.info(f"Recommendations saved to {output_path}")
         print(json.dumps(result, indent=2))
 
 if __name__ == "__main__":
-    predictor = LendingPredictor()
+    predictor = EnsemblePredictor()
     predictor.generate_recommendations()
