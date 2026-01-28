@@ -188,7 +188,106 @@ class DataProcessor:
         df['rate_deviation_ma60'] = (df['close_annual'] - df['ma_60']) / (df['ma_60'] + 1e-8)
         df['rate_deviation_ma1440'] = (df['close_annual'] - df['ma_1440']) / (df['ma_1440'] + 1e-8)
 
-        # ============ 7. 改进目标定义 (4个目标) ============
+        # ============ 7. 执行反馈特征 (Execution Feedback Features) ============
+        # 从虚拟订单历史中提取成交统计，动态调整预测策略
+        try:
+            from ml_engine.execution_features import ExecutionFeatures
+
+            # 获取当前币种和周期
+            currency = df['currency'].iloc[0] if 'currency' in df.columns else 'fUSD'
+            period = df['period'].iloc[0] if 'period' in df.columns else 30
+
+            # 计算所有执行反馈特征
+            exec_calc = ExecutionFeatures()
+            exec_features = exec_calc.get_all_features(currency, period)
+
+            # 7.1 成交率统计 (7日和30日)
+            df['exec_rate_7d'] = exec_features['exec_rate_7d']
+            df['exec_rate_30d'] = exec_features['exec_rate_30d']
+
+            # 7.2 利差统计 (成交订单的平均利差)
+            df['avg_spread_7d'] = exec_features['avg_spread_7d']
+            df['avg_spread_30d'] = exec_features['avg_spread_30d']
+
+            # 7.3 失败订单利率差距
+            df['avg_rate_gap_failed_7d'] = exec_features['avg_rate_gap_failed_7d']
+
+            # 7.4 成交延迟分布
+            df['exec_delay_p50'] = exec_features['exec_delay_p50']
+            df['exec_delay_p90'] = exec_features['exec_delay_p90']
+
+            # 7.5 市场竞争力评分 (当前利率相对MA的位置)
+            df['market_competitiveness'] = df['close_annual'] / (df['ma_1440'] + 1e-8)
+
+            # 7.6 成交可能性综合评分
+            # 结合成交率、利率分位数、市场竞争力
+            df['exec_likelihood_score'] = (
+                df['exec_rate_7d'] * 0.4 +
+                (1.0 - df['rate_percentile_1440']) * 0.3 +
+                (df['market_competitiveness'] - 1.0).clip(lower=0, upper=0.2) * 1.5
+            )
+
+            # 7.7 动态风险调整因子
+            # 根据近期成交率自动调整预测激进程度
+            df['risk_adjustment_factor'] = np.where(
+                df['exec_rate_7d'] < 0.5,
+                0.90,  # 成交率低于50%时降低10%
+                np.where(
+                    df['exec_rate_7d'] > 0.8,
+                    1.02,  # 成交率高于80%时略微提高2%
+                    1.0    # 正常情况不调整
+                )
+            )
+
+            # 7.8 成交率趋势 (短期vs长期)
+            df['exec_rate_trend'] = df['exec_rate_7d'] / (df['exec_rate_30d'] + 1e-8)
+
+            # 7.9 利率差距趋势 (滚动平均)
+            df['rate_gap_trend'] = df['avg_rate_gap_failed_7d']
+
+            # 7.10-7.12 预留特征位 (用于未来扩展)
+            df['exec_feature_reserved_1'] = 0.0
+            df['exec_feature_reserved_2'] = 0.0
+            df['exec_feature_reserved_3'] = 0.0
+
+        except (ImportError, Exception) as e:
+            # 如果execution_features模块不可用，使用默认值
+            print(f"Warning: execution_features not available ({e}), using default values")
+            df['exec_rate_7d'] = 0.7
+            df['exec_rate_30d'] = 0.7
+            df['avg_spread_7d'] = 0.0
+            df['avg_spread_30d'] = 0.0
+            df['avg_rate_gap_failed_7d'] = 0.0
+            df['exec_delay_p50'] = 0.0
+            df['exec_delay_p90'] = 0.0
+            df['market_competitiveness'] = 1.0
+            df['exec_likelihood_score'] = 0.7
+            df['risk_adjustment_factor'] = 1.0
+            df['exec_rate_trend'] = 1.0
+            df['rate_gap_trend'] = 0.0
+            df['exec_feature_reserved_1'] = 0.0
+            df['exec_feature_reserved_2'] = 0.0
+            df['exec_feature_reserved_3'] = 0.0
+        except Exception as e:
+            # 任何其他错误，记录并使用默认值
+            logger.error(f"Error calculating execution features: {e}")
+            df['exec_rate_7d'] = 0.7
+            df['exec_rate_30d'] = 0.7
+            df['avg_spread_7d'] = 0.0
+            df['avg_spread_30d'] = 0.0
+            df['avg_rate_gap_failed_7d'] = 0.0
+            df['exec_delay_p50'] = 0.0
+            df['exec_delay_p90'] = 0.0
+            df['market_competitiveness'] = 1.0
+            df['exec_likelihood_score'] = 0.7
+            df['risk_adjustment_factor'] = 1.0
+            df['exec_rate_trend'] = 1.0
+            df['rate_gap_trend'] = 0.0
+            df['exec_feature_reserved_1'] = 0.0
+            df['exec_feature_reserved_2'] = 0.0
+            df['exec_feature_reserved_3'] = 0.0
+
+        # ============ 8. 改进目标定义 (4个目标) ============
         indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=120)
 
         # Target 1: 保守利率 (从20%提升到30%分位数)

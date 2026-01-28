@@ -27,6 +27,14 @@ class EnsemblePredictor:
         self.meta_info = {}  # {curr: {model_type: {weights, features, task_type}}}
         self.processor = DataProcessor()
 
+        # 导入OrderManager用于创建虚拟订单
+        try:
+            from ml_engine.order_manager import OrderManager
+            self.order_manager = OrderManager()
+        except ImportError:
+            print("Warning: OrderManager not available, virtual order creation disabled")
+            self.order_manager = None
+
         # 加载所有模型
         self.load_all_models()
 
@@ -135,7 +143,7 @@ class EnsemblePredictor:
 
     def predict_single_period(self, row_data: dict, feature_cols: list, currency: str) -> dict:
         """
-        对单个period的数据进行预测（用于并行化）
+        对单个period的数据进行预测（用于并行化）- 增强版含执行反馈调整
 
         Args:
             row_data: 单行数据字典
@@ -173,15 +181,30 @@ class EnsemblePredictor:
             strategy_desc = "Balanced"
             confidence = "Medium"
 
-        # 趋势修正
+        # ========== 执行反馈调整 (Execution Feedback Adjustment) ==========
+        exec_rate_7d = row_data.get('exec_rate_7d', 0.7)
+        exec_rate_30d = row_data.get('exec_rate_30d', 0.7)
+        avg_rate_gap = row_data.get('avg_rate_gap_failed_7d', 0.0)
+        risk_adjustment = row_data.get('risk_adjustment_factor', 1.0)
+
+        # 计算执行调整系数
+        execution_adjustment = self._calculate_execution_adjustment(
+            exec_rate_7d, exec_rate_30d, avg_rate_gap, base_rate
+        )
+
+        # 应用调整
+        adjusted_rate = base_rate * execution_adjustment * risk_adjustment
+        # ====================================================================
+
+        # 趋势修正 (降低趋势影响权重从0.15到0.10)
         trend = float(row_data.get('rate_chg_60', 0))
         trend_factor = np.clip(trend / 5.0, -1.0, 1.0)
-        trend_adjustment = trend_factor * 0.15 * base_rate
-        final_rate = base_rate + trend_adjustment
+        trend_adjustment = trend_factor * 0.10 * adjusted_rate
+        final_rate = adjusted_rate + trend_adjustment
 
-        # 安全边界检查
+        # 安全边界检查 (更严格: 降低上限从1.1到1.05)
         current_rate = float(row_data['close_annual'])
-        final_rate = np.clip(final_rate, current_rate * 0.6, current_rate * 1.1)
+        final_rate = np.clip(final_rate, current_rate * 0.50, current_rate * 1.05)
 
         return {
             "currency": currency,
@@ -195,8 +218,65 @@ class EnsemblePredictor:
             "trend_factor": trend,
             "strategy": strategy_desc,
             "confidence": confidence,
-            "timestamp": row_data['datetime'].strftime('%Y-%m-%d %H:%M:%S')
+            "timestamp": row_data['datetime'].strftime('%Y-%m-%d %H:%M:%S'),
+            # 新增调试信息
+            "execution_rate_7d": exec_rate_7d,
+            "execution_adjustment_applied": execution_adjustment
         }
+
+    def _calculate_execution_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
+                                         avg_gap: float, base_rate: float) -> float:
+        """
+        根据成交历史计算利率调整系数
+
+        调整逻辑:
+        - 成交率 < 50%: 降低10%
+        - 成交率 50-60%: 降低5%
+        - 成交率 60-70%: 降低2%
+        - 成交率 70-85%: 不调整
+        - 成交率 > 85%: 可提高2%
+
+        额外考虑:
+        - 失败订单平均利率差距大,进一步降低
+        - 成交率趋势恶化,额外降低3%
+
+        Args:
+            exec_rate_7d: 7日成交率
+            exec_rate_30d: 30日成交率
+            avg_gap: 失败订单平均利率差距
+            base_rate: 基础预测利率
+
+        Returns:
+            调整系数 (0.85-1.05)
+        """
+        # 基础调整
+        if exec_rate_7d < 0.5:
+            adjustment = 0.90
+        elif exec_rate_7d < 0.6:
+            adjustment = 0.95
+        elif exec_rate_7d < 0.7:
+            adjustment = 0.98
+        elif exec_rate_7d > 0.85:
+            adjustment = 1.02
+        else:
+            adjustment = 1.0
+
+        # 利率差距惩罚
+        if avg_gap > 0:
+            gap_penalty = min(avg_gap / (base_rate + 1e-8), 0.08)  # 最多降低8%
+            adjustment *= (1.0 - gap_penalty)
+
+        # 趋势因素
+        exec_trend = exec_rate_7d / (exec_rate_30d + 1e-8)
+        if exec_trend < 0.8:  # 成交率显著恶化
+            adjustment *= 0.97
+        elif exec_trend > 1.2:  # 成交率改善
+            adjustment *= 1.01
+
+        # 安全边界
+        adjustment = np.clip(adjustment, 0.85, 1.05)
+
+        return adjustment
 
     def get_latest_predictions(self):
         """获取最新预测结果 - 并行化版本"""
@@ -250,7 +330,7 @@ class EnsemblePredictor:
         return all_predictions
 
     def generate_recommendations(self, output_path="../data/optimal_combination.json"):
-        """生成推荐结果并保存"""
+        """生成推荐结果并保存 - 增强版含虚拟订单创建"""
         preds = self.get_latest_predictions()
         if not preds:
             logger.warning("No predictions generated.")
@@ -271,7 +351,7 @@ class EnsemblePredictor:
         result = {
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "status": 'success',
-            "strategy_info": "AI-Optimized Multi-Model Ensemble with Execution Probability Modeling",
+            "strategy_info": "AI-Optimized Multi-Model Ensemble with Execution Feedback Loop",
             "recommendations": []
         }
 
@@ -299,6 +379,22 @@ class EnsemblePredictor:
 
         logger.info(f"Recommendations saved to {output_path}")
         print(json.dumps(result, indent=2))
+
+        # ========== 创建虚拟订单 (Create Virtual Orders) ==========
+        if self.order_manager is not None:
+            try:
+                created_orders = []
+                # 为前10个预测创建虚拟订单用于验证
+                for pred in sorted_preds[:10]:
+                    order_id = self.order_manager.create_virtual_order(pred)
+                    created_orders.append(order_id)
+
+                print(f"Created {len(created_orders)} virtual orders for validation")
+            except Exception as e:
+                print(f"Failed to create virtual orders: {e}")
+        else:
+            print("Warning: OrderManager not available, skipping virtual order creation")
+        # ============================================================
 
 if __name__ == "__main__":
     predictor = EnsemblePredictor()
