@@ -6,6 +6,9 @@ import os
 import asyncio
 from datetime import datetime
 from loguru import logger
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logger.add('/home/bumblebee/Project/optimize/log/ml_optimizer.log', retention='7 days', rotation="10 MB")
 
@@ -107,7 +110,7 @@ async def run_full_pipeline():
 @app.get("/status")
 def check_status():
     """
-    返回 API 在线状态及当前后台��务进度
+    返回 API 在线状态及当前后台任务进度
     """
     return {
         "api_online": True,
