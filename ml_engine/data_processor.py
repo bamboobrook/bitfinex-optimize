@@ -8,7 +8,11 @@ from typing import List, Dict, Tuple
 from functools import partial
 
 class DataProcessor:
-    def __init__(self, db_path: str = "../data/lending_history.db"):
+    def __init__(self, db_path: str = None):
+        # Use absolute path for database
+        if db_path is None:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            db_path = os.path.join(base_dir, "data", "lending_history.db")
         self.db_path = db_path
         self.conn = None
 

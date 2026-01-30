@@ -258,6 +258,75 @@ class ExecutionFeatures:
 
         return features
 
+    def is_cold_start(self, currency: str, period: int, threshold: int = 10) -> bool:
+        """
+        Check if a currency-period combination is in cold start phase
+
+        Args:
+            currency: fUSD/fUST
+            period: Lending period
+            threshold: Minimum number of validated orders to exit cold start
+
+        Returns:
+            True if cold start (< threshold orders), False otherwise
+        """
+        cache_key = f"cold_start_{currency}_{period}_{threshold}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            query = """
+            SELECT COUNT(*) as total
+            FROM virtual_orders
+            WHERE currency = ?
+              AND period = ?
+              AND status IN ('EXECUTED', 'FAILED')
+            """
+
+            cursor.execute(query, (currency, period))
+            row = cursor.fetchone()
+            total = row[0] or 0
+
+            is_cold = total < threshold
+            self._cache[cache_key] = is_cold
+            return is_cold
+
+        finally:
+            conn.close()
+
+    def get_order_count(self, currency: str, period: int) -> int:
+        """
+        Get total number of validated orders for a currency-period combination
+
+        Args:
+            currency: fUSD/fUST
+            period: Lending period
+
+        Returns:
+            Number of validated orders (EXECUTED or FAILED)
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            query = """
+            SELECT COUNT(*) as total
+            FROM virtual_orders
+            WHERE currency = ?
+              AND period = ?
+              AND status IN ('EXECUTED', 'FAILED')
+            """
+
+            cursor.execute(query, (currency, period))
+            row = cursor.fetchone()
+            return row[0] or 0
+
+        finally:
+            conn.close()
+
     def clear_cache(self):
         """Clear the feature cache"""
         self._cache = {}

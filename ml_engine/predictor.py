@@ -20,7 +20,11 @@ from ml_engine.data_processor import DataProcessor
 class EnsemblePredictor:
     """使用集成模型的增强预测器 - 支持GPU加速和并行化"""
 
-    def __init__(self, model_dir="../data/models", max_workers=8):
+    def __init__(self, model_dir=None, max_workers=8):
+        # Use absolute path for models directory
+        if model_dir is None:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            model_dir = os.path.join(base_dir, "data", "models")
         self.model_dir = model_dir
         self.max_workers = max_workers  # 并行worker数量
         self.models = {}  # {curr: {model_type: {algo: model}}}
@@ -218,7 +222,7 @@ class EnsemblePredictor:
             "trend_factor": trend,
             "strategy": strategy_desc,
             "confidence": confidence,
-            "timestamp": row_data['datetime'].strftime('%Y-%m-%d %H:%M:%S'),
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # Use current time, not historical data time
             # 新增调试信息
             "execution_rate_7d": exec_rate_7d,
             "execution_adjustment_applied": execution_adjustment
@@ -233,8 +237,8 @@ class EnsemblePredictor:
         - 成交率 < 50%: 降低10%
         - 成交率 50-60%: 降低5%
         - 成交率 60-70%: 降低2%
-        - 成交率 70-85%: 不调整
-        - 成交率 > 85%: 可提高2%
+        - 成交率 70-90%: 不调整
+        - 成交率 > 90%: 可提高1% (弱化马太效应)
 
         额外考虑:
         - 失败订单平均利率差距大,进一步降低
@@ -256,8 +260,8 @@ class EnsemblePredictor:
             adjustment = 0.95
         elif exec_rate_7d < 0.7:
             adjustment = 0.98
-        elif exec_rate_7d > 0.85:
-            adjustment = 1.02
+        elif exec_rate_7d > 0.90:  # Raise threshold from 0.85 to 0.90
+            adjustment = 1.01       # Lower reward from 1.02 to 1.01
         else:
             adjustment = 1.0
 
@@ -355,7 +359,30 @@ class EnsemblePredictor:
             "recommendations": []
         }
 
-        for i, pred in enumerate(sorted_preds[:5]):
+        # Build recommendations: ensure top 5 + fUSD-2d if not already included
+        recommendations_to_add = []
+        fusd_2d_pred = None
+
+        # First, add top 5 predictions
+        for pred in sorted_preds[:5]:
+            recommendations_to_add.append(pred)
+            if pred['currency'] == 'fUSD' and pred['period'] == 2:
+                fusd_2d_pred = pred
+
+        # If fUSD-2d is not in top 5, find it and add as 6th
+        if fusd_2d_pred is None:
+            for pred in sorted_preds:
+                if pred['currency'] == 'fUSD' and pred['period'] == 2:
+                    fusd_2d_pred = pred
+                    recommendations_to_add.append(pred)
+                    break
+
+        # If still not found (shouldn't happen), add 6th best instead
+        if fusd_2d_pred is None and len(sorted_preds) > 5:
+            recommendations_to_add.append(sorted_preds[5])
+
+        # Build the recommendations list
+        for i, pred in enumerate(recommendations_to_add[:6]):
             result["recommendations"].append({
                 "rank": i + 1,
                 "type": "optimal" if i == 0 else "alternative",
@@ -380,18 +407,80 @@ class EnsemblePredictor:
         logger.info(f"Recommendations saved to {output_path}")
         print(json.dumps(result, indent=2))
 
-        # ========== 创建虚拟订单 (Create Virtual Orders) ==========
+        # ========== 创建虚拟订单 with Stratified Sampling (Create Virtual Orders) ==========
         if self.order_manager is not None:
             try:
-                created_orders = []
-                # 为前10个预测创建虚拟订单用于验证
-                for pred in sorted_preds[:10]:
-                    order_id = self.order_manager.create_virtual_order(pred)
-                    created_orders.append(order_id)
+                # Sampling configuration
+                TOP_N = 10                 # Total virtual orders to create
+                COLD_START_SLOTS = 3       # Reserve 3 slots for cold start combinations
+                COLD_START_THRESHOLD = 10  # Combinations with <10 orders are cold start
 
-                print(f"Created {len(created_orders)} virtual orders for validation")
+                # Identify cold start vs warm combinations
+                cold_start_preds = []
+                warm_preds = []
+
+                for pred in sorted_preds:
+                    order_count = self.order_manager.get_order_count(
+                        pred['currency'],
+                        pred['period']
+                    )
+
+                    if order_count < COLD_START_THRESHOLD:
+                        pred['is_cold_start'] = True
+                        pred['order_count'] = order_count
+                        cold_start_preds.append(pred)
+                    else:
+                        pred['is_cold_start'] = False
+                        pred['order_count'] = order_count
+                        warm_preds.append(pred)
+
+                # Stratified sampling: allocate slots
+                selected_preds = []
+
+                # 1. Select top warm predictions (exploiting known good combinations)
+                warm_slots = TOP_N - COLD_START_SLOTS
+                selected_preds.extend(warm_preds[:warm_slots])
+
+                # 2. Select cold start predictions (exploring new combinations)
+                selected_preds.extend(cold_start_preds[:COLD_START_SLOTS])
+
+                # 3. Fill remaining slots if cold start pool is insufficient
+                remaining = TOP_N - len(selected_preds)
+                if remaining > 0:
+                    # Use remaining warm predictions
+                    selected_preds.extend(warm_preds[warm_slots:warm_slots + remaining])
+
+                # Create virtual orders
+                created_orders = []
+                for pred in selected_preds[:TOP_N]:
+                    order_id = self.order_manager.create_virtual_order(pred)
+                    created_orders.append({
+                        'order_id': order_id,
+                        'currency': pred['currency'],
+                        'period': pred['period'],
+                        'is_cold_start': pred.get('is_cold_start', False),
+                        'order_count': pred.get('order_count', 0)
+                    })
+
+                # Print summary
+                cold_count = sum(1 for o in created_orders if o['is_cold_start'])
+                warm_count = len(created_orders) - cold_count
+
+                print(f"\n=== Virtual Order Creation Summary ===")
+                print(f"Total orders created: {len(created_orders)}")
+                print(f"  - Warm combinations (exploiting): {warm_count}")
+                print(f"  - Cold start combinations (exploring): {cold_count}")
+                print(f"Sampling strategy: Stratified (70% exploit + 30% explore)")
+
+                # Print details
+                for order in created_orders:
+                    status = "COLD START" if order['is_cold_start'] else f"WARM ({order['order_count']} orders)"
+                    print(f"  {order['currency']}-{order['period']}d: {status}")
+
             except Exception as e:
                 print(f"Failed to create virtual orders: {e}")
+                import traceback
+                traceback.print_exc()
         else:
             print("Warning: OrderManager not available, skipping virtual order creation")
         # ============================================================

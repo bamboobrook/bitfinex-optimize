@@ -68,22 +68,26 @@ class OrderManager:
         cursor = conn.cursor()
 
         try:
+            # Use explicit created_at to avoid timezone issues with SQLite CURRENT_TIMESTAMP (UTC)
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
             cursor.execute("""
                 INSERT INTO virtual_orders
                 (order_id, currency, period, predicted_rate, order_timestamp,
                  validation_window_hours, prediction_confidence, prediction_strategy,
-                 model_version, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                 model_version, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
             """, (
                 order_id,
                 prediction['currency'],
                 prediction['period'],
                 prediction['predicted_rate'],
-                prediction.get('timestamp', datetime.now().isoformat()),
+                prediction.get('timestamp', current_time),
                 validation_window,
                 prediction.get('confidence', 'Medium'),
                 prediction.get('strategy', 'Unknown'),
-                'v1.0'  # Model version
+                'v1.0',  # Model version
+                current_time  # Explicit created_at
             ))
 
             conn.commit()
@@ -275,6 +279,34 @@ class OrderManager:
         conn.close()
 
         return orders
+
+    def get_order_count(self, currency: str, period: int) -> int:
+        """
+        Get total number of validated orders for a currency-period combination.
+
+        Args:
+            currency: fUSD/fUST
+            period: Lending period
+
+        Returns:
+            Number of validated orders (EXECUTED or FAILED)
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        query = """
+            SELECT COUNT(*) as total
+            FROM virtual_orders
+            WHERE currency = ?
+              AND period = ?
+              AND status IN ('EXECUTED', 'FAILED')
+        """
+
+        cursor.execute(query, (currency, period))
+        row = cursor.fetchone()
+        conn.close()
+
+        return row[0] or 0
 
 
 if __name__ == "__main__":

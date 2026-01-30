@@ -605,3 +605,685 @@ sqlite3 data/lending_history.db < backup_stats_YYYYMMDD.sql
 
 **文档版本**: 1.0
 **最后更新**: 2025-01
+
+---
+
+## 十四、API 接口完整指南
+
+本系统提供完整的 RESTful API 接口，支持通过 HTTP 请求执行所有操作，无需手动运行脚本。
+
+### 14.1 服务启动
+
+```bash
+# 启动 API 服务器（端口 5000）
+python ml_engine/api_server.py
+
+# API 将在以下地址可用
+# http://localhost:5000
+```
+
+### 14.2 健康检查与状态
+
+#### GET /status
+
+查看 API 状态和当前任务进度。
+
+**请求示例**:
+```bash
+curl http://localhost:5000/status | jq
+```
+
+**返回示例**:
+```json
+{
+  "api_online": true,
+  "service_info": {
+    "status": "online",
+    "current_step": "Idle",
+    "last_update": "2025-01-30 14:30:00",
+    "details": "Last update completed at 2025-01-30 14:30:00"
+  }
+}
+```
+
+**状态说明**:
+- `online` - 服务在线且空闲，可接受新任务
+- `processing` - 正在执行任务
+- `error` - 上次任务出错
+
+**使用场景**:
+- 启动后验证服务是否正常
+- 检查后台任务执行进度
+- 确认服务是否空闲（执行新任务前）
+
+---
+
+### 14.3 数据获取
+
+#### GET /result
+
+获取最新的预测结果（`optimal_combination.json`）。
+
+**请求示例**:
+```bash
+curl http://localhost:5000/result | jq
+```
+
+**返回示例**:
+```json
+{
+  "timestamp": "2025-01-30 14:30:00",
+  "optimal_combination": {
+    "currency": "fUSD",
+    "period": 30,
+    "predicted_rate": 12.45,
+    "confidence": "High",
+    "strategy": "ensemble_v3"
+  },
+  "top_10_predictions": [...]
+}
+```
+
+**使用场景**:
+- 获取最新借贷利率预测
+- 查看 Top 10 推荐组合
+- 集成到交易系统或监控面板
+
+---
+
+#### GET /stats
+
+获取虚拟订单统计信息。
+
+**请求示例**:
+```bash
+curl http://localhost:5000/stats | jq
+```
+
+**返回示例**:
+```json
+{
+  "status_summary": [
+    {"status": "PENDING", "count": 15},
+    {"status": "EXECUTED", "count": 342},
+    {"status": "FAILED", "count": 158}
+  ],
+  "execution_rate_7d": [
+    {
+      "currency": "fUSD",
+      "period": 30,
+      "total": 45,
+      "executed": 32,
+      "exec_rate": 71.1
+    }
+  ],
+  "latest_orders": [
+    {
+      "id": "a1b2c3d4",
+      "combo": "fUSD-30d",
+      "rate": "12.45%",
+      "status": "EXECUTED",
+      "created": "2025-01-30 14:00:00"
+    }
+  ]
+}
+```
+
+**使用场景**:
+- 查看订单状态分布
+- 监控 7 天执行率
+- 查看最新订单记录
+
+---
+
+#### GET /execution_stats
+
+查询指定币种-周期的执行统计。
+
+**参数**:
+- `currency` (可选，默认 `fUSD`): 币种（`fUSD` 或 `fUST`）
+- `period` (可选，默认 `30`): 借贷周期（2-120）
+- `days` (可选，默认 `7`): 回溯天数
+
+**请求示例**:
+```bash
+# fUSD 30天期限，最近 7 天的执行统计
+curl "http://localhost:5000/execution_stats?currency=fUSD&period=30&days=7" | jq
+
+# fUST 60天期限，最近 30 天的执行统计
+curl "http://localhost:5000/execution_stats?currency=fUST&period=60&days=30" | jq
+```
+
+**返回示例**:
+```json
+{
+  "currency": "fUSD",
+  "period": 30,
+  "lookback_days": 7,
+  "statistics": {
+    "total_orders": 45,
+    "executed_orders": 32,
+    "execution_rate": 0.711,
+    "avg_execution_delay": 245,
+    "avg_spread": 0.85,
+    "avg_rate_gap": 1.23,
+    "has_sufficient_data": true
+  }
+}
+```
+
+**使用场景**:
+- 分析特定组合的执行表现
+- 优化预测策略
+- 生成性能报告
+
+---
+
+#### GET /orders
+
+查询虚拟订单列表。
+
+**参数**:
+- `status` (可选): 过滤状态（`PENDING` / `EXECUTED` / `FAILED`）
+- `limit` (可选，默认 `100`): 返回数量限制
+
+**请求示例**:
+```bash
+# 查看所有待验证订单
+curl "http://localhost:5000/orders?status=PENDING&limit=50" | jq
+
+# 查看最近 100 个已成交订单
+curl "http://localhost:5000/orders?status=EXECUTED&limit=100" | jq
+
+# 查看所有订单（不过滤状态）
+curl "http://localhost:5000/orders?limit=200" | jq
+```
+
+**返回示例**:
+```json
+{
+  "total": 15,
+  "filter_status": "PENDING",
+  "orders": [
+    {
+      "order_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "currency": "fUSD",
+      "period": 30,
+      "predicted_rate": 12.45,
+      "status": "PENDING",
+      "order_timestamp": "2025-01-30 14:00:00",
+      "validation_window_hours": 48
+    }
+  ]
+}
+```
+
+**使用场景**:
+- 监控待验证订单数量
+- 审查失败订单
+- 导出订单数据用于分析
+
+---
+
+### 14.4 任务触发
+
+#### POST /update
+
+触发完整流水线（推荐使用，每 2 小时运行一次）。
+
+**流程**:
+1. 验证虚拟订单（检查 PENDING 订单是否成交）
+2. 下载最新历史数据
+3. 处理特征（包含 15 个执行反馈特征）
+4. 训练模型（使用最新数据）
+5. 生成预测（创建 Top 10 虚拟订单）
+
+**请求示例**:
+```bash
+curl -X POST http://localhost:5000/update
+```
+
+**返回示例**:
+```json
+{
+  "status": "accepted",
+  "message": "Full update pipeline started. Check /status for progress."
+}
+```
+
+**监控进度**:
+```bash
+# 持续监控任务状态
+watch -n 5 'curl -s http://localhost:5000/status | jq'
+```
+
+**使用场景**:
+- 定时更新（推荐每 2 小时）
+- 确保系统使用最新数据
+- 完整的端到端流程
+
+---
+
+#### POST /download_data
+
+仅下载历史数据（不训练模型）。
+
+**请求示例**:
+```bash
+curl -X POST http://localhost:5000/download_data
+```
+
+**返回示例**:
+```json
+{
+  "status": "accepted",
+  "message": "Data download task started. Check /status for progress."
+}
+```
+
+**使用场景**:
+- 手动补充缺失数据
+- 数据下载失败后重试
+- 不需要重新训练模型时
+
+---
+
+#### POST /process_features
+
+仅处理特征（不下载数据或训练模型）。
+
+**请求示例**:
+```bash
+curl -X POST http://localhost:5000/process_features
+```
+
+**返回示例**:
+```json
+{
+  "status": "accepted",
+  "message": "Feature processing task started. Check /status for progress."
+}
+```
+
+**使用场景**:
+- 特征处理失败后重试
+- 调整特征计算逻辑后重新处理
+- 测试新的特征工程
+
+---
+
+#### POST /train
+
+仅训练模型（不下载数据或生成预测）。
+
+**请求示例**:
+```bash
+curl -X POST http://localhost:5000/train
+```
+
+**返回示例**:
+```json
+{
+  "status": "accepted",
+  "message": "Model training task started. Check /status for progress."
+}
+```
+
+**使用场景**:
+- 调整模型参数后重新训练
+- 训练失败后重试
+- 测试新的模型架构
+
+---
+
+#### POST /predict
+
+仅生成预测（不训练模型）。
+
+**请求示例**:
+```bash
+curl -X POST http://localhost:5000/predict
+```
+
+**返回示例**:
+```json
+{
+  "status": "accepted",
+  "message": "Prediction generation task started. Check /status for progress."
+}
+```
+
+**使用场景**:
+- 使用现有模型生成新预测
+- 预测失败后重试
+- 快速获取预测结果（不重新训练）
+
+---
+
+#### POST /validate_orders
+
+手动触发虚拟订单验证。
+
+**请求示例**:
+```bash
+curl -X POST http://localhost:5000/validate_orders
+```
+
+**返回示例**:
+```json
+{
+  "status": "accepted",
+  "message": "Order validation task started. Check /status for progress."
+}
+```
+
+**使用场景**:
+- 立即验证 PENDING 订单
+- 测试验证逻辑
+- 在完整流水线之外单独运行验证
+
+---
+
+### 14.5 系统验证
+
+#### GET /validate
+
+运行完整系统验证（5 个测试）。
+
+**测试内容**:
+1. **时间戳正确性** - 验证订单时间戳在创建时间 5 分钟内
+2. **验证窗口合规** - 验证订单在窗口结束后才验证（防止 look-ahead bias）
+3. **采样覆盖率** - 验证 7 天内覆盖 >80% 的组合
+4. **执行率真实性** - 检查执行率 <90%（过高可能有 look-ahead bias）
+5. **冷启动检测** - 验证冷启动组合（<10 订单）是否被测试
+
+**请求示例**:
+```bash
+curl http://localhost:5000/validate | jq
+```
+
+**返回示例**:
+```json
+{
+  "summary": {
+    "passed": 3,
+    "failed": 0,
+    "warnings": 2,
+    "overall_status": "PASS"
+  },
+  "tests": {
+    "timestamp_correctness": {
+      "status": "PASS",
+      "message": "All order timestamps are within 5 minutes of creation time",
+      "anomaly_count": 0,
+      "anomalies": []
+    },
+    "validation_window": {
+      "status": "PASS",
+      "message": "All validations occurred after window end",
+      "early_validation_count": 0,
+      "early_validations": []
+    },
+    "sampling_coverage": {
+      "status": "WARNING",
+      "message": "Low sampling coverage (75.0%), expect improvement over time",
+      "tested_combinations": 21,
+      "total_combinations": 28,
+      "coverage_pct": 75.0,
+      "coverage_details": [...]
+    },
+    "execution_rate": {
+      "status": "PASS",
+      "message": "Execution rate is realistic (65.5%)",
+      "total_7d": 45,
+      "executed_7d": 32,
+      "exec_rate_7d": 71.1,
+      "total_30d": 180,
+      "executed_30d": 118,
+      "exec_rate_30d": 65.5
+    },
+    "cold_start_detection": {
+      "status": "WARNING",
+      "message": "Some cold start combinations not tested recently",
+      "cold_start_count": 7,
+      "recent_tested_count": 3,
+      "cold_start_combos": [...]
+    }
+  }
+}
+```
+
+**状态说明**:
+- `PASS` - 测试通过
+- `FAIL` - 测试失败（需要修复）
+- `WARNING` - 警告（可能正常，观察即可）
+- `overall_status`:
+  - `PASS` - 无失败，至少 3 个通过
+  - `FAIL` - 有测试失败
+  - `WARNING` - 无失败但通过数 <3
+
+**使用场景**:
+- 系统初始化后验证
+- 定期健康检查（每周）
+- 发现异常后诊断问题
+
+---
+
+#### GET /validate/{test_name}
+
+运行单个验证测试。
+
+**可用测试名称**:
+- `timestamp_correctness` - 时间戳正确性
+- `validation_window` - 验证窗口合规性
+- `sampling_coverage` - 采样覆盖率
+- `execution_rate` - 执行率真实性
+- `cold_start_detection` - 冷启动检测
+
+**请求示例**:
+```bash
+# 只检查时间戳正确性
+curl http://localhost:5000/validate/timestamp_correctness | jq
+
+# 只检查执行率
+curl http://localhost:5000/validate/execution_rate | jq
+
+# 只检查采样覆盖率
+curl http://localhost:5000/validate/sampling_coverage | jq
+```
+
+**返回示例**:
+```json
+{
+  "test_name": "execution_rate",
+  "result": {
+    "status": "PASS",
+    "message": "Execution rate is realistic (65.5%)",
+    "total_7d": 45,
+    "executed_7d": 32,
+    "exec_rate_7d": 71.1,
+    "total_30d": 180,
+    "executed_30d": 118,
+    "exec_rate_30d": 65.5
+  }
+}
+```
+
+**使用场景**:
+- 针对性检查特定问题
+- 开发/调试特定功能
+- 减少响应时间（不运行所有测试）
+
+---
+
+### 14.6 完整工作流示例
+
+#### 场景 1: 系统初始化
+
+```bash
+# 1. 启动 API 服务器
+python ml_engine/api_server.py
+
+# 2. 检查服务状态
+curl http://localhost:5000/status | jq
+
+# 3. 运行系统验证
+curl http://localhost:5000/validate | jq
+
+# 4. 触发完整流水线
+curl -X POST http://localhost:5000/update
+
+# 5. 监控进度（每 5 秒刷新）
+watch -n 5 'curl -s http://localhost:5000/status | jq'
+
+# 6. 获取预测结果
+curl http://localhost:5000/result | jq
+```
+
+---
+
+#### 场景 2: 定期更新（每 2 小时）
+
+```bash
+# 使用 crontab 定时触发
+# 编辑 crontab: crontab -e
+# 添加以下行（每 2 小时运行）:
+0 */2 * * * curl -X POST http://localhost:5000/update
+
+# 或使用 while 循环手动调度
+while true; do
+    echo "[$(date)] Triggering update..."
+    curl -X POST http://localhost:5000/update
+    sleep 7200  # 2 小时
+done
+```
+
+---
+
+#### 场景 3: 故障排查
+
+```bash
+# 1. 查看服务状态
+curl http://localhost:5000/status | jq
+
+# 2. 运行完整验证
+curl http://localhost:5000/validate | jq
+
+# 3. 查看订单统计
+curl http://localhost:5000/stats | jq
+
+# 4. 检查失败订单
+curl "http://localhost:5000/orders?status=FAILED&limit=50" | jq
+
+# 5. 查看特定组合的执行统计
+curl "http://localhost:5000/execution_stats?currency=fUSD&period=30&days=7" | jq
+
+# 6. 如果发现问题，单独重试失败的步骤
+curl -X POST http://localhost:5000/validate_orders  # 重新验证订单
+curl -X POST http://localhost:5000/train           # 重新训练模型
+curl -X POST http://localhost:5000/predict         # 重新生成预测
+```
+
+---
+
+#### 场景 4: 性能监控
+
+```bash
+# 创建监控脚本: monitor.sh
+#!/bin/bash
+
+echo "=== System Status ==="
+curl -s http://localhost:5000/status | jq -r '.service_info | "Status: \(.status)\nStep: \(.current_step)\nLast Update: \(.last_update)"'
+
+echo -e "\n=== Order Statistics ==="
+curl -s http://localhost:5000/stats | jq -r '.status_summary[] | "\(.status): \(.count)"'
+
+echo -e "\n=== 7-Day Execution Rates ==="
+curl -s http://localhost:5000/stats | jq -r '.execution_rate_7d[] | "\(.currency)-\(.period)d: \(.exec_rate)% (\(.executed)/\(.total))"'
+
+echo -e "\n=== Validation Tests ==="
+curl -s http://localhost:5000/validate | jq -r '.tests | to_entries[] | "\(.key): \(.value.status)"'
+
+# 运行监控
+chmod +x monitor.sh
+./monitor.sh
+```
+
+---
+
+### 14.7 错误处理
+
+#### 错误码说明
+
+- **404** - 资源不存在（如预测结果未生成、测试名称错误）
+- **409** - 冲突（服务正在执行其他任务）
+- **500** - 服务器内部错误（数据库连接失败、模块执行错误）
+
+#### 常见错误示例
+
+**错误 1: 任务冲突**
+```json
+{
+  "status": "busy",
+  "message": "Another task is running: Training Models"
+}
+```
+
+**解决**: 等待当前任务完成，通过 `/status` 监控进度。
+
+---
+
+**错误 2: 预测结果不存在**
+```json
+{
+  "error": "No predictions found.",
+  "suggestion": "Please call /update to generate data."
+}
+```
+
+**解决**: 执行 `POST /update` 生成预测结果。
+
+---
+
+**错误 3: 数据库未找到**
+```json
+{
+  "error": "Database not found: /path/to/lending_history.db"
+}
+```
+
+**解决**: 运行 `python ml_engine/init_execution_tables.py` 初始化数据库。
+
+---
+
+### 14.8 API 接口总结表
+
+| 方法 | 路径 | 功能 | 是否后台执行 |
+|------|------|------|------------|
+| GET | /status | 查看 API 状态和任务进度 | ❌ |
+| GET | /result | 获取最新预测结果 | ❌ |
+| GET | /stats | 获取订单统计信息 | ❌ |
+| GET | /execution_stats | 查询执行统计（指定组合） | ❌ |
+| GET | /orders | 查询虚拟订单列表 | ❌ |
+| POST | /update | 完整流水线（推荐） | ✅ |
+| POST | /download_data | 仅下载数据 | ✅ |
+| POST | /process_features | 仅处理特征 | ✅ |
+| POST | /train | 仅训练模型 | ✅ |
+| POST | /predict | 仅生成预测 | ✅ |
+| POST | /validate_orders | 仅验证订单 | ✅ |
+| GET | /validate | 运行所有验证测试 | ❌ |
+| GET | /validate/{test_name} | 运行单个验证测试 | ❌ |
+
+---
+
+### 14.9 最佳实践
+
+1. **定期更新**: 使用 `POST /update` 每 2 小时更新一次
+2. **监控状态**: 定期检查 `/status` 和 `/validate`
+3. **日志审查**: 查看 `log/ml_optimizer.log` 了解详细执行日志
+4. **错误恢复**: 任务失败时，使用单独的端点重试失败步骤
+5. **性能优化**: 根据 `/execution_stats` 调整预测策略
+6. **数据备份**: 定期备份 `data/lending_history.db`
+
+---
+

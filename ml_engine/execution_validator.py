@@ -108,12 +108,16 @@ class ExecutionValidator:
                     'reason': 'Validation window not complete'
                 }
 
+            # CRITICAL: Validation window end must not exceed current time
+            # This prevents look-ahead bias from using "future" data
+            actual_window_end = min(window_end, now)
+
             # Query market rates during validation window
             market_data = self.query_market_rates(
                 order['currency'],
                 order['period'],
                 order_time,
-                window_end
+                actual_window_end
             )
 
             if not market_data:
