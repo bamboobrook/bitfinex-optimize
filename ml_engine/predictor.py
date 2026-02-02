@@ -407,48 +407,71 @@ class EnsemblePredictor:
         logger.info(f"Recommendations saved to {output_path}")
         print(json.dumps(result, indent=2))
 
-        # ========== 创建虚拟订单 with Stratified Sampling (Create Virtual Orders) ==========
+        # ========== 创建虚拟订单 with Stratified Sampling by Period Tiers ==========
         if self.order_manager is not None:
             try:
-                # Sampling configuration
-                TOP_N = 10                 # Total virtual orders to create
-                COLD_START_SLOTS = 3       # Reserve 3 slots for cold start combinations
+                # Stratified sampling configuration by period tiers - 均衡采样
+                # 目标是覆盖全期限，各层级数量均衡
+                TIER_CONFIG = {
+                    'short': {'periods': [2, 3, 4, 5, 6, 7], 'min_orders': 7, 'target_per_period': 1},
+                    'medium': {'periods': [10, 14, 15, 20, 30], 'min_orders': 7, 'target_per_period': 1},
+                    'long': {'periods': [60, 90, 120], 'min_orders': 6, 'target_per_period': 2}
+                }
+                TOP_N = 24                 # 增加总订单数到24，确保各层级都有足够覆盖
                 COLD_START_THRESHOLD = 10  # Combinations with <10 orders are cold start
 
-                # Identify cold start vs warm combinations
-                cold_start_preds = []
-                warm_preds = []
+                # Helper function to get tier for a period
+                def get_tier(period):
+                    for tier_name, config in TIER_CONFIG.items():
+                        if period in config['periods']:
+                            return tier_name
+                    return None
+
+                # Group predictions by tier
+                tier_preds = {'short': [], 'medium': [], 'long': []}
 
                 for pred in sorted_preds:
-                    order_count = self.order_manager.get_order_count(
-                        pred['currency'],
-                        pred['period']
-                    )
-
-                    if order_count < COLD_START_THRESHOLD:
-                        pred['is_cold_start'] = True
+                    tier = get_tier(pred['period'])
+                    if tier:
+                        # Check if cold start
+                        order_count = self.order_manager.get_order_count(
+                            pred['currency'],
+                            pred['period']
+                        )
+                        pred['is_cold_start'] = order_count < COLD_START_THRESHOLD
                         pred['order_count'] = order_count
-                        cold_start_preds.append(pred)
-                    else:
-                        pred['is_cold_start'] = False
-                        pred['order_count'] = order_count
-                        warm_preds.append(pred)
+                        pred['tier'] = tier
+                        tier_preds[tier].append(pred)
 
-                # Stratified sampling: allocate slots
+                # Select orders from each tier
                 selected_preds = []
+                tier_shortfall = 0  # Track how many slots we couldn't fill
 
-                # 1. Select top warm predictions (exploiting known good combinations)
-                warm_slots = TOP_N - COLD_START_SLOTS
-                selected_preds.extend(warm_preds[:warm_slots])
+                for tier_name, config in TIER_CONFIG.items():
+                    min_orders = config['min_orders']
+                    available = tier_preds[tier_name]
 
-                # 2. Select cold start predictions (exploring new combinations)
-                selected_preds.extend(cold_start_preds[:COLD_START_SLOTS])
+                    # Take up to min_orders from this tier
+                    selected = available[:min_orders]
+                    selected_preds.extend(selected)
 
-                # 3. Fill remaining slots if cold start pool is insufficient
-                remaining = TOP_N - len(selected_preds)
-                if remaining > 0:
-                    # Use remaining warm predictions
-                    selected_preds.extend(warm_preds[warm_slots:warm_slots + remaining])
+                    # Calculate shortfall if tier doesn't have enough
+                    if len(selected) < min_orders:
+                        tier_shortfall += min_orders - len(selected)
+
+                # Fill remaining slots with best remaining predictions (regardless of tier)
+                remaining_slots = TOP_N - len(selected_preds) + tier_shortfall
+
+                # Collect all remaining predictions not yet selected
+                selected_keys = {(p['currency'], p['period']) for p in selected_preds}
+                remaining_preds = []
+                for tier_name in ['long', 'medium', 'short']:  # Prefer longer periods for remaining
+                    for pred in tier_preds[tier_name]:
+                        if (pred['currency'], pred['period']) not in selected_keys:
+                            remaining_preds.append(pred)
+
+                # Fill remaining slots
+                selected_preds.extend(remaining_preds[:remaining_slots])
 
                 # Create virtual orders
                 created_orders = []
@@ -459,23 +482,31 @@ class EnsemblePredictor:
                         'currency': pred['currency'],
                         'period': pred['period'],
                         'is_cold_start': pred.get('is_cold_start', False),
-                        'order_count': pred.get('order_count', 0)
+                        'order_count': pred.get('order_count', 0),
+                        'tier': pred.get('tier', 'unknown')
                     })
 
                 # Print summary
-                cold_count = sum(1 for o in created_orders if o['is_cold_start'])
-                warm_count = len(created_orders) - cold_count
+                tier_counts = {'short': 0, 'medium': 0, 'long': 0}
+                cold_count = 0
+                for order in created_orders:
+                    tier_counts[order['tier']] += 1
+                    if order['is_cold_start']:
+                        cold_count += 1
 
                 print(f"\n=== Virtual Order Creation Summary ===")
                 print(f"Total orders created: {len(created_orders)}")
-                print(f"  - Warm combinations (exploiting): {warm_count}")
-                print(f"  - Cold start combinations (exploring): {cold_count}")
-                print(f"Sampling strategy: Stratified (70% exploit + 30% explore)")
+                print(f"Tier distribution:")
+                print(f"  - Short (2-7d): {tier_counts['short']} orders")
+                print(f"  - Medium (10-30d): {tier_counts['medium']} orders")
+                print(f"  - Long (60-120d): {tier_counts['long']} orders")
+                print(f"Cold start combinations: {cold_count}")
+                print(f"Sampling strategy: Stratified by Period Tiers")
 
                 # Print details
                 for order in created_orders:
                     status = "COLD START" if order['is_cold_start'] else f"WARM ({order['order_count']} orders)"
-                    print(f"  {order['currency']}-{order['period']}d: {status}")
+                    print(f"  {order['currency']}-{order['period']}d [{order['tier']}]: {status}")
 
             except Exception as e:
                 print(f"Failed to create virtual orders: {e}")
