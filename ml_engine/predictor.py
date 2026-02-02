@@ -333,8 +333,12 @@ class EnsemblePredictor:
 
         return all_predictions
 
-    def generate_recommendations(self, output_path="../data/optimal_combination.json"):
+    def generate_recommendations(self, output_path=None):
         """生成推荐结果并保存 - 增强版含虚拟订单创建"""
+        # Use absolute path by default
+        if output_path is None:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            output_path = os.path.join(base_dir, "data", "optimal_combination.json")
         preds = self.get_latest_predictions()
         if not preds:
             logger.warning("No predictions generated.")
