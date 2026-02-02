@@ -542,13 +542,23 @@ async def run_full_pipeline():
             # 等待完成
             stdout, stderr = await process.communicate()
 
+            # Capture and log subprocess output
+            stdout_text = stdout.decode().strip()
+            stderr_text = stderr.decode().strip()
+
+            # Log subprocess output
+            if stdout_text:
+                logger.info(f"{step_name} output:\n{stdout_text}")
+            if stderr_text:
+                logger.warning(f"{step_name} stderr:\n{stderr_text}")
+
             if process.returncode != 0:
-                err_msg = stderr.decode().strip() or stdout.decode().strip()
-                logger.error(f"{step_name} Failed: {err_msg}")
-                update_status("error", step_name, f"Failed: {err_msg[-200:]}") # 只记录最后200字符
+                err_msg = stderr_text or stdout_text or "Process exited with non-zero code"
+                logger.error(f"{step_name} Failed (exit code {process.returncode}): {err_msg}")
+                update_status("error", step_name, f"Failed: {err_msg[-200:]}")  # 只记录最后200字符
                 return
 
-            logger.info(f"{step_name} completed successfully")
+            logger.info(f"{step_name} completed successfully (exit code 0)")
 
         except Exception as e:
             logger.error(f"Pipeline System Error: {e}")

@@ -145,6 +145,34 @@ class EnsemblePredictor:
 
         return ensemble_pred
 
+    def get_latest_rate_from_db(self, currency: str, period: int) -> tuple:
+        """Query database directly for the most recent rate"""
+        import sqlite3
+        db_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "lending_history.db"
+        )
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        try:
+            query = """
+            SELECT close_annual, datetime
+            FROM funding_rates
+            WHERE currency = ? AND period = ?
+            ORDER BY datetime DESC
+            LIMIT 1
+            """
+            cursor.execute(query, (currency, period))
+            result = cursor.fetchone()
+
+            if result:
+                return float(result[0]), result[1]
+            return None, None
+        finally:
+            conn.close()
+
     def predict_single_period(self, row_data: dict, feature_cols: list, currency: str) -> dict:
         """
         对单个period的数据进行预测（用于并行化）- 增强版含执行反馈调整
@@ -156,6 +184,19 @@ class EnsemblePredictor:
         Returns:
             预测结果字典
         """
+        # Query database for current rate (get latest data)
+        period = int(row_data['period'])
+        current_rate_db, data_timestamp = self.get_latest_rate_from_db(currency, period)
+
+        # Use DB rate if available, fallback to feature data
+        if current_rate_db is not None:
+            current_rate = current_rate_db
+            actual_timestamp = data_timestamp
+        else:
+            current_rate = float(row_data['close_annual'])
+            actual_timestamp = row_data.get('datetime', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            logger.warning(f"Could not get latest rate from DB for {currency}-{period}, using feature data")
+
         # 构造特征DataFrame
         X_single = pd.DataFrame([{col: row_data[col] for col in feature_cols}])
 
@@ -207,7 +248,6 @@ class EnsemblePredictor:
         final_rate = adjusted_rate + trend_adjustment
 
         # 安全边界检查 (更严格: 降低上限从1.1到1.05)
-        current_rate = float(row_data['close_annual'])
         final_rate = np.clip(final_rate, current_rate * 0.50, current_rate * 1.05)
 
         return {
@@ -222,7 +262,8 @@ class EnsemblePredictor:
             "trend_factor": trend,
             "strategy": strategy_desc,
             "confidence": confidence,
-            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # Use current time, not historical data time
+            "data_timestamp": actual_timestamp,  # Actual timestamp of rate data
+            "prediction_timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # When prediction was made
             # 新增调试信息
             "execution_rate_7d": exec_rate_7d,
             "execution_adjustment_applied": execution_adjustment

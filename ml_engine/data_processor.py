@@ -50,6 +50,54 @@ class DataProcessor:
             df['datetime'] = pd.to_datetime(df['datetime'])
             df = df.sort_values(['period', 'timestamp'])
 
+            # Remove extreme outliers (>200% annual rate)
+            outlier_threshold = 200.0
+            outlier_mask = (
+                (df['close_annual'] > outlier_threshold) |
+                (df['high_annual'] > outlier_threshold) |
+                (df['low_annual'] > outlier_threshold) |
+                (df['open_annual'] > outlier_threshold)
+            )
+            outlier_count = outlier_mask.sum()
+
+            if outlier_count > 0:
+                logger.warning(f"Found {outlier_count} outlier records (>200%) for {currency}. Removing.")
+                outlier_examples = df[outlier_mask][['period', 'datetime', 'close_annual']].head(5)
+                logger.warning(f"Outlier examples:\n{outlier_examples}")
+                df = df[~outlier_mask].copy()
+                logger.info(f"After outlier removal: {len(df)} rows")
+
+            # Cap extreme values at 99th percentile per period
+            for rate_col in ['open_annual', 'close_annual', 'high_annual', 'low_annual']:
+                p99_by_period = df.groupby('period')[rate_col].transform(lambda x: x.quantile(0.99))
+                capped_count = (df[rate_col] > p99_by_period).sum()
+                if capped_count > 0:
+                    logger.info(f"Capping {capped_count} extreme {rate_col} values to 99th percentile")
+                    df[rate_col] = df[rate_col].clip(upper=p99_by_period)
+
+            # Remove negative rates
+            negative_mask = (
+                (df['close_annual'] < 0) |
+                (df['high_annual'] < 0) |
+                (df['low_annual'] < 0) |
+                (df['open_annual'] < 0)
+            )
+            negative_count = negative_mask.sum()
+            if negative_count > 0:
+                logger.warning(f"Removing {negative_count} records with negative rates")
+                df = df[~negative_mask].copy()
+
+            # Sanity check: high >= close >= low
+            invalid_hlc = ~((df['high_annual'] >= df['close_annual']) &
+                           (df['close_annual'] >= df['low_annual']))
+            invalid_count = invalid_hlc.sum()
+            if invalid_count > 0:
+                logger.warning(f"Fixing {invalid_count} records with invalid high/low/close relationships")
+                df.loc[invalid_hlc, 'high_annual'] = df.loc[invalid_hlc, 'close_annual']
+                df.loc[invalid_hlc, 'low_annual'] = df.loc[invalid_hlc, 'close_annual']
+
+            logger.info(f"Data quality checks complete for {currency}")
+
             # 填充缺失值（如有）
             df = df.fillna(method='ffill').fillna(method='bfill')
 
@@ -313,7 +361,7 @@ class DataProcessor:
 
         return df
 
-    def process_currency(self, currency: str, output_dir: str = "../data/processed", max_workers: int = 8):
+    def process_currency(self, currency: str, output_dir: str = None, max_workers: int = 8):
         """
         处理单个币种的全流程：加载 -> 特征工程 -> 保存
         使用并行化加速处理
@@ -323,6 +371,10 @@ class DataProcessor:
             output_dir: 输出目录
             max_workers: 最大并行worker数量
         """
+        if output_dir is None:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            output_dir = os.path.join(base_dir, "data", "processed")
+
         df = self.load_data(currency)
         if df.empty:
             return None
@@ -383,7 +435,41 @@ class DataProcessor:
         return processor.add_technical_indicators(period_df)
 
 if __name__ == "__main__":
+    import sys
+
+    # Configure logging
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+    logger.add("log/ml_optimizer.log", rotation="10 MB", retention="7 days")
+
+    logger.info("Starting data processing pipeline")
+
     processor = DataProcessor()
-    # 示例运行
+    success_count = 0
+    failed_currencies = []
+
     for curr in ['fUSD', 'fUST']:
-        processor.process_currency(curr)
+        try:
+            logger.info(f"Processing {curr}")
+            output_path = processor.process_currency(curr)
+
+            if output_path and os.path.exists(output_path):
+                file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                logger.info(f"✓ Successfully processed {curr}: {output_path} ({file_size_mb:.2f} MB)")
+                success_count += 1
+            else:
+                logger.error(f"✗ Failed: Output file not created for {curr}")
+                failed_currencies.append(curr)
+        except Exception as e:
+            logger.error(f"✗ Failed to process {curr}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            failed_currencies.append(curr)
+
+    logger.info(f"Summary: {success_count}/2 successful")
+    if failed_currencies:
+        logger.error(f"Failed: {', '.join(failed_currencies)}")
+        sys.exit(1)
+    else:
+        logger.info("All currencies processed successfully")
+        sys.exit(0)
