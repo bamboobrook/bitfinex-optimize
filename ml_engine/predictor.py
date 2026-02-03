@@ -301,16 +301,36 @@ class EnsemblePredictor:
         trend_adjustment = trend_factor * 0.10 * adjusted_rate
         final_rate = adjusted_rate + trend_adjustment
 
-        # 安全边界: 相对于当前利率
-        # 下限: 当前的50%(防止过度折扣)
-        # 上限: 当前的105%(从110%降低以控制风险)
-        # 注意: 边界是按设计的规模依赖 - 低利率时更严格
-        clipped_rate = np.clip(final_rate, current_rate * 0.50, current_rate * 1.05)
-        if clipped_rate != final_rate:
+        # 动态安全边界: 根据执行概率调整激进程度
+        # 高概率(>0.8): 宽边界 - 信任模型预测
+        # 中等概率(0.5-0.8): 平衡边界 - 适度控制
+        # 低概率(<0.5): 窄边界 - 保守策略
+        if prob > 0.8:
+            # 高执行概率 = 激进策略
+            min_bound = max(current_rate * 0.4, 0.01)
+            max_bound = current_rate * 1.5
+            strategy_label = "aggressive"
+        elif prob > 0.5:
+            # 中等概率 = 平衡策略
+            min_bound = max(current_rate * 0.45, 0.01)
+            max_bound = current_rate * 1.2
+            strategy_label = "balanced"
+        else:
+            # 低概率 = 保守策略
+            min_bound = max(current_rate * 0.5, 0.01)
+            max_bound = current_rate * 1.05
+            strategy_label = "conservative"
+
+        clipped_rate = np.clip(final_rate, min_bound, max_bound)
+        was_clipped = (clipped_rate != final_rate)
+
+        if was_clipped:
+            reduction_pct = abs((final_rate - clipped_rate) / final_rate * 100) if final_rate != 0 else 0
             logger.info(
                 f"Rate clipped for {currency}-{period}: "
                 f"{final_rate:.4f} -> {clipped_rate:.4f} "
-                f"(bounds: {current_rate*0.5:.4f} to {current_rate*1.05:.4f})"
+                f"(exec_prob={prob:.2f}, bounds: {min_bound:.4f} to {max_bound:.4f}, "
+                f"strategy={strategy_label}, reduction={reduction_pct:.1f}%)"
             )
         final_rate = clipped_rate
 
@@ -341,7 +361,11 @@ class EnsemblePredictor:
             "timestamp": actual_timestamp,  # DEPRECATED: 使用 data_timestamp
             # 新增调试信息
             "execution_rate_7d": exec_rate_7d,
-            "execution_adjustment_applied": execution_adjustment
+            "execution_adjustment_applied": execution_adjustment,
+            # Rate clipping 元数据
+            "was_clipped": was_clipped,
+            "clipping_strategy": strategy_label,
+            "clipping_bounds": {"min": float(min_bound), "max": float(max_bound)}
         }
 
     def _calculate_execution_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
@@ -639,6 +663,31 @@ class EnsemblePredictor:
                 traceback.print_exc()
         else:
             print("Warning: OrderManager not available, skipping virtual order creation")
+        # ============================================================
+
+        # ========== 收集并输出系统指标 ==========
+        try:
+            from ml_engine.metrics import MetricsCollector, save_metrics_to_file
+
+            base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+            db_path = os.path.join(base_dir, 'data', 'lending_history.db')
+
+            metrics_collector = MetricsCollector(db_path)
+
+            # 收集所有指标（包括预测的 clipping 信息）
+            all_metrics = metrics_collector.get_all_metrics(predictions=preds)
+
+            # 打印到日志和控制台
+            metrics_collector.print_metrics_summary(predictions=preds)
+
+            # 保存到文件
+            metrics_output = os.path.join(base_dir, 'data', 'system_metrics.json')
+            save_metrics_to_file(all_metrics, metrics_output)
+
+        except Exception as e:
+            logger.warning(f"Failed to collect system metrics: {e}")
+            import traceback
+            traceback.print_exc()
         # ============================================================
 
 if __name__ == "__main__":
