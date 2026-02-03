@@ -17,7 +17,7 @@ logger.add('/home/bumblebee/Project/optimize/log/ml_optimizer.log', retention='7
 app = FastAPI(title="Lending Optimization API", version="3.0")
 
 # Use absolute paths
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_FILE = str(BASE_DIR / "data" / "optimal_combination.json")
 STATUS_FILE = str(BASE_DIR / "data" / "service_status.json")
 DB_FILE = str(BASE_DIR / "data" / "lending_history.db")

@@ -14,7 +14,7 @@ from functools import partial
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # 添加父目录到 path 以便导入
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from ml_engine.data_processor import DataProcessor
 
 class EnsemblePredictor:
@@ -27,7 +27,7 @@ class EnsemblePredictor:
     def __init__(self, model_dir=None, max_workers=8):
         # Use absolute path for models directory
         if model_dir is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             model_dir = os.path.join(base_dir, "data", "models")
         self.model_dir = model_dir
         self.max_workers = max_workers  # 并行worker数量
@@ -176,7 +176,7 @@ class EnsemblePredictor:
         """Query database directly for the most recent rate"""
         import sqlite3
         db_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
             "data", "lending_history.db"
         )
 
@@ -456,7 +456,7 @@ class EnsemblePredictor:
         """生成推荐结果并保存 - 增强版含虚拟订单创建"""
         # Use absolute path by default
         if output_path is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             output_path = os.path.join(base_dir, "data", "optimal_combination.json")
         preds = self.get_latest_predictions()
         if not preds:

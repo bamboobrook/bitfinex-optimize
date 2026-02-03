@@ -11,7 +11,7 @@ class DataProcessor:
     def __init__(self, db_path: str = None):
         # Use absolute path for database
         if db_path is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             db_path = os.path.join(base_dir, "data", "lending_history.db")
         self.db_path = db_path
         self.conn = None
@@ -371,7 +371,7 @@ class DataProcessor:
             max_workers: 最大并行worker数量
         """
         if output_dir is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             output_dir = os.path.join(base_dir, "data", "processed")
 
         df = self.load_data(currency)

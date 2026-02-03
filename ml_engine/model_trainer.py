@@ -14,10 +14,10 @@ warnings.filterwarnings('ignore')
 class EnsembleModelTrainer:
     def __init__(self, data_dir=None, model_dir=None):
         if data_dir is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             data_dir = os.path.join(base_dir, "data", "processed")
         if model_dir is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             model_dir = os.path.join(base_dir, "data", "models")
 
         self.data_dir = data_dir
