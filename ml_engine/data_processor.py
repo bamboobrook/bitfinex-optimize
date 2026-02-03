@@ -39,11 +39,11 @@ class DataProcessor:
             open_annual, close_annual, high_annual, low_annual, volume,
             hour, day_of_week{month_col}
         FROM funding_rates
-        WHERE currency = '{currency}'
+        WHERE currency = ?
         ORDER BY period, timestamp
         """
         try:
-            df = pd.read_sql(query, self.conn)
+            df = pd.read_sql(query, self.conn, params=(currency,))
             logger.info(f"Loaded {len(df)} rows for {currency}.")
 
             # 简单的数据清洗
@@ -302,42 +302,18 @@ class DataProcessor:
             df['exec_feature_reserved_2'] = 0.0
             df['exec_feature_reserved_3'] = 0.0
 
-        except (ImportError, Exception) as e:
-            # 如果execution_features模块不可用，使用默认值
-            print(f"Warning: execution_features not available ({e}), using default values")
-            df['exec_rate_7d'] = 0.7
-            df['exec_rate_30d'] = 0.7
-            df['avg_spread_7d'] = 0.0
-            df['avg_spread_30d'] = 0.0
-            df['avg_rate_gap_failed_7d'] = 0.0
-            df['exec_delay_p50'] = 0.0
-            df['exec_delay_p90'] = 0.0
-            df['market_competitiveness'] = 1.0
-            df['exec_likelihood_score'] = 0.7
-            df['risk_adjustment_factor'] = 1.0
-            df['exec_rate_trend'] = 1.0
-            df['rate_gap_trend'] = 0.0
-            df['exec_feature_reserved_1'] = 0.0
-            df['exec_feature_reserved_2'] = 0.0
-            df['exec_feature_reserved_3'] = 0.0
+        except ImportError as e:
+            logger.warning(
+                f"execution_features module not available ({e}), using default values. "
+                f"This is expected if execution tracking is not enabled."
+            )
+            df = self._apply_default_exec_features(df)
         except Exception as e:
-            # 任何其他错误，记录并使用默认值
-            logger.error(f"Error calculating execution features: {e}")
-            df['exec_rate_7d'] = 0.7
-            df['exec_rate_30d'] = 0.7
-            df['avg_spread_7d'] = 0.0
-            df['avg_spread_30d'] = 0.0
-            df['avg_rate_gap_failed_7d'] = 0.0
-            df['exec_delay_p50'] = 0.0
-            df['exec_delay_p90'] = 0.0
-            df['market_competitiveness'] = 1.0
-            df['exec_likelihood_score'] = 0.7
-            df['risk_adjustment_factor'] = 1.0
-            df['exec_rate_trend'] = 1.0
-            df['rate_gap_trend'] = 0.0
-            df['exec_feature_reserved_1'] = 0.0
-            df['exec_feature_reserved_2'] = 0.0
-            df['exec_feature_reserved_3'] = 0.0
+            logger.error(
+                f"Error calculating execution features: {e}",
+                exc_info=True
+            )
+            df = self._apply_default_exec_features(df)
 
         # ============ 8. 改进目标定义 (4个目标) ============
         indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=120)
@@ -359,6 +335,29 @@ class DataProcessor:
         # 清理 NaN
         df = df.dropna()
 
+        return df
+
+    def _apply_default_exec_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """当计算失败时应用默认执行特征值"""
+        default_features = {
+            'exec_rate_7d': 0.7,
+            'exec_rate_30d': 0.7,
+            'avg_spread_7d': 0.0,
+            'avg_spread_30d': 0.0,
+            'avg_rate_gap_failed_7d': 0.0,
+            'exec_delay_p50': 0.0,
+            'exec_delay_p90': 0.0,
+            'market_competitiveness': 1.0,
+            'exec_likelihood_score': 0.7,
+            'risk_adjustment_factor': 1.0,
+            'exec_rate_trend': 1.0,
+            'rate_gap_trend': 0.0,
+            'exec_feature_reserved_1': 0.0,
+            'exec_feature_reserved_2': 0.0,
+            'exec_feature_reserved_3': 0.0,
+        }
+        for col, val in default_features.items():
+            df[col] = val
         return df
 
     def process_currency(self, currency: str, output_dir: str = None, max_workers: int = 8):

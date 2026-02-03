@@ -20,6 +20,10 @@ from ml_engine.data_processor import DataProcessor
 class EnsemblePredictor:
     """使用集成模型的增强预测器 - 支持GPU加速和并行化"""
 
+    # 类常量配置
+    COLD_START_THRESHOLD = 10  # 冷启动数据点阈值
+    STALE_DATA_THRESHOLD_HOURS = 2  # 陈旧数据阈值(小时)
+
     def __init__(self, model_dir=None, max_workers=8):
         # Use absolute path for models directory
         if model_dir is None:
@@ -30,6 +34,7 @@ class EnsemblePredictor:
         self.models = {}  # {curr: {model_type: {algo: model}}}
         self.meta_info = {}  # {curr: {model_type: {weights, features, task_type}}}
         self.processor = DataProcessor()
+        self._timestamp_deprecation_warned = False  # 废弃警告标志
 
         # 导入OrderManager用于创建虚拟订单
         try:
@@ -69,7 +74,29 @@ class EnsemblePredictor:
 
         if os.path.exists(cat_path) and os.path.exists(meta_path):
             with open(meta_path, 'r') as f:
-                meta = json.load(f)
+                try:
+                    meta = json.load(f)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Corrupted metadata JSON for {currency}_{prefix}: {e}")
+                    return models, None
+
+            # 验证必需字段
+            required_fields = ['task_type', 'weights', 'feature_cols']
+            missing_fields = [f for f in required_fields if f not in meta]
+            if missing_fields:
+                logger.error(
+                    f"Invalid metadata for {currency}_{prefix}: "
+                    f"missing required fields: {missing_fields}"
+                )
+                return models, None
+
+            # 验证 task_type 值
+            if meta['task_type'] not in ['classification', 'regression']:
+                logger.error(
+                    f"Invalid task_type '{meta['task_type']}' for {currency}_{prefix}. "
+                    f"Must be 'classification' or 'regression'"
+                )
+                return models, None
 
             # 根据task_type加载对应的模型类型
             if meta['task_type'] == 'classification':
@@ -113,7 +140,7 @@ class EnsemblePredictor:
         """
         if currency not in self.models or model_type not in self.models[currency]:
             logger.error(f"Model not found: {currency} - {model_type}")
-            return np.array([])
+            raise ValueError(f"Model not found: {currency} - {model_type}")
 
         models = self.models[currency][model_type]
         meta = self.meta_info[currency][model_type]
@@ -161,6 +188,8 @@ class EnsemblePredictor:
             SELECT close_annual, datetime
             FROM funding_rates
             WHERE currency = ? AND period = ?
+              AND close_annual > 0
+              AND close_annual <= 50
             ORDER BY datetime DESC
             LIMIT 1
             """
@@ -193,9 +222,34 @@ class EnsemblePredictor:
             current_rate = current_rate_db
             actual_timestamp = data_timestamp
         else:
-            current_rate = float(row_data['close_annual'])
-            actual_timestamp = row_data.get('datetime', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-            logger.warning(f"Could not get latest rate from DB for {currency}-{period}, using feature data")
+            # 验证特征数据时间戳新鲜度
+            feature_datetime = row_data.get('datetime')
+            if feature_datetime:
+                from datetime import timedelta
+                if isinstance(feature_datetime, str):
+                    feature_dt = datetime.strptime(feature_datetime, '%Y-%m-%d %H:%M:%S')
+                else:
+                    feature_dt = feature_datetime
+
+                # 检查数据是否陈旧(超过2小时)
+                data_age = datetime.now() - feature_dt
+                if data_age > timedelta(hours=2):
+                    logger.error(
+                        f"STALE DATA DETECTED for {currency}-{period}: "
+                        f"DB query failed AND feature data is {data_age} old (from {feature_datetime}). "
+                        f"Refusing to predict with stale data."
+                    )
+                    raise ValueError(f"Stale data for {currency}-{period}: {data_age} old")
+
+                actual_timestamp = feature_datetime
+                current_rate = float(row_data['close_annual'])
+                logger.warning(
+                    f"DB query failed for {currency}-{period}, using feature data from {feature_datetime} "
+                    f"(age: {data_age})"
+                )
+            else:
+                logger.error(f"No datetime field in feature data for {currency}-{period}")
+                raise ValueError(f"Missing datetime for {currency}-{period}")
 
         # 构造特征DataFrame
         X_single = pd.DataFrame([{col: row_data[col] for col in feature_cols}])
@@ -247,8 +301,27 @@ class EnsemblePredictor:
         trend_adjustment = trend_factor * 0.10 * adjusted_rate
         final_rate = adjusted_rate + trend_adjustment
 
-        # 安全边界检查 (更严格: 降低上限从1.1到1.05)
-        final_rate = np.clip(final_rate, current_rate * 0.50, current_rate * 1.05)
+        # 安全边界: 相对于当前利率
+        # 下限: 当前的50%(防止过度折扣)
+        # 上限: 当前的105%(从110%降低以控制风险)
+        # 注意: 边界是按设计的规模依赖 - 低利率时更严格
+        clipped_rate = np.clip(final_rate, current_rate * 0.50, current_rate * 1.05)
+        if clipped_rate != final_rate:
+            logger.info(
+                f"Rate clipped for {currency}-{period}: "
+                f"{final_rate:.4f} -> {clipped_rate:.4f} "
+                f"(bounds: {current_rate*0.5:.4f} to {current_rate*1.05:.4f})"
+            )
+        final_rate = clipped_rate
+
+        # 添加废弃通知(每次会话一次)
+        if not self._timestamp_deprecation_warned:
+            logger.warning(
+                "Prediction output includes deprecated 'timestamp' field for backwards compatibility. "
+                "Use 'data_timestamp' and 'prediction_timestamp' instead. "
+                "The 'timestamp' field will be removed in v2.0."
+            )
+            self._timestamp_deprecation_warned = True
 
         return {
             "currency": currency,
@@ -264,6 +337,8 @@ class EnsemblePredictor:
             "confidence": confidence,
             "data_timestamp": actual_timestamp,  # Actual timestamp of rate data
             "prediction_timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # When prediction was made
+            # 已废弃字段,用于向后兼容(v2.0中移除)
+            "timestamp": actual_timestamp,  # DEPRECATED: 使用 data_timestamp
             # 新增调试信息
             "execution_rate_7d": exec_rate_7d,
             "execution_adjustment_applied": execution_adjustment
@@ -372,6 +447,9 @@ class EnsemblePredictor:
 
             logger.info(f"Completed predictions for {curr}: {len(all_predictions)} results")
 
+        # 排序结果以保证确定性输出
+        all_predictions.sort(key=lambda x: (x['currency'], x['period']))
+
         return all_predictions
 
     def generate_recommendations(self, output_path=None):
@@ -457,13 +535,15 @@ class EnsemblePredictor:
             try:
                 # Stratified sampling configuration by period tiers - 均衡采样
                 # 目标是覆盖全期限，各层级数量均衡
+                # 周期层级配置
+                # 注意: 交易所不存在周期8-9
+                # 可用周期: [2,3,4,5,6,7, 10,14,15,20,30, 60,90,120]
                 TIER_CONFIG = {
                     'short': {'periods': [2, 3, 4, 5, 6, 7], 'min_orders': 7, 'target_per_period': 1},
                     'medium': {'periods': [10, 14, 15, 20, 30], 'min_orders': 7, 'target_per_period': 1},
                     'long': {'periods': [60, 90, 120], 'min_orders': 6, 'target_per_period': 2}
                 }
                 TOP_N = 24                 # 增加总订单数到24，确保各层级都有足够覆盖
-                COLD_START_THRESHOLD = 10  # Combinations with <10 orders are cold start
 
                 # Helper function to get tier for a period
                 def get_tier(period):
@@ -483,7 +563,7 @@ class EnsemblePredictor:
                             pred['currency'],
                             pred['period']
                         )
-                        pred['is_cold_start'] = order_count < COLD_START_THRESHOLD
+                        pred['is_cold_start'] = order_count < self.COLD_START_THRESHOLD
                         pred['order_count'] = order_count
                         pred['tier'] = tier
                         tier_preds[tier].append(pred)
