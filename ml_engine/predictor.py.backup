@@ -334,6 +334,15 @@ class EnsemblePredictor:
             )
         final_rate = clipped_rate
 
+        # 添加废弃通知(每次会话一次)
+        if not self._timestamp_deprecation_warned:
+            logger.warning(
+                "Prediction output includes deprecated 'timestamp' field for backwards compatibility. "
+                "Use 'data_timestamp' and 'prediction_timestamp' instead. "
+                "The 'timestamp' field will be removed in v2.0."
+            )
+            self._timestamp_deprecation_warned = True
+
         return {
             "currency": currency,
             "period": int(row_data['period']),
@@ -348,6 +357,8 @@ class EnsemblePredictor:
             "confidence": confidence,
             "data_timestamp": actual_timestamp,  # Actual timestamp of rate data
             "prediction_timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # When prediction was made
+            # 已废弃字段,用于向后兼容(v2.0中移除)
+            "timestamp": actual_timestamp,  # DEPRECATED: 使用 data_timestamp
             # 新增调试信息
             "execution_rate_7d": exec_rate_7d,
             "execution_adjustment_applied": execution_adjustment,

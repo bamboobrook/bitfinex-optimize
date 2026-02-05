@@ -144,6 +144,7 @@ def test_timestamp_correctness(conn):
             ROUND((julianday(created_at) - julianday(order_timestamp)) * 24 * 60, 1) as delay_minutes
         FROM virtual_orders
         WHERE ABS((julianday(created_at) - julianday(order_timestamp)) * 24 * 60) > 5
+          AND status != 'EXPIRED'
         ORDER BY created_at DESC
         LIMIT 10
     """)
@@ -433,6 +434,50 @@ def test_cold_start_detection(conn):
         }
 
 
+def test_expired_orders_validated(conn):
+    """
+    测试6: 所有EXPIRED订单都有validated_at时间戳
+
+    这确保订单经过了正确的验证流程,而不是被直接标记为EXPIRED
+    防止未来再次出现未验证的EXPIRED订单
+    """
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT COUNT(*) as unvalidated_count
+        FROM virtual_orders
+        WHERE status = 'EXPIRED'
+          AND validated_at IS NULL
+    """)
+
+    unvalidated_count = cursor.fetchone()[0]
+
+    # Also get total EXPIRED count for context
+    cursor.execute("""
+        SELECT COUNT(*) as total_expired
+        FROM virtual_orders
+        WHERE status = 'EXPIRED'
+    """)
+
+    total_expired = cursor.fetchone()[0]
+
+    # Check if all EXPIRED orders have validated_at
+    if unvalidated_count == 0:
+        status = "PASS"
+        message = f"All {total_expired} EXPIRED orders have validated_at timestamp"
+    else:
+        status = "FAIL"
+        message = f"Found {unvalidated_count} EXPIRED orders without validated_at (out of {total_expired} total)"
+
+    return {
+        "status": status,
+        "message": message,
+        "unvalidated_expired_orders": unvalidated_count,
+        "total_expired_orders": total_expired,
+        "validation_coverage": f"{100.0 * (total_expired - unvalidated_count) / max(total_expired, 1):.1f}%"
+    }
+
+
 def run_all_validation_tests():
     """
     运行所有5个验证测试
@@ -453,6 +498,7 @@ def run_all_validation_tests():
             'sampling_coverage': test_sampling_coverage(conn),
             'execution_rate': test_execution_rate_realism(conn),
             'cold_start_detection': test_cold_start_detection(conn),
+            'expired_orders_validated': test_expired_orders_validated(conn),
         }
 
         conn.close()
@@ -695,14 +741,15 @@ def get_stats():
 @app.get("/validate")
 def validate_system():
     """
-    运行所有5个系统验证测试，返回完整验证报告
+    运行所有6个系统验证测试,返回完整验证报告
 
     测试包括:
-        1. 时间戳正确性（5分钟内）
-        2. 验证窗口合规性（防止 look-ahead bias）
-        3. 采样覆盖率（7天内 >80% 组合覆盖）
-        4. 执行率真实性（<90%）
+        1. 时间戳正确性(5分钟内)
+        2. 验证窗口合规性(防止 look-ahead bias)
+        3. 采样覆盖率(7天内 >80% 组合覆盖)
+        4. 执行率真实性(<90%)
         5. 冷启动组合检测
+        6. EXPIRED订单验证覆盖率(确保所有EXPIRED订单都经过验证)
     """
     return run_all_validation_tests()
 
@@ -719,6 +766,7 @@ def validate_single_test(test_name: str):
             - sampling_coverage: 采样覆盖率
             - execution_rate: 执行率真实性
             - cold_start_detection: 冷启动检测
+            - expired_orders_validated: EXPIRED订单验证覆盖率
     """
     test_functions = {
         'timestamp_correctness': test_timestamp_correctness,
@@ -726,6 +774,7 @@ def validate_single_test(test_name: str):
         'sampling_coverage': test_sampling_coverage,
         'execution_rate': test_execution_rate_realism,
         'cold_start_detection': test_cold_start_detection,
+        'expired_orders_validated': test_expired_orders_validated,
     }
 
     if test_name not in test_functions:

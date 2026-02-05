@@ -82,7 +82,7 @@ class OrderManager:
                 prediction['currency'],
                 prediction['period'],
                 prediction['predicted_rate'],
-                current_time,
+                prediction.get('timestamp', current_time),
                 validation_window,
                 prediction.get('confidence', 'Medium'),
                 prediction.get('strategy', 'Unknown'),

@@ -99,7 +99,7 @@ class DataProcessor:
             logger.info(f"Data quality checks complete for {currency}")
 
             # 填充缺失值（如有）
-            df = df.ffill().bfill()
+            df = df.fillna(method='ffill').fillna(method='bfill')
 
             return df
         except Exception as e:
