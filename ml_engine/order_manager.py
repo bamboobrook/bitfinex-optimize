@@ -54,7 +54,8 @@ class OrderManager:
                 - currency: fUSD/fUST
                 - period: lending period
                 - predicted_rate: predicted lending rate
-                - timestamp: prediction timestamp
+                - data_timestamp: timestamp of market data used for prediction
+                - prediction_timestamp: when prediction was made
                 - confidence: Low/Medium/High
                 - strategy: strategy description
 
@@ -68,8 +69,13 @@ class OrderManager:
         cursor = conn.cursor()
 
         try:
-            # Use explicit created_at to avoid timezone issues with SQLite CURRENT_TIMESTAMP (UTC)
+            # Use explicit timestamps to avoid timezone issues
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # CRITICAL FIX: Use data_timestamp as order_timestamp to avoid time inconsistencies
+            # order_timestamp should reflect when the market data was captured,
+            # not when the order was created
+            data_timestamp = prediction.get('data_timestamp', current_time)
 
             cursor.execute("""
                 INSERT INTO virtual_orders
@@ -82,12 +88,12 @@ class OrderManager:
                 prediction['currency'],
                 prediction['period'],
                 prediction['predicted_rate'],
-                current_time,
+                data_timestamp,  # Use data_timestamp for order_timestamp
                 validation_window,
                 prediction.get('confidence', 'Medium'),
                 prediction.get('strategy', 'Unknown'),
                 'v1.0',  # Model version
-                current_time  # Explicit created_at
+                current_time  # created_at is when order was inserted
             ))
 
             conn.commit()

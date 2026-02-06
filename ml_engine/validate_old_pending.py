@@ -10,6 +10,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 import logging
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -71,38 +72,72 @@ def force_validate_order(validator, order):
             validator.update_order_status(order_id, update_data)
             return {'status': 'EXPIRED', 'reason': 'No market data'}
 
-        # 检查执行
+        # 检查执行 - FIXED LOGIC (Plan B: Percentile-based)
+        # 在Lending市场中，Lender设置的利率越低，越容易被Borrower选中
+        # 因此只有当预测利率 <= 市场25分位数时，才认为订单成交
         predicted_rate = order['predicted_rate']
         executed = False
         execution_details = {}
 
-        max_rate = 0.0
+        # Collect all market rates during validation window
+        market_close_rates = []
+        market_data_timestamped = []
+
         for row in market_data:
             timestamp_str, high_annual, close_annual = row
+            close_annual = close_annual or 0.0
             high_annual = high_annual or 0.0
 
-            if high_annual > max_rate:
-                max_rate = high_annual
+            market_close_rates.append(close_annual)
+            market_data_timestamped.append((timestamp_str, close_annual, high_annual))
 
-            if high_annual >= predicted_rate:
-                executed = True
-                row_time = datetime.fromisoformat(timestamp_str)
-                delay_minutes = int((row_time - order_time).total_seconds() / 60)
+        if not market_close_rates:
+            # No valid market data
+            update_data = {'status': 'EXPIRED'}
+            validator.update_order_status(order_id, update_data)
+            return {'status': 'EXPIRED', 'reason': 'No market data'}
 
-                execution_details = {
-                    'status': 'EXECUTED',
-                    'executed_at': timestamp_str,
-                    'execution_rate': high_annual,
-                    'execution_delay_minutes': delay_minutes,
-                    'max_market_rate': high_annual
-                }
-                break
+        # Calculate market percentiles
+        percentile_25 = np.percentile(market_close_rates, 25)
+        min_rate = np.min(market_close_rates)
+        max_rate = np.max(market_close_rates)
+        median_rate = np.median(market_close_rates)
 
-        if not executed:
+        # Execution logic: predicted_rate <= 25th percentile
+        if predicted_rate <= percentile_25:
+            executed = True
+
+            # Find the first timestamp where market rate is close to predicted rate
+            execution_timestamp = None
+            execution_rate = None
+
+            for timestamp_str, close_rate, high_rate in market_data_timestamped:
+                if close_rate >= predicted_rate * 0.95:  # Within 5% tolerance
+                    execution_timestamp = timestamp_str
+                    execution_rate = close_rate
+                    break
+
+            # Fallback: use first datapoint if no match found
+            if execution_timestamp is None:
+                execution_timestamp = market_data_timestamped[0][0]
+                execution_rate = market_data_timestamped[0][1]
+
+            row_time = datetime.fromisoformat(execution_timestamp)
+            delay_minutes = int((row_time - order_time).total_seconds() / 60)
+
+            execution_details = {
+                'status': 'EXECUTED',
+                'executed_at': execution_timestamp,
+                'execution_rate': execution_rate,
+                'execution_delay_minutes': delay_minutes,
+                'max_market_rate': max_rate
+            }
+        else:
+            # Order failed - predicted rate too high (not competitive)
             execution_details = {
                 'status': 'FAILED',
                 'max_market_rate': max_rate,
-                'rate_gap': predicted_rate - max_rate
+                'rate_gap': predicted_rate - percentile_25  # Gap to 25th percentile
             }
 
         validator.update_order_status(order_id, execution_details)

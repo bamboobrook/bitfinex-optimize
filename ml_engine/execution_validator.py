@@ -9,6 +9,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Dict, List
 import os
+import numpy as np
 
 # Resolve database path relative to this file
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -98,18 +99,25 @@ class ExecutionValidator:
             window_hours = order['validation_window_hours']
             window_end = order_time + timedelta(hours=window_hours)
 
-            # Check if validation window has passed
+            # CRITICAL FIX: Add 1-hour buffer to prevent premature validation
+            # This ensures we strictly enforce the validation window requirement
+            # and avoid look-ahead bias from validating orders too early
+            validation_safe_time = window_end + timedelta(hours=1)
+
+            # Check if validation window has passed (with 1-hour safety buffer)
             now = datetime.now()
-            if now < window_end:
+            if now < validation_safe_time:
                 # Not ready for validation yet
+                hours_remaining = (validation_safe_time - now).total_seconds() / 3600
                 return {
                     'order_id': order['order_id'],
                     'status': 'PENDING',
-                    'reason': 'Validation window not complete'
+                    'reason': f'Validation window not complete (wait {hours_remaining:.1f}h more)'
                 }
 
             # CRITICAL: Validation window end must not exceed current time
             # This prevents look-ahead bias from using "future" data
+            # Use the original window_end (without buffer) for data query
             actual_window_end = min(window_end, now)
 
             # Query market rates during validation window
@@ -132,42 +140,88 @@ class ExecutionValidator:
                     'reason': 'No market data available'
                 }
 
-            # Check for execution
+            # Check for execution - FIXED LOGIC (Plan B: Percentile-based)
+            # 在Lending市场中，Lender设置的利率越低，越容易被Borrower选中
+            # 因此只有当预测利率 <= 市场25分位数时，才认为订单成交
             predicted_rate = order['predicted_rate']
             executed = False
             execution_details = {}
 
-            max_rate = 0.0
+            # Collect all market rates during validation window
+            market_close_rates = []
+            market_high_rates = []
+            market_data_timestamped = []
+
             for row in market_data:
                 timestamp_str, high_annual, close_annual = row
+                close_annual = close_annual or 0.0
                 high_annual = high_annual or 0.0
 
-                # Track maximum rate
-                if high_annual > max_rate:
-                    max_rate = high_annual
+                market_close_rates.append(close_annual)
+                market_high_rates.append(high_annual)
+                market_data_timestamped.append((timestamp_str, close_annual, high_annual))
 
-                # Check if order would execute (market reached predicted rate)
-                if high_annual >= predicted_rate:
+            if not market_close_rates:
+                # No valid market data
+                execution_details = {
+                    'status': 'FAILED',
+                    'max_market_rate': 0.0,
+                    'rate_gap': predicted_rate
+                }
+            else:
+                # Calculate market percentiles (using close_annual as reference)
+                percentile_25 = np.percentile(market_close_rates, 25)
+                min_rate = np.min(market_close_rates)
+                max_rate = np.max(market_close_rates)
+                median_rate = np.median(market_close_rates)
+
+                # Execution logic: predicted_rate <= 25th percentile
+                # This means your offer is in the lowest 25% of market rates
+                # → High chance of execution (competitive pricing)
+                if predicted_rate <= percentile_25:
                     executed = True
-                    row_time = datetime.fromisoformat(timestamp_str)
+
+                    # Find the first timestamp where market rate is close to predicted rate
+                    # (simulating when the order would be matched)
+                    execution_timestamp = None
+                    execution_rate = None
+
+                    for timestamp_str, close_rate, high_rate in market_data_timestamped:
+                        # Order executes when market rate is near or above predicted rate
+                        # Use close_rate as reference for actual execution price
+                        if close_rate >= predicted_rate * 0.95:  # Within 5% tolerance
+                            execution_timestamp = timestamp_str
+                            execution_rate = close_rate
+                            break
+
+                    # Fallback: use first datapoint if no match found
+                    if execution_timestamp is None:
+                        execution_timestamp = market_data_timestamped[0][0]
+                        execution_rate = market_data_timestamped[0][1]
+
+                    row_time = datetime.fromisoformat(execution_timestamp)
                     delay_minutes = int((row_time - order_time).total_seconds() / 60)
 
                     execution_details = {
                         'status': 'EXECUTED',
-                        'executed_at': timestamp_str,
-                        'execution_rate': high_annual,
+                        'executed_at': execution_timestamp,
+                        'execution_rate': execution_rate,
                         'execution_delay_minutes': delay_minutes,
-                        'max_market_rate': high_annual
+                        'max_market_rate': max_rate,
+                        'market_percentile_25': percentile_25,
+                        'market_median': median_rate,
+                        'market_min': min_rate
                     }
-                    break
-
-            if not executed:
-                # Order failed to execute
-                execution_details = {
-                    'status': 'FAILED',
-                    'max_market_rate': max_rate,
-                    'rate_gap': predicted_rate - max_rate
-                }
+                else:
+                    # Order failed - predicted rate too high (not competitive)
+                    execution_details = {
+                        'status': 'FAILED',
+                        'max_market_rate': max_rate,
+                        'rate_gap': predicted_rate - percentile_25,  # Gap to 25th percentile
+                        'market_percentile_25': percentile_25,
+                        'market_median': median_rate,
+                        'market_min': min_rate
+                    }
 
             # Update database
             self.update_order_status(order['order_id'], execution_details)

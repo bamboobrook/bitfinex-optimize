@@ -219,8 +219,25 @@ class EnsemblePredictor:
 
         # Use DB rate if available, fallback to feature data
         if current_rate_db is not None:
+            # ✅ CRITICAL FIX: Check data freshness even when DB query succeeds
+            from datetime import timedelta
+            if isinstance(data_timestamp, str):
+                db_dt = datetime.strptime(data_timestamp, '%Y-%m-%d %H:%M:%S')
+            else:
+                db_dt = data_timestamp
+
+            data_age = datetime.now() - db_dt
+            if data_age > timedelta(hours=self.STALE_DATA_THRESHOLD_HOURS):
+                logger.error(
+                    f"STALE DATA DETECTED from DB for {currency}-{period}: "
+                    f"Latest data is {data_age} old (from {data_timestamp}). "
+                    f"Refusing to predict with stale data."
+                )
+                raise ValueError(f"Stale DB data for {currency}-{period}: {data_age} old")
+
             current_rate = current_rate_db
             actual_timestamp = data_timestamp
+            logger.debug(f"Using DB rate for {currency}-{period}: {current_rate} (age: {data_age})")
         else:
             # 验证特征数据时间戳新鲜度
             feature_datetime = row_data.get('datetime')
@@ -231,9 +248,9 @@ class EnsemblePredictor:
                 else:
                     feature_dt = feature_datetime
 
-                # 检查数据是否陈旧(超过2小时)
+                # 检查数据是否陈旧(超过阈值)
                 data_age = datetime.now() - feature_dt
-                if data_age > timedelta(hours=2):
+                if data_age > timedelta(hours=self.STALE_DATA_THRESHOLD_HOURS):
                     logger.error(
                         f"STALE DATA DETECTED for {currency}-{period}: "
                         f"DB query failed AND feature data is {data_age} old (from {feature_datetime}). "
