@@ -169,32 +169,24 @@ class ExecutionValidator:
                     'rate_gap': predicted_rate
                 }
             else:
-                # Calculate market percentiles (using close_annual as reference)
-                percentile_25 = np.percentile(market_close_rates, 25)
-                min_rate = np.min(market_close_rates)
-                max_rate = np.max(market_close_rates)
-                median_rate = np.median(market_close_rates)
+                # 使用混合判断策略
+                should_execute, confidence, score_details = self._calculate_hybrid_execution_score(
+                    predicted_rate, market_close_rates
+                )
 
-                # Execution logic: predicted_rate <= 25th percentile
-                # This means your offer is in the lowest 25% of market rates
-                # → High chance of execution (competitive pricing)
-                if predicted_rate <= percentile_25:
+                if should_execute:
                     executed = True
 
-                    # Find the first timestamp where market rate is close to predicted rate
-                    # (simulating when the order would be matched)
+                    # 找到第一个匹配的执行时间点
                     execution_timestamp = None
                     execution_rate = None
 
                     for timestamp_str, close_rate, high_rate in market_data_timestamped:
-                        # Order executes when market rate is near or above predicted rate
-                        # Use close_rate as reference for actual execution price
                         if close_rate >= predicted_rate * 0.95:  # Within 5% tolerance
                             execution_timestamp = timestamp_str
                             execution_rate = close_rate
                             break
 
-                    # Fallback: use first datapoint if no match found
                     if execution_timestamp is None:
                         execution_timestamp = market_data_timestamped[0][0]
                         execution_rate = market_data_timestamped[0][1]
@@ -207,20 +199,15 @@ class ExecutionValidator:
                         'executed_at': execution_timestamp,
                         'execution_rate': execution_rate,
                         'execution_delay_minutes': delay_minutes,
-                        'max_market_rate': max_rate,
-                        'market_percentile_25': percentile_25,
-                        'market_median': median_rate,
-                        'market_min': min_rate
+                        'execution_confidence': confidence,
+                        **score_details
                     }
                 else:
-                    # Order failed - predicted rate too high (not competitive)
+                    # 订单失败
                     execution_details = {
                         'status': 'FAILED',
-                        'max_market_rate': max_rate,
-                        'rate_gap': predicted_rate - percentile_25,  # Gap to 25th percentile
-                        'market_percentile_25': percentile_25,
-                        'market_median': median_rate,
-                        'market_min': min_rate
+                        'execution_confidence': confidence,
+                        **score_details
                     }
 
             # Update database
@@ -240,6 +227,97 @@ class ExecutionValidator:
                 'status': 'ERROR',
                 'error': str(e)
             }
+
+    def _calculate_hybrid_execution_score(
+        self,
+        predicted_rate: float,
+        market_close_rates: list
+    ) -> tuple:
+        """
+        混合判断: 分位数 + 利率差距 + 市场密度
+
+        Args:
+            predicted_rate: 预测利率
+            market_close_rates: 市场收盘利率列表
+
+        Returns:
+            (should_execute, confidence_score, score_details)
+        """
+        if not market_close_rates or len(market_close_rates) == 0:
+            return False, 0.0, {'error': 'No market data'}
+
+        # 计算市场统计值
+        percentile_25 = np.percentile(market_close_rates, 25)
+        percentile_30 = np.percentile(market_close_rates, 30)
+        percentile_35 = np.percentile(market_close_rates, 35)
+        percentile_40 = np.percentile(market_close_rates, 40)
+        median = np.median(market_close_rates)
+        min_rate = np.min(market_close_rates)
+        max_rate = np.max(market_close_rates)
+
+        # 1. 分位数得分 (0-40分)
+        # 预测利率在市场分位数中的位置，越低分数越高
+        if predicted_rate <= percentile_25:
+            percentile_score = 40
+        elif predicted_rate <= percentile_30:
+            percentile_score = 35
+        elif predicted_rate <= percentile_35:
+            percentile_score = 28
+        elif predicted_rate <= percentile_40:
+            percentile_score = 20
+        elif predicted_rate <= median:
+            percentile_score = 10
+        else:
+            percentile_score = 0
+
+        # 2. 利率差距得分 (0-30分)
+        # 预测利率越接近市场最低值，得分越高
+        rate_gap = predicted_rate - min_rate
+        median_gap = median - min_rate
+
+        if median_gap > 0:
+            gap_ratio = rate_gap / median_gap
+            gap_score = max(30 - gap_ratio * 30, 0)
+        else:
+            gap_score = 30 if rate_gap < 0.001 else 0
+
+        # 3. 市场密度得分 (0-30分)
+        # 在预测利率±5%附近有多少市场报价
+        if predicted_rate > 0:
+            tolerance = 0.05  # 5% tolerance
+            nearby_rates = [
+                r for r in market_close_rates
+                if abs(r - predicted_rate) / predicted_rate <= tolerance
+            ]
+            density_ratio = len(nearby_rates) / len(market_close_rates)
+            density_score = density_ratio * 30
+        else:
+            nearby_rates = []
+            density_score = 0
+
+        # 综合评分 (0-100)
+        total_score = percentile_score + gap_score + density_score
+
+        # 执行阈值: 45分 (微调后更接近目标执行率)
+        should_execute = total_score >= 45
+        confidence = total_score / 100
+
+        score_details = {
+            'percentile_score': round(percentile_score, 2),
+            'gap_score': round(gap_score, 2),
+            'density_score': round(density_score, 2),
+            'total_score': round(total_score, 2),
+            'market_percentile_25': percentile_25,
+            'market_percentile_30': percentile_30,
+            'market_percentile_35': percentile_35,
+            'market_median': median,
+            'market_min': min_rate,
+            'market_max': max_rate,
+            'rate_gap': rate_gap,
+            'nearby_rate_count': len(nearby_rates) if predicted_rate > 0 else 0
+        }
+
+        return should_execute, confidence, score_details
 
     def query_market_rates(self, currency: str, period: int,
                           start_time: datetime, end_time: datetime) -> List:
@@ -301,7 +379,12 @@ class ExecutionValidator:
             values = []
 
             for field in ['status', 'executed_at', 'execution_rate',
-                         'execution_delay_minutes', 'max_market_rate', 'rate_gap']:
+                         'execution_delay_minutes', 'max_market_rate', 'rate_gap',
+                         'execution_confidence', 'percentile_score', 'gap_score',
+                         'density_score', 'total_score', 'market_percentile_25',
+                         'market_percentile_30', 'market_median', 'market_min',
+                         'market_max', 'nearby_rate_count', 'market_percentile_35',
+                         'rate_gap']:
                 if field in update_data:
                     set_clauses.append(f"{field} = ?")
                     values.append(update_data[field])

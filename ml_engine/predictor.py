@@ -111,11 +111,12 @@ class EnsemblePredictor:
             return models, None
 
     def load_all_models(self):
-        """加载所有币种的所有模型"""
+        """加载所有币种的所有模型 - 增强版支持新模型"""
         for curr in ['fUSD', 'fUST']:
             self.models[curr] = {}
             self.meta_info[curr] = {}
 
+            # 传统4个模型
             for model_type in ['model_execution_prob', 'model_conservative',
                               'model_aggressive', 'model_balanced']:
                 models, meta = self.load_ensemble_models(curr, model_type)
@@ -126,6 +127,17 @@ class EnsemblePredictor:
                     logger.info(f"Loaded {model_type} for {curr}")
                 else:
                     logger.warning(f"Failed to load {model_type} for {curr}")
+
+            # 尝试加载增强模型 (如果存在)
+            for enhanced_model_type in ['model_execution_prob_v2', 'model_revenue_optimized']:
+                models, meta = self.load_ensemble_models(curr, enhanced_model_type)
+
+                if models and meta:
+                    self.models[curr][enhanced_model_type] = models
+                    self.meta_info[curr][enhanced_model_type] = meta
+                    logger.info(f"✨ Loaded enhanced {enhanced_model_type} for {curr}")
+                else:
+                    logger.debug(f"Enhanced {enhanced_model_type} not available for {curr} (using traditional models)")
 
     def predict_with_ensemble(self, X: pd.DataFrame, currency: str, model_type: str) -> np.ndarray:
         """
@@ -308,8 +320,11 @@ class EnsemblePredictor:
             exec_rate_7d, exec_rate_30d, avg_rate_gap, base_rate
         )
 
-        # 应用调整
-        adjusted_rate = base_rate * execution_adjustment * risk_adjustment
+        # ⭐ 新增:币种差异化因子
+        currency_factor = self._get_currency_adjustment_factor(currency, period, exec_rate_7d)
+
+        # 应用调整 (执行反馈 × 风险因子 × 币种因子)
+        adjusted_rate = base_rate * execution_adjustment * risk_adjustment * currency_factor
         # ====================================================================
 
         # 趋势修正 (降低趋势影响权重从0.15到0.10)
@@ -377,14 +392,16 @@ class EnsemblePredictor:
     def _calculate_execution_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
                                          avg_gap: float, base_rate: float) -> float:
         """
-        根据成交历史计算利率调整系数
+        根据成交历史计算利率调整系数 - 优化版
 
-        调整逻辑:
-        - 成交率 < 50%: 降低10%
-        - 成交率 50-60%: 降低5%
-        - 成交率 60-70%: 降低2%
-        - 成交率 70-90%: 不调整
-        - 成交率 > 90%: 可提高1% (弱化马太效应)
+        调整逻辑(更平衡):
+        - 成交率 < 40%: 降低12% (从10%调整)
+        - 成交率 < 50%: 降低7% (从10%调整)
+        - 成交率 50-60%: 降低5% (保持)
+        - 成交率 60-70%: 降低2% (保持)
+        - 成交率 70-80%: 不调整
+        - 成交率 80-90%: 提高3% (新增)
+        - 成交率 > 90%: 提高5% (从1%调整) ⭐
 
         额外考虑:
         - 失败订单平均利率差距大,进一步降低
@@ -397,17 +414,21 @@ class EnsemblePredictor:
             base_rate: 基础预测利率
 
         Returns:
-            调整系数 (0.85-1.05)
+            调整系数 (0.85-1.15)
         """
-        # 基础调整
-        if exec_rate_7d < 0.5:
-            adjustment = 0.90
+        # 基础调整 - 更平衡的策略
+        if exec_rate_7d < 0.4:
+            adjustment = 0.88      # 极低成交率,激进降低
+        elif exec_rate_7d < 0.5:
+            adjustment = 0.93      # 低成交率,适度降低
         elif exec_rate_7d < 0.6:
-            adjustment = 0.95
+            adjustment = 0.95      # 保持
         elif exec_rate_7d < 0.7:
-            adjustment = 0.98
-        elif exec_rate_7d > 0.90:  # Raise threshold from 0.85 to 0.90
-            adjustment = 1.01       # Lower reward from 1.02 to 1.01
+            adjustment = 0.98      # 保持
+        elif exec_rate_7d > 0.9:
+            adjustment = 1.05      # ⭐ 提高奖励 (从1.01增加到1.05)
+        elif exec_rate_7d > 0.8:
+            adjustment = 1.03      # ⭐ 新增:高成交率适度提高
         else:
             adjustment = 1.0
 
@@ -423,10 +444,47 @@ class EnsemblePredictor:
         elif exec_trend > 1.2:  # 成交率改善
             adjustment *= 1.01
 
-        # 安全边界
-        adjustment = np.clip(adjustment, 0.85, 1.05)
+        # 安全边界 (扩大上限从1.05到1.15)
+        adjustment = np.clip(adjustment, 0.85, 1.15)
 
         return adjustment
+
+    def _get_currency_adjustment_factor(self, currency: str, period: int, exec_rate: float) -> float:
+        """
+        币种和周期差异化调整因子
+
+        策略:
+        - fUST + 高成交率 (>60%): 提高10% (利用高成交场景)
+        - 高成交周期 (15/60/90) + 高成交率 (>65%): 提高8%
+        - fUSD + 低成交率 (<35%): 降低7% (避免失败)
+        - 低成交周期 (2/30/120) + 低成交率 (<35%): 降低5%
+
+        Args:
+            currency: 币种 (fUSD/fUST)
+            period: 期限 (天)
+            exec_rate: 执行成交率
+
+        Returns:
+            调整因子 (0.90-1.15)
+        """
+        # fUST通常成交率较高,可以更激进
+        if currency == 'fUST' and exec_rate > 0.6:
+            return 1.10
+
+        # 高成交周期(15/60/90天)可以提高利率
+        if period in [15, 60, 90] and exec_rate > 0.65:
+            return 1.08
+
+        # fUSD低成交场景需要保守
+        if currency == 'fUSD' and exec_rate < 0.35:
+            return 0.93
+
+        # 低成交周期(2/30/120天)低成交场景需要保守
+        if period in [2, 30, 120] and exec_rate < 0.35:
+            return 0.95
+
+        # 默认不调整
+        return 1.0
 
     def get_latest_predictions(self):
         """获取最新预测结果 - 并行化版本"""
@@ -498,10 +556,22 @@ class EnsemblePredictor:
         # 2. 在成交概率合格的基础上，按预测利率降序排列
         valid_preds = [p for p in preds if p['predicted_rate'] > 1.0]
 
-        # 按成交概率和预测利率综合排序
+        # 按成交概率和预测利率综合排序 - 优化版 (60%概率 + 40%利率)
+        def calculate_weighted_score(pred):
+            """
+            加权评分:
+            - 60% 成交概率 (更重视成交)
+            - 40% 标准化利率 (兼顾收益)
+            """
+            prob = pred['execution_probability']
+            rate = pred['predicted_rate']
+            # 标准化利率到0-1范围 (假设最高利率40%)
+            normalized_rate = min(rate / 40.0, 1.0)
+            return prob * 0.6 + normalized_rate * 0.4
+
         sorted_preds = sorted(
             valid_preds,
-            key=lambda x: (x['execution_probability'] * x['predicted_rate']),
+            key=calculate_weighted_score,
             reverse=True
         )
 

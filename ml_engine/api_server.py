@@ -549,21 +549,29 @@ def run_all_validation_tests():
             "overall_status": "ERROR"
         }
 
-# --- 核心逻辑: 完整更新流水线 (每2小时运行) ---
+# --- 核心逻辑: 完整更新流水线 (每2小时运行) - 闭环优化版 ---
 async def run_full_pipeline():
     """
-    后台任务: 执行完整的数据更新与模型训练流程
-    步骤: 验证订单 -> 下载数据 -> 处理特征 -> 训练模型 -> 生成预测
-    适合每2小时运行一次
-    """
-    logger.info("=" * 70)
-    logger.info(">>> Starting full update pipeline (2-hour cycle)...")
-    logger.info(f">>> Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 70)
+    后台任务: 执行完整的闭环优化流程
 
-    # ========== STEP 1: 验证虚拟订单 (Validate Virtual Orders) ==========
-    update_status("processing", "1. Validating Orders", "Checking pending orders...")
-    logger.info("Step 1: Validating pending virtual orders")
+    闭环流程:
+    1. 验证虚拟订单（获取执行反馈）
+    2. 下载最新市场数据（确保数据新鲜）⭐
+    3. 检查是否需要重训练（基于执行结果）
+    4. 如果需要，执行模型重训练（学习市场反馈）
+    5. 生成新预测（使用最新模型和数据）
+    6. 创建新虚拟订单（进入下一轮循环）
+
+    适合每2小时运行一次，形成持续优化闭环
+    """
+    logger.info("=" * 80)
+    logger.info(">>> 🔄 Starting CLOSED-LOOP Optimization Pipeline")
+    logger.info(f">>> Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 80)
+
+    # ========== STEP 1: 验证虚拟订单 (获取执行反馈) ==========
+    update_status("processing", "1. Validating Orders", "Checking pending orders for execution feedback...")
+    logger.info("Step 1: 🔍 Validating pending virtual orders (execution feedback)")
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -577,60 +585,175 @@ async def run_full_pipeline():
         if process.returncode != 0:
             logger.warning(f"Order validation had issues: {stderr.decode()}")
         else:
-            logger.info(f"Order validation completed: {stdout.decode().strip()}")
+            logger.info(f"✅ Order validation completed: {stdout.decode().strip()[-500:]}")
     except Exception as e:
-        logger.warning(f"Order validation failed: {e}, continuing with pipeline")
+        logger.warning(f"⚠️  Order validation failed: {e}, continuing with pipeline")
     # ====================================================================
 
-    # 定义流水线步骤 (显示名称, Python模块路径)
-    steps = [
-        ("2. Downloading Data", ["python", "-m", "funding_history_downloader"]),
-        ("3. Processing Features", ["python", "-m", "ml_engine.data_processor"]),
-        ("4. Re-training Models", ["python", "-m", "ml_engine.model_trainer"]),
-        ("5. Generating Predictions", ["python", "-m", "ml_engine.predictor"])
-    ]
+    # ========== STEP 2: 下载最新市场数据 (必须！) ⭐ ==========
+    update_status("processing", "2. Downloading Data", "Downloading latest market data...")
+    logger.info("Step 2: 📥 Downloading latest market data (CRITICAL)")
 
-    for step_name, command in steps:
-        update_status("processing", step_name, "Executing...")
-        logger.info(f"Running: {step_name}")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "python", "-m", "funding_history_downloader",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(BASE_DIR)
+        )
+        stdout, stderr = await process.communicate()
+
+        stdout_text = stdout.decode().strip()
+        stderr_text = stderr.decode().strip()
+
+        if stdout_text:
+            logger.info(f"Download output (last 500 chars):\n{stdout_text[-500:]}")
+        if stderr_text:
+            logger.warning(f"Download stderr:\n{stderr_text[-500:]}")
+
+        if process.returncode != 0:
+            logger.warning(f"⚠️  Data download had issues (exit code {process.returncode}), continuing...")
+        else:
+            logger.info(f"✅ Market data download completed")
+
+    except Exception as e:
+        logger.warning(f"⚠️  Data download failed: {e}, continuing with existing data")
+    # ====================================================================
+
+    # ========== STEP 3: 检查是否需要重训练 (闭环核心) ==========
+    update_status("processing", "3. Checking Retraining", "Evaluating if model retraining is needed...")
+    logger.info("Step 3: 🤖 Checking if model retraining is needed (closed-loop)")
+
+    should_retrain = False
+    try:
+        # 调用重训练调度器的干运行模式
+        process = await asyncio.create_subprocess_exec(
+            "python", str(BASE_DIR / "ml_engine" / "retraining_scheduler.py"),
+            "--dry-run",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(BASE_DIR)
+        )
+        stdout, stderr = await process.communicate()
+        stdout_text = stdout.decode().strip()
+
+        # 检查输出中是否包含"需要重训练"
+        if "需要重训练" in stdout_text:
+            should_retrain = True
+            logger.info(f"✅ Retraining trigger detected: {stdout_text[-300:]}")
+        else:
+            logger.info(f"ℹ️  No retraining needed: {stdout_text[-300:]}")
+
+    except Exception as e:
+        logger.warning(f"⚠️  Retraining check failed: {e}, skipping retraining")
+    # ====================================================================
+
+    # ========== STEP 4: 执行模型重训练 (如果需要) ==========
+    if should_retrain:
+        update_status("processing", "4. Retraining Models", "Training models with execution feedback...")
+        logger.info("Step 4: 🚀 Retraining models with execution feedback (CLOSED-LOOP)")
 
         try:
-            # 使用子进程调用脚本，确保内存独立且环境干净
+            # 使用增强版训练器，融合执行结果
             process = await asyncio.create_subprocess_exec(
-                *command,
+                "python", str(BASE_DIR / "ml_engine" / "retraining_scheduler.py"),
+                "--force",  # 强制执行重训练
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(BASE_DIR)
             )
-            # 等待完成
             stdout, stderr = await process.communicate()
 
-            # Capture and log subprocess output
             stdout_text = stdout.decode().strip()
             stderr_text = stderr.decode().strip()
 
-            # Log subprocess output
             if stdout_text:
-                logger.info(f"{step_name} output:\n{stdout_text}")
+                logger.info(f"Retraining output (last 1000 chars):\n{stdout_text[-1000:]}")
             if stderr_text:
-                logger.warning(f"{step_name} stderr:\n{stderr_text}")
+                logger.warning(f"Retraining stderr (last 500 chars):\n{stderr_text[-500:]}")
 
             if process.returncode != 0:
-                err_msg = stderr_text or stdout_text or "Process exited with non-zero code"
-                logger.error(f"{step_name} Failed (exit code {process.returncode}): {err_msg}")
-                update_status("error", step_name, f"Failed: {err_msg[-200:]}")  # 只记录最后200字符
-                return
-
-            logger.info(f"{step_name} completed successfully (exit code 0)")
+                logger.error(f"❌ Retraining failed (exit code {process.returncode})")
+                update_status("error", "4. Retraining Models", "Retraining failed")
+                # 不返回，继续使用现有模型生成预测
+            else:
+                logger.info(f"✅ Retraining completed successfully")
 
         except Exception as e:
-            logger.error(f"Pipeline System Error: {e}")
-            update_status("error", step_name, str(e))
+            logger.error(f"❌ Retraining system error: {e}")
+            # 继续流程，使用现有模型
+    else:
+        logger.info("Step 4: ⏭️  Skipping retraining (not needed)")
+    # ====================================================================
+
+    # ========== STEP 5: 生成新预测 (使用最新模型) ==========
+    update_status("processing", "5. Generating Predictions", "Creating new predictions...")
+    logger.info("Step 5: 📊 Generating new predictions with latest models")
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "python", "-m", "ml_engine.predictor",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(BASE_DIR)
+        )
+        stdout, stderr = await process.communicate()
+
+        stdout_text = stdout.decode().strip()
+        stderr_text = stderr.decode().strip()
+
+        if stdout_text:
+            logger.info(f"Prediction output (last 500 chars):\n{stdout_text[-500:]}")
+        if stderr_text:
+            logger.warning(f"Prediction stderr:\n{stderr_text[-500:]}")
+
+        if process.returncode != 0:
+            err_msg = stderr_text or stdout_text or "Prediction failed"
+            logger.error(f"❌ Prediction failed (exit code {process.returncode}): {err_msg}")
+            update_status("error", "5. Generating Predictions", f"Failed: {err_msg[-200:]}")
             return
 
+        logger.info(f"✅ Prediction completed successfully")
+
+    except Exception as e:
+        logger.error(f"❌ Prediction system error: {e}")
+        update_status("error", "5. Generating Predictions", str(e))
+        return
+    # ====================================================================
+
+    # ========== STEP 6: 创建新虚拟订单 (进入下一轮闭环) ==========
+    update_status("processing", "6. Creating Virtual Orders", "Creating new virtual orders...")
+    logger.info("Step 6: 📝 Creating new virtual orders (next cycle)")
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "python", "-m", "ml_engine.order_manager",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(BASE_DIR)
+        )
+        stdout, stderr = await process.communicate()
+
+        stdout_text = stdout.decode().strip()
+        stderr_text = stderr.decode().strip()
+
+        if stdout_text:
+            logger.info(f"Order creation output (last 500 chars):\n{stdout_text[-500:]}")
+        if stderr_text:
+            logger.warning(f"Order creation stderr:\n{stderr_text[-500:]}")
+
+        if process.returncode != 0:
+            logger.warning(f"⚠️  Order creation had issues (exit code {process.returncode})")
+        else:
+            logger.info(f"✅ Virtual orders created successfully")
+
+    except Exception as e:
+        logger.warning(f"⚠️  Order creation failed: {e}")
+    # ====================================================================
+
     # 全部完成 - 记录统计信息
-    logger.info("=" * 70)
-    logger.info("<<< Pipeline completed successfully!")
+    logger.info("=" * 80)
+    logger.info("<<< ✅ CLOSED-LOOP Pipeline completed successfully!")
     logger.info(f"<<< End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # 获取并记录统计信息
@@ -638,9 +761,18 @@ async def run_full_pipeline():
     logger.info("=== Virtual Orders Summary ===")
     logger.info(f"Status: {stats.get('status_summary', [])}")
     logger.info(f"7-day execution rate: {len(stats.get('execution_rate_7d', []))} combinations validated")
-    logger.info("=" * 70)
 
-    update_status("online", "Idle", f"Last update completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # 计算成交率
+    exec_stats = stats.get('execution_rate_7d', [])
+    if exec_stats:
+        total_orders = sum(item['total'] for item in exec_stats)
+        total_executed = sum(item['executed'] for item in exec_stats)
+        overall_exec_rate = (total_executed / total_orders * 100) if total_orders > 0 else 0
+        logger.info(f"Overall 7-day execution rate: {overall_exec_rate:.2f}% ({total_executed}/{total_orders})")
+
+    logger.info("=" * 80)
+
+    update_status("online", "Idle", f"Last closed-loop update at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # --- API 接口定义 ---
 
@@ -1044,6 +1176,75 @@ async def trigger_order_validation(background_tasks: BackgroundTasks):
     return {
         "status": "accepted",
         "message": "Order validation task started. Check /status for progress."
+    }
+
+# 14. 触发闭环重训练 (Trigger Closed-Loop Retraining) - 新增 ⭐
+@app.post("/retrain")
+async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = False):
+    """
+    触发闭环模型重训练
+
+    参数:
+    - force: 是否强制重训练（忽略判断条件）
+
+    闭环流程:
+    1. 检查是否需要重训练（基于执行结果）
+    2. 如果需要，使用增强版训练器重新训练
+    3. 融合虚拟订单执行反馈
+    4. 自动对比新旧模型
+    5. 如果新模型更好，自动部署
+    """
+    current = get_current_status()
+    if current.get("status") == "processing":
+        return JSONResponse(status_code=409, content={
+            "status": "busy",
+            "message": f"Another task is running: {current.get('current_step')}"
+        })
+
+    async def run_retraining():
+        update_status("processing", "Closed-Loop Retraining", "Checking and retraining models...")
+        logger.info("🔄 Starting closed-loop retraining task")
+
+        try:
+            # 构建命令
+            cmd = ["python", str(BASE_DIR / "ml_engine" / "retraining_scheduler.py")]
+            if force:
+                cmd.append("--force")
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(BASE_DIR)
+            )
+            stdout, stderr = await process.communicate()
+
+            stdout_text = stdout.decode().strip()
+            stderr_text = stderr.decode().strip()
+
+            if stdout_text:
+                logger.info(f"Retraining output (last 1000 chars):\n{stdout_text[-1000:]}")
+            if stderr_text:
+                logger.warning(f"Retraining stderr (last 500 chars):\n{stderr_text[-500:]}")
+
+            if process.returncode != 0:
+                err_msg = stderr_text or stdout_text or "Retraining failed"
+                logger.error(f"❌ Closed-loop retraining failed: {err_msg}")
+                update_status("error", "Closed-Loop Retraining", f"Failed: {err_msg[-200:]}")
+            else:
+                logger.info("✅ Closed-loop retraining completed successfully")
+                update_status("online", "Idle", f"Retraining completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        except Exception as e:
+            logger.error(f"❌ Retraining task error: {e}")
+            update_status("error", "Closed-Loop Retraining", str(e))
+
+    background_tasks.add_task(run_retraining)
+
+    return {
+        "status": "accepted",
+        "message": f"Closed-loop retraining task started (force={force}). Check /status for progress.",
+        "force_mode": force
     }
 
 if __name__ == "__main__":
