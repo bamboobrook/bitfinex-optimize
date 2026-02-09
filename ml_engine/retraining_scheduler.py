@@ -461,6 +461,56 @@ class RetrainingScheduler:
 
         print(f"\n📝 日志已记录: {self.history_log_path}")
 
+    def cleanup_old_artifacts(self, retrained_dir: str = None, max_backups: int = 3):
+        """
+        清理重训练产生的冗余文件
+
+        - 删除已用完的 models_retrained_* 临时目录
+        - 只保留最近 max_backups 个 backup,删除更旧的
+
+        Args:
+            retrained_dir: 本次重训练临时目录(部署后可删除)
+            max_backups: 最多保留的备份数量
+        """
+        import glob as glob_mod
+
+        print("\n🧹 清理冗余模型文件...")
+
+        # 1. 删除本次 retrained 临时目录
+        if retrained_dir and os.path.exists(retrained_dir):
+            try:
+                shutil.rmtree(retrained_dir)
+                print(f"  ✅ 删除临时目录: {retrained_dir}")
+            except Exception as e:
+                print(f"  ⚠️  删除临时目录失败: {e}")
+
+        # 2. 清理所有残留的 models_retrained_* 目录
+        base_dir = os.path.dirname(self.production_model_dir)
+        retrained_dirs = sorted(glob_mod.glob(os.path.join(base_dir, 'models_retrained_*')))
+        for d in retrained_dirs:
+            try:
+                shutil.rmtree(d)
+                print(f"  ✅ 删除残留目录: {d}")
+            except Exception as e:
+                print(f"  ⚠️  删除失败: {d} - {e}")
+
+        # 3. 只保留最近 max_backups 个 backup
+        if os.path.exists(self.backup_dir):
+            backup_dirs = sorted(glob_mod.glob(os.path.join(self.backup_dir, 'production_*')))
+            if len(backup_dirs) > max_backups:
+                to_delete = backup_dirs[:-max_backups]
+                for d in to_delete:
+                    try:
+                        shutil.rmtree(d)
+                        print(f"  ✅ 删除旧备份: {d}")
+                    except Exception as e:
+                        print(f"  ⚠️  删除备份失败: {d} - {e}")
+                print(f"  保留最近 {max_backups} 个备份")
+            else:
+                print(f"  备份数量 ({len(backup_dirs)}) <= {max_backups},无需清理")
+
+        print("🧹 清理完成")
+
     def run(self, force: bool = False) -> bool:
         """
         执行完整的重训练流程
@@ -501,6 +551,7 @@ class RetrainingScheduler:
             print("\n" + "="*80)
             print(" "*20 + "❌ 重训练失败,流程结束")
             print("="*80)
+            self.cleanup_old_artifacts(retrained_dir)
             return False
 
         # Step 3: 对比新旧模型
@@ -524,11 +575,13 @@ class RetrainingScheduler:
                 print("\n" + "="*80)
                 print(" "*20 + "✅ 新模型已部署到生产环境")
                 print("="*80)
+                self.cleanup_old_artifacts(retrained_dir)
                 return True
             else:
                 print("\n" + "="*80)
                 print(" "*20 + "⚠️  部署失败,保持现有模型")
                 print("="*80)
+                self.cleanup_old_artifacts(retrained_dir)
                 return False
         else:
             self.log_retraining_event(
@@ -541,6 +594,7 @@ class RetrainingScheduler:
             print("\n" + "="*80)
             print(" "*20 + "⚠️  新模型未达标,保持现有模型")
             print("="*80)
+            self.cleanup_old_artifacts(retrained_dir)
             return False
 
 

@@ -295,13 +295,22 @@ class EnsemblePredictor:
         p_aggr = float(pred_aggressive)
         p_bal = float(pred_balanced)
 
-        # 根据成交概率动态选择策略
-        if prob < 0.5:
-            base_rate = p_cons
-            strategy_desc = "High Certainty (Low Prob)"
+        # ========== 校准执行概率 (Calibrated Probability) ==========
+        # 温和校准: 50%原始概率 + 50%历史校准, 避免过度压低
+        exec_rate_7d = row_data.get('exec_rate_7d', 0.6)
+        raw_calibrated = prob * (exec_rate_7d / 0.7)
+        calibrated_prob = 0.5 * prob + 0.5 * raw_calibrated  # 混合校准,保留模型信心
+        calibrated_prob = np.clip(calibrated_prob, 0.0, 1.0)
+
+        # 根据校准后概率动态选择策略 (收益率优先)
+        if calibrated_prob < 0.40:
+            # 仅在校准概率极低时才走保守
+            base_rate = p_cons * 0.6 + p_bal * 0.4
+            strategy_desc = "High Certainty (Low Calibrated Prob)"
             confidence = "Low"
-        elif prob > 0.8:
-            base_rate = p_aggr * 0.7 + p_bal * 0.3
+        elif calibrated_prob > 0.75:
+            # 高概率时偏激进,最大化收益
+            base_rate = p_aggr * 0.6 + p_bal * 0.3 + p_cons * 0.1
             strategy_desc = "High Yield (High Prob)"
             confidence = "High"
         else:
@@ -310,8 +319,8 @@ class EnsemblePredictor:
             confidence = "Medium"
 
         # ========== 执行反馈调整 (Execution Feedback Adjustment) ==========
-        exec_rate_7d = row_data.get('exec_rate_7d', 0.7)
-        exec_rate_30d = row_data.get('exec_rate_30d', 0.7)
+        # exec_rate_7d already fetched above for calibration
+        exec_rate_30d = row_data.get('exec_rate_30d', 0.6)
         avg_rate_gap = row_data.get('avg_rate_gap_failed_7d', 0.0)
         risk_adjustment = row_data.get('risk_adjustment_factor', 1.0)
 
@@ -392,20 +401,15 @@ class EnsemblePredictor:
     def _calculate_execution_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
                                          avg_gap: float, base_rate: float) -> float:
         """
-        根据成交历史计算利率调整系数 - 优化版
+        根据成交历史计算利率调整系数 - v3 收益率优先版
 
-        调整逻辑(更平衡):
-        - 成交率 < 40%: 降低12% (从10%调整)
-        - 成交率 < 50%: 降低7% (从10%调整)
-        - 成交率 50-60%: 降低5% (保持)
-        - 成交率 60-70%: 降低2% (保持)
-        - 成交率 70-80%: 不调整
-        - 成交率 80-90%: 提高3% (新增)
-        - 成交率 > 90%: 提高5% (从1%调整) ⭐
-
-        额外考虑:
-        - 失败订单平均利率差距大,进一步降低
-        - 成交率趋势恶化,额外降低3%
+        调整逻辑(温和版 - 避免过度压低利率):
+        - 成交率 < 10%: 降低15% (极端低成交,仅温和调整)
+        - 成交率 < 30%: 降低10%
+        - 成交率 < 50%: 降低5%
+        - 成交率 50-70%: 基本不调整
+        - 成交率 > 70%: 适度提高,鼓励更高收益
+        - 成交率 > 90%: 提高8%
 
         Args:
             exec_rate_7d: 7日成交率
@@ -414,50 +418,51 @@ class EnsemblePredictor:
             base_rate: 基础预测利率
 
         Returns:
-            调整系数 (0.85-1.15)
+            调整系数 (0.82-1.18)
         """
-        # 基础调整 - 更平衡的策略
-        if exec_rate_7d < 0.4:
-            adjustment = 0.88      # 极低成交率,激进降低
+        # 基础调整 - 温和版,收益率优先
+        if exec_rate_7d < 0.1:
+            adjustment = 0.85      # 极端低成交,温和降低
+        elif exec_rate_7d < 0.3:
+            adjustment = 0.90      # 低成交,适度降低
         elif exec_rate_7d < 0.5:
-            adjustment = 0.93      # 低成交率,适度降低
-        elif exec_rate_7d < 0.6:
-            adjustment = 0.95      # 保持
+            adjustment = 0.95      # 中低成交,微调
         elif exec_rate_7d < 0.7:
-            adjustment = 0.98      # 保持
+            adjustment = 1.0       # 正常区间,不调整
         elif exec_rate_7d > 0.9:
-            adjustment = 1.05      # ⭐ 提高奖励 (从1.01增加到1.05)
-        elif exec_rate_7d > 0.8:
-            adjustment = 1.03      # ⭐ 新增:高成交率适度提高
+            adjustment = 1.08      # 高成交,鼓励提高利率
+        elif exec_rate_7d > 0.7:
+            adjustment = 1.04      # 较高成交,适度提高
         else:
             adjustment = 1.0
 
-        # 利率差距惩罚
+        # 利率差距惩罚 (温和版,上限10%)
         if avg_gap > 0:
-            gap_penalty = min(avg_gap / (base_rate + 1e-8), 0.08)  # 最多降低8%
+            gap_penalty = min(avg_gap / (base_rate + 1e-8), 0.10)
             adjustment *= (1.0 - gap_penalty)
 
         # 趋势因素
         exec_trend = exec_rate_7d / (exec_rate_30d + 1e-8)
         if exec_trend < 0.8:  # 成交率显著恶化
-            adjustment *= 0.97
+            adjustment *= 0.98
         elif exec_trend > 1.2:  # 成交率改善
-            adjustment *= 1.01
+            adjustment *= 1.02
 
-        # 安全边界 (扩大上限从1.05到1.15)
-        adjustment = np.clip(adjustment, 0.85, 1.15)
+        # 安全边界 (收窄范围,避免极端调整)
+        adjustment = np.clip(adjustment, 0.82, 1.18)
 
         return adjustment
 
     def _get_currency_adjustment_factor(self, currency: str, period: int, exec_rate: float) -> float:
         """
-        币种和周期差异化调整因子
+        币种和周期差异化调整因子 - v3 收益率优先版
 
         策略:
-        - fUST + 高成交率 (>60%): 提高10% (利用高成交场景)
-        - 高成交周期 (15/60/90) + 高成交率 (>65%): 提高8%
-        - fUSD + 低成交率 (<35%): 降低7% (避免失败)
-        - 低成交周期 (2/30/120) + 低成交率 (<35%): 降低5%
+        - 基于exec_rate与目标(0.50)的偏差,使用连续函数
+        - 高于目标: 线性放大至+12% (鼓励高执行率组合追求更高收益)
+        - 低于目标: 线性缩减至-12% (温和惩罚,不过度压低)
+        - 长周期奖励: period >= 60d 额外+5% (鼓励长周期)
+        - 最终clamp到[0.88, 1.18]
 
         Args:
             currency: 币种 (fUSD/fUST)
@@ -465,26 +470,26 @@ class EnsemblePredictor:
             exec_rate: 执行成交率
 
         Returns:
-            调整因子 (0.90-1.15)
+            调整因子 (0.88-1.18)
         """
-        # fUST通常成交率较高,可以更激进
-        if currency == 'fUST' and exec_rate > 0.6:
-            return 1.10
+        target_exec_rate = 0.50
+        deviation = exec_rate - target_exec_rate
 
-        # 高成交周期(15/60/90天)可以提高利率
-        if period in [15, 60, 90] and exec_rate > 0.65:
-            return 1.08
+        if deviation >= 0:
+            # Above target: scale up to +12% (at exec_rate=1.0, deviation=0.50 -> +12%)
+            adjustment = 1.0 + (deviation / 0.50) * 0.12
+        else:
+            # Below target: scale down to -12% (at exec_rate=0.0, deviation=-0.50 -> -12%)
+            adjustment = 1.0 + (deviation / 0.50) * 0.12
 
-        # fUSD低成交场景需要保守
-        if currency == 'fUSD' and exec_rate < 0.35:
-            return 0.93
+        # Long period bonus: +5% for period >= 60d (不依赖exec_rate,鼓励长周期)
+        if period >= 60:
+            adjustment += 0.05
 
-        # 低成交周期(2/30/120天)低成交场景需要保守
-        if period in [2, 30, 120] and exec_rate < 0.35:
-            return 0.95
+        # Clamp to safe range (比之前收窄,避免极端调整)
+        adjustment = np.clip(adjustment, 0.88, 1.18)
 
-        # 默认不调整
-        return 1.0
+        return adjustment
 
     def get_latest_predictions(self):
         """获取最新预测结果 - 并行化版本"""
@@ -556,18 +561,41 @@ class EnsemblePredictor:
         # 2. 在成交概率合格的基础上，按预测利率降序排列
         valid_preds = [p for p in preds if p['predicted_rate'] > 1.0]
 
-        # 按成交概率和预测利率综合排序 - 优化版 (60%概率 + 40%利率)
+        # Revenue-optimized scoring: 收益率优先,兼顾成交和长周期
         def calculate_weighted_score(pred):
             """
-            加权评分:
-            - 60% 成交概率 (更重视成交)
-            - 40% 标准化利率 (兼顾收益)
+            收益率优先评分 (v3):
+            - 30% raw_rate (高利率偏好,直接反映收益能力)
+            - 25% effective_rate (rate * prob - 期望收益)
+            - 20% exec_prob (成交保障)
+            - 25% revenue_factor (period_days/120 - 长周期收益)
+            + execution floor: exec_prob < 0.35 gets 0.4x penalty (仅极低概率才惩罚)
             """
             prob = pred['execution_probability']
             rate = pred['predicted_rate']
-            # 标准化利率到0-1范围 (假设最高利率40%)
+            period = pred['period']
+
+            # 1. 标准化利率到0-1范围 (假设最高利率40%)
             normalized_rate = min(rate / 40.0, 1.0)
-            return prob * 0.6 + normalized_rate * 0.4
+
+            # 2. Effective rate = rate * prob (期望收益)
+            effective_rate = normalized_rate * prob
+
+            # 3. Revenue factor based on period (continuous, not tiered)
+            revenue_factor = min(period / 120.0, 1.0)
+
+            # 4. Execution floor: 仅在极低概率时惩罚
+            exec_floor_multiplier = 0.4 if prob < 0.35 else 1.0
+
+            # 5. 最终分数 = 30%原始利率 + 25%有效利率 + 20%执行概率 + 25%周期收益
+            final_score = (
+                normalized_rate * 0.30 +
+                effective_rate * 0.25 +
+                prob * 0.20 +
+                revenue_factor * 0.25
+            ) * exec_floor_multiplier
+
+            return final_score
 
         sorted_preds = sorted(
             valid_preds,

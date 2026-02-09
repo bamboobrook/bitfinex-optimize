@@ -315,22 +315,21 @@ class DataProcessor:
             )
             df = self._apply_default_exec_features(df)
 
-        # ============ 8. 改进目标定义 (4个目标) ============
+        # ============ 8. 改进目标定义 (4个目标) - v3 收益率优先版 ============
         indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=120)
 
-        # Target 1: 保守利率 (从20%提升到30%分位数)
-        df['future_conservative'] = df['low_annual'].rolling(window=indexer).quantile(0.3)
+        # Target 1: 保守利率 (28%分位数 - 介于原始30%和v2的25%之间)
+        df['future_conservative'] = df['low_annual'].rolling(window=indexer).quantile(0.28)
 
-        # Target 2: 激进利率 (从均值改为60%分位数)
-        df['future_aggressive'] = df['close_annual'].rolling(window=indexer).quantile(0.6)
+        # Target 2: 激进利率 (58%分位数 - 接近原始60%,保留高利率追求)
+        df['future_aggressive'] = df['close_annual'].rolling(window=indexer).quantile(0.58)
 
-        # Target 3: 平衡利率 (新增 - 70%分位数)
-        df['future_balanced'] = df['close_annual'].rolling(window=indexer).quantile(0.7)
+        # Target 3: 平衡利率 (68%分位数 - 接近原始70%,温和下调)
+        df['future_balanced'] = df['close_annual'].rolling(window=indexer).quantile(0.68)
 
-        # Target 4: 成交概率 (新增 - 二分类标签)
-        # 定义：如果当前利率 <= 未来80%分位数，则标记为高成交概率
-        future_80pct = df['close_annual'].rolling(window=indexer).quantile(0.8)
-        df['future_execution_prob'] = (df['close_annual'] <= future_80pct).astype(int)
+        # Target 4: 成交概率 (78%分位数 - 接近原始80%)
+        future_78pct = df['close_annual'].rolling(window=indexer).quantile(0.78)
+        df['future_execution_prob'] = (df['close_annual'] <= future_78pct).astype(int)
 
         # 清理 NaN
         df = df.dropna()
@@ -340,15 +339,15 @@ class DataProcessor:
     def _apply_default_exec_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """当计算失败时应用默认执行特征值"""
         default_features = {
-            'exec_rate_7d': 0.7,
-            'exec_rate_30d': 0.7,
+            'exec_rate_7d': 0.6,
+            'exec_rate_30d': 0.6,
             'avg_spread_7d': 0.0,
             'avg_spread_30d': 0.0,
             'avg_rate_gap_failed_7d': 0.0,
             'exec_delay_p50': 0.0,
             'exec_delay_p90': 0.0,
             'market_competitiveness': 1.0,
-            'exec_likelihood_score': 0.7,
+            'exec_likelihood_score': 0.6,
             'risk_adjustment_factor': 1.0,
             'exec_rate_trend': 1.0,
             'rate_gap_trend': 0.0,

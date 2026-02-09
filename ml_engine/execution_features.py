@@ -78,7 +78,7 @@ class ExecutionFeatures:
             executed = row[1] or 0
 
             if total < 10:  # Cold start threshold
-                exec_rate = 0.7
+                exec_rate = 0.6
             else:
                 exec_rate = executed / total
 
