@@ -429,4 +429,18 @@ if __name__ == "__main__":
     print(f"  Failed: {results['failed']}")
     print(f"  Expired: {results['expired']}")
 
+    # Aggregate execution statistics after validation (fixes issue #6)
+    try:
+        # 使用相对导入兼容直接运行和模块运行两种方式
+        import importlib, sys
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        from ml_engine.order_manager import OrderManager
+        manager = OrderManager()
+        manager.aggregate_execution_statistics()
+        print("\n✅ Execution statistics aggregated")
+    except Exception as e:
+        print(f"\n⚠️  Failed to aggregate execution statistics: {e}")
+
     print("\n✅ Execution validator tests completed")

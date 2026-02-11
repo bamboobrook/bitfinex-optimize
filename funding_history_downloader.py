@@ -182,9 +182,9 @@ class BitfinexDataDownloader:
             try:
                 # 固定延迟控制（避免过于频繁）
                 time.sleep(self.base_delay)
-                
+
                 response = self.session.get(url, params=params, timeout=30)
-                
+
                 if response.status_code == 200:
                     return response.json()
                 elif response.status_code == 429:
@@ -194,15 +194,18 @@ class BitfinexDataDownloader:
                     time.sleep(wait_time)
                     continue
                 else:
-                    logger.info(f"    Request failed, status code: {response.status_code}")
-                    
+                    # B6 FIX: Non-429 errors should also retry instead of silently failing
+                    logger.info(f"    Request failed (status {response.status_code}), retry {attempt+1}/{self.max_retries}")
+                    time.sleep(10)
+                    continue
+
             except requests.exceptions.Timeout:
                 logger.info(f"    Request timeout, retry {attempt+1}/{self.max_retries}")
                 time.sleep(10)
             except Exception as e:
                 logger.info(f"    Request exception: {e}")
                 time.sleep(5)
-        
+
         logger.info(f"    Request failed after {self.max_retries} retries")
         return None
     
@@ -498,6 +501,36 @@ class BitfinexDataDownloader:
         logger.info("=" * 60)
         logger.info(f"📁 Database file: {self.db_path}")
         logger.info("  Use SQLite browser or the analysis program to view data")
+
+        # 修改6.2: Log data freshness summary after download
+        try:
+            logger.info(f"\n📊 Data Freshness Check:")
+            stale_count = 0
+            for currency in currencies:
+                for period in periods:
+                    self.cursor.execute(
+                        "SELECT MAX(datetime) FROM funding_rates WHERE currency = ? AND period = ?",
+                        (currency, period)
+                    )
+                    result = self.cursor.fetchone()
+                    if result and result[0]:
+                        latest_dt = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
+                        age_hours = (datetime.now() - latest_dt).total_seconds() / 3600
+                        if age_hours > 4:
+                            logger.warning(f"  STALE: {currency}-{period}d latest data is {age_hours:.1f}h old ({result[0]})")
+                            stale_count += 1
+                        else:
+                            logger.info(f"  OK: {currency}-{period}d latest: {result[0]} ({age_hours:.1f}h ago)")
+                    else:
+                        logger.warning(f"  MISSING: {currency}-{period}d has no data")
+                        stale_count += 1
+            if stale_count > 0:
+                logger.warning(f"\n  ⚠️  {stale_count} currency-period combinations have stale or missing data")
+            else:
+                logger.info(f"\n  ✅ All data is fresh (< 4h old)")
+        except Exception as e:
+            logger.info(f"  Error checking freshness: {e}")
+
         logger.info("=" * 60)
         
         # 关闭数据库连接

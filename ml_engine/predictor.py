@@ -137,7 +137,7 @@ class EnsemblePredictor:
                     self.meta_info[curr][enhanced_model_type] = meta
                     logger.info(f"✨ Loaded enhanced {enhanced_model_type} for {curr}")
                 else:
-                    logger.debug(f"Enhanced {enhanced_model_type} not available for {curr} (using traditional models)")
+                    logger.info(f"Enhanced {enhanced_model_type} not available for {curr} (using traditional models)")
 
     def predict_with_ensemble(self, X: pd.DataFrame, currency: str, model_type: str) -> np.ndarray:
         """
@@ -157,6 +157,12 @@ class EnsemblePredictor:
         models = self.models[currency][model_type]
         meta = self.meta_info[currency][model_type]
         weights = meta['weights']
+
+        # B3 FIX: Validate weights for NaN, fallback to equal weights
+        if any(np.isnan(v) for v in weights.values()):
+            logger.warning(f"NaN detected in ensemble weights for {currency}-{model_type}, using equal weights")
+            n_algos = len(weights)
+            weights = {k: 1.0 / n_algos for k in weights}
 
         # 获取各模型预测
         predictions = {}
@@ -231,7 +237,7 @@ class EnsemblePredictor:
 
         # Use DB rate if available, fallback to feature data
         if current_rate_db is not None:
-            # ✅ CRITICAL FIX: Check data freshness even when DB query succeeds
+            # 修改2.4: Graduated freshness check with confidence degradation
             from datetime import timedelta
             if isinstance(data_timestamp, str):
                 db_dt = datetime.strptime(data_timestamp, '%Y-%m-%d %H:%M:%S')
@@ -239,13 +245,26 @@ class EnsemblePredictor:
                 db_dt = data_timestamp
 
             data_age = datetime.now() - db_dt
-            if data_age > timedelta(hours=self.STALE_DATA_THRESHOLD_HOURS):
+            data_age_hours = data_age.total_seconds() / 3600
+
+            # fUST long periods (90d/120d) have lower liquidity, relaxed thresholds
+            is_low_liquidity = (currency == 'fUST' and period in [90, 120])
+            stale_warn_hours = 8 if is_low_liquidity else 4
+            stale_error_hours = 12 if is_low_liquidity else 8
+
+            if data_age_hours > stale_error_hours:
                 logger.error(
-                    f"STALE DATA DETECTED from DB for {currency}-{period}: "
-                    f"Latest data is {data_age} old (from {data_timestamp}). "
-                    f"Refusing to predict with stale data."
+                    f"STALE DATA for {currency}-{period}: "
+                    f"data is {data_age_hours:.1f}h old (threshold: {stale_error_hours}h). "
+                    f"Refusing to predict."
                 )
-                raise ValueError(f"Stale DB data for {currency}-{period}: {data_age} old")
+                raise ValueError(f"Stale DB data for {currency}-{period}: {data_age_hours:.1f}h old")
+            elif data_age_hours > stale_warn_hours:
+                logger.warning(
+                    f"AGING DATA for {currency}-{period}: "
+                    f"data is {data_age_hours:.1f}h old (warn threshold: {stale_warn_hours}h). "
+                    f"Confidence will be degraded."
+                )
 
             current_rate = current_rate_db
             actual_timestamp = data_timestamp
@@ -260,15 +279,24 @@ class EnsemblePredictor:
                 else:
                     feature_dt = feature_datetime
 
-                # 检查数据是否陈旧(超过阈值)
+                # Apply same graduated freshness logic as DB path
                 data_age = datetime.now() - feature_dt
-                if data_age > timedelta(hours=self.STALE_DATA_THRESHOLD_HOURS):
+                data_age_hours = data_age.total_seconds() / 3600
+                is_low_liquidity = (currency == 'fUST' and period in [90, 120])
+                stale_warn_hours = 8 if is_low_liquidity else 4
+                stale_error_hours = 12 if is_low_liquidity else 8
+
+                if data_age_hours > stale_error_hours:
                     logger.error(
-                        f"STALE DATA DETECTED for {currency}-{period}: "
-                        f"DB query failed AND feature data is {data_age} old (from {feature_datetime}). "
-                        f"Refusing to predict with stale data."
+                        f"STALE DATA for {currency}-{period}: "
+                        f"DB query failed AND feature data is {data_age_hours:.1f}h old. "
+                        f"Refusing to predict."
                     )
-                    raise ValueError(f"Stale data for {currency}-{period}: {data_age} old")
+                    raise ValueError(f"Stale data for {currency}-{period}: {data_age_hours:.1f}h old")
+                elif data_age_hours > stale_warn_hours:
+                    logger.warning(
+                        f"AGING feature data for {currency}-{period}: {data_age_hours:.1f}h old"
+                    )
 
                 actual_timestamp = feature_datetime
                 current_rate = float(row_data['close_annual'])
@@ -280,20 +308,72 @@ class EnsemblePredictor:
                 logger.error(f"No datetime field in feature data for {currency}-{period}")
                 raise ValueError(f"Missing datetime for {currency}-{period}")
 
+            # Ensure data_age_hours is set for confidence degradation below
+            # (already set in both DB and feature branches above)
+
         # 构造特征DataFrame
         X_single = pd.DataFrame([{col: row_data[col] for col in feature_cols}])
 
-        # 执行4个模型预测
+        # 执行4个传统模型预测
         pred_execution_prob = self.predict_with_ensemble(X_single, currency, 'model_execution_prob')[0]
         pred_conservative = self.predict_with_ensemble(X_single, currency, 'model_conservative')[0]
         pred_aggressive = self.predict_with_ensemble(X_single, currency, 'model_aggressive')[0]
         pred_balanced = self.predict_with_ensemble(X_single, currency, 'model_balanced')[0]
+
+        # S1 FIX: 启用 v2 模型参与预测 (如果可用)
+        v2_execution_prob = None
+        v2_revenue_rate = None
+
+        if currency in self.models:
+            # 尝试使用 execution_prob_v2 (基于实际执行结果训练)
+            if 'model_execution_prob_v2' in self.models[currency]:
+                try:
+                    v2_meta = self.meta_info[currency]['model_execution_prob_v2']
+                    v2_feature_cols = v2_meta['feature_cols']
+                    # v2 模型可能有不同的特征集,需要检查可用性
+                    available_cols = [c for c in v2_feature_cols if c in row_data]
+                    if len(available_cols) == len(v2_feature_cols):
+                        X_v2 = pd.DataFrame([{col: row_data[col] for col in v2_feature_cols}])
+                        v2_execution_prob = float(self.predict_with_ensemble(
+                            X_v2, currency, 'model_execution_prob_v2'
+                        )[0])
+                        logger.info(f"v2 execution_prob for {currency}-{period}: {v2_execution_prob:.4f}")
+                    else:
+                        missing = set(v2_feature_cols) - set(available_cols)
+                        logger.info(f"v2 execution_prob skipped for {currency}-{period}: missing features {missing}")
+                except Exception as e:
+                    logger.warning(f"v2 execution_prob prediction failed for {currency}-{period}: {e}")
+
+            # 尝试使用 revenue_optimized 模型
+            if 'model_revenue_optimized' in self.models[currency]:
+                try:
+                    rev_meta = self.meta_info[currency]['model_revenue_optimized']
+                    rev_feature_cols = rev_meta['feature_cols']
+                    available_cols = [c for c in rev_feature_cols if c in row_data]
+                    if len(available_cols) == len(rev_feature_cols):
+                        X_rev = pd.DataFrame([{col: row_data[col] for col in rev_feature_cols}])
+                        v2_revenue_rate = float(self.predict_with_ensemble(
+                            X_rev, currency, 'model_revenue_optimized'
+                        )[0])
+                        logger.info(f"v2 revenue_optimized for {currency}-{period}: {v2_revenue_rate:.4f}")
+                    else:
+                        missing = set(rev_feature_cols) - set(available_cols)
+                        logger.info(f"v2 revenue skipped for {currency}-{period}: missing features {missing}")
+                except Exception as e:
+                    logger.warning(f"v2 revenue prediction failed for {currency}-{period}: {e}")
 
         # 智能定价策略
         prob = float(pred_execution_prob)
         p_cons = float(pred_conservative)
         p_aggr = float(pred_aggressive)
         p_bal = float(pred_balanced)
+
+        # S1: 融合 v2 执行概率 (如果可用)
+        # execution_prob 最终值 = 0.6 × 传统 + 0.4 × v2
+        if v2_execution_prob is not None:
+            blended_prob = 0.6 * prob + 0.4 * v2_execution_prob
+            logger.info(f"v2 blend for {currency}-{period}: traditional={prob:.4f}, v2={v2_execution_prob:.4f}, blended={blended_prob:.4f}")
+            prob = blended_prob
 
         # ========== 校准执行概率 (Calibrated Probability) ==========
         # 温和校准: 50%原始概率 + 50%历史校准, 避免过度压低
@@ -318,6 +398,15 @@ class EnsemblePredictor:
             strategy_desc = "Balanced"
             confidence = "Medium"
 
+        # 修改2.4: Confidence degradation based on data age
+        if data_age_hours > stale_warn_hours:
+            # Degrade confidence by one level
+            confidence_map = {"High": "Medium", "Medium": "Low", "Low": "Low"}
+            old_confidence = confidence
+            confidence = confidence_map.get(confidence, confidence)
+            if old_confidence != confidence:
+                logger.info(f"Confidence degraded for {currency}-{period}: {old_confidence} -> {confidence} (data age: {data_age_hours:.1f}h)")
+
         # ========== 执行反馈调整 (Execution Feedback Adjustment) ==========
         # exec_rate_7d already fetched above for calibration
         exec_rate_30d = row_data.get('exec_rate_30d', 0.6)
@@ -334,6 +423,12 @@ class EnsemblePredictor:
 
         # 应用调整 (执行反馈 × 风险因子 × 币种因子)
         adjusted_rate = base_rate * execution_adjustment * risk_adjustment * currency_factor
+
+        # S1: 融合 v2 revenue_optimized 预测 (如果可用)
+        if v2_revenue_rate is not None and v2_revenue_rate > 0:
+            # 加权混合: 70% 传统调整后 + 30% v2 收益优化
+            adjusted_rate = 0.7 * adjusted_rate + 0.3 * v2_revenue_rate
+            logger.debug(f"v2 revenue blend for {currency}-{period}: adjusted={adjusted_rate:.4f}")
         # ====================================================================
 
         # 趋势修正 (降低趋势影响权重从0.15到0.10)
@@ -342,24 +437,29 @@ class EnsemblePredictor:
         trend_adjustment = trend_factor * 0.10 * adjusted_rate
         final_rate = adjusted_rate + trend_adjustment
 
-        # 动态安全边界: 根据执行概率调整激进程度
+        # B4 FIX: Check for NaN in final_rate before clipping
+        if np.isnan(final_rate):
+            logger.error(f"NaN detected in final_rate for {currency}-{period}, skipping prediction")
+            raise ValueError(f"NaN in final_rate for {currency}-{period}")
+
+        # 动态安全边界: 根据执行概率调整激进程度 (修改2.2: 收紧bounds)
         # 高概率(>0.8): 宽边界 - 信任模型预测
-        # 中等概率(0.5-0.8): 平衡边界 - 适度控制
-        # 低概率(<0.5): 窄边界 - 保守策略
+        # 中等概率(0.5-0.8): 收紧边界 - 适度控制 (0.45x-1.2x → 0.50x-1.10x)
+        # 低概率(<0.5): 窄边界 - 保守策略 (0.5x-1.05x → 0.55x-1.0x)
         if prob > 0.8:
             # 高执行概率 = 激进策略
             min_bound = max(current_rate * 0.4, 0.01)
             max_bound = current_rate * 1.5
             strategy_label = "aggressive"
         elif prob > 0.5:
-            # 中等概率 = 平衡策略
-            min_bound = max(current_rate * 0.45, 0.01)
-            max_bound = current_rate * 1.2
+            # 中等概率 = 收紧平衡策略
+            min_bound = max(current_rate * 0.50, 0.01)
+            max_bound = current_rate * 1.10
             strategy_label = "balanced"
         else:
-            # 低概率 = 保守策略
-            min_bound = max(current_rate * 0.5, 0.01)
-            max_bound = current_rate * 1.05
+            # 低概率 = 收紧保守策略
+            min_bound = max(current_rate * 0.55, 0.01)
+            max_bound = current_rate * 1.0
             strategy_label = "conservative"
 
         clipped_rate = np.clip(final_rate, min_bound, max_bound)
@@ -392,6 +492,9 @@ class EnsemblePredictor:
             # 新增调试信息
             "execution_rate_7d": exec_rate_7d,
             "execution_adjustment_applied": execution_adjustment,
+            # v2 model info (S1)
+            "v2_execution_prob": v2_execution_prob,
+            "v2_revenue_rate": v2_revenue_rate,
             # Rate clipping 元数据
             "was_clipped": was_clipped,
             "clipping_strategy": strategy_label,

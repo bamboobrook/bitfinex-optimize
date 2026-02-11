@@ -76,6 +76,26 @@ class OrderManager:
             # order_timestamp should reflect when the market data was captured,
             # not when the order was created
             data_timestamp = prediction.get('data_timestamp', current_time)
+            # B2 FIX: Ensure consistent timestamp format (strftime, not isoformat)
+            if isinstance(data_timestamp, datetime):
+                data_timestamp = data_timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            elif isinstance(data_timestamp, str) and 'T' in data_timestamp:
+                # Convert isoformat to strftime format
+                data_timestamp = data_timestamp.replace('T', ' ')[:19]
+
+            # 修改5.1: 订单去重 - 检查是否已存在相同 (currency, period, order_timestamp) 的 PENDING 订单
+            cursor.execute("""
+                SELECT COUNT(*) FROM virtual_orders
+                WHERE currency = ? AND period = ? AND order_timestamp = ? AND status = 'PENDING'
+            """, (prediction['currency'], prediction['period'], data_timestamp))
+            existing_count = cursor.fetchone()[0]
+            if existing_count > 0:
+                logger.warning(
+                    f"Duplicate order skipped: {prediction['currency']}-{prediction['period']}d "
+                    f"@ {data_timestamp} already has {existing_count} PENDING order(s)"
+                )
+                conn.close()
+                return f"DUPLICATE_SKIPPED_{prediction['currency']}_{prediction['period']}"
 
             cursor.execute("""
                 INSERT INTO virtual_orders
@@ -122,7 +142,7 @@ class OrderManager:
         cursor = conn.cursor()
         cursor.row_factory = sqlite3.Row
 
-        now = datetime.now().isoformat()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         if expired_only:
             # Only orders past their validation window
@@ -182,7 +202,7 @@ class OrderManager:
                 execution_details.get('execution_delay_minutes'),
                 execution_details.get('max_market_rate'),
                 execution_details.get('rate_gap'),
-                datetime.now().isoformat(),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 order_id
             ))
 
@@ -217,7 +237,7 @@ class OrderManager:
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        cutoff_date = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+        cutoff_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d %H:%M:%S')
 
         query = """
             SELECT
@@ -313,6 +333,99 @@ class OrderManager:
         conn.close()
 
         return row[0] or 0
+
+    def aggregate_execution_statistics(self):
+        """
+        Aggregate execution statistics from virtual_orders into execution_statistics table.
+        Called after order validation to keep execution_statistics up to date.
+
+        This fixes issue #6 where execution_statistics table was always empty.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            # Ensure the execution_statistics table exists
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS execution_statistics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    currency TEXT NOT NULL,
+                    period INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    total_orders INTEGER DEFAULT 0,
+                    executed_orders INTEGER DEFAULT 0,
+                    failed_orders INTEGER DEFAULT 0,
+                    expired_orders INTEGER DEFAULT 0,
+                    execution_rate REAL DEFAULT 0,
+                    avg_predicted_rate REAL,
+                    avg_execution_rate REAL,
+                    avg_rate_gap REAL,
+                    avg_execution_delay REAL,
+                    updated_at TEXT,
+                    UNIQUE(currency, period, date)
+                )
+            """)
+
+            # Aggregate today's stats from virtual_orders
+            today = datetime.now().strftime('%Y-%m-%d')
+
+            cursor.execute("""
+                SELECT
+                    currency,
+                    period,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END) as executed,
+                    SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed,
+                    SUM(CASE WHEN status = 'EXPIRED' THEN 1 ELSE 0 END) as expired,
+                    AVG(predicted_rate) as avg_predicted,
+                    AVG(CASE WHEN status = 'EXECUTED' THEN execution_rate END) as avg_exec_rate,
+                    AVG(CASE WHEN status = 'FAILED' THEN rate_gap END) as avg_gap,
+                    AVG(CASE WHEN status = 'EXECUTED' THEN execution_delay_minutes END) as avg_delay
+                FROM virtual_orders
+                WHERE validated_at IS NOT NULL
+                  AND date(validated_at) = ?
+                  AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
+                GROUP BY currency, period
+            """, (today,))
+
+            rows = cursor.fetchall()
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            for row in rows:
+                currency, period, total, executed, failed, expired, avg_predicted, avg_exec_rate, avg_gap, avg_delay = row
+                exec_rate = (executed / total * 100) if total > 0 else 0
+
+                cursor.execute("""
+                    INSERT INTO execution_statistics
+                    (currency, period, date, total_orders, executed_orders, failed_orders, expired_orders,
+                     execution_rate, avg_predicted_rate, avg_execution_rate, avg_rate_gap,
+                     avg_execution_delay, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(currency, period, date) DO UPDATE SET
+                        total_orders = excluded.total_orders,
+                        executed_orders = excluded.executed_orders,
+                        failed_orders = excluded.failed_orders,
+                        expired_orders = excluded.expired_orders,
+                        execution_rate = excluded.execution_rate,
+                        avg_predicted_rate = excluded.avg_predicted_rate,
+                        avg_execution_rate = excluded.avg_execution_rate,
+                        avg_rate_gap = excluded.avg_rate_gap,
+                        avg_execution_delay = excluded.avg_execution_delay,
+                        updated_at = excluded.updated_at
+                """, (currency, period, today, total, executed, failed, expired,
+                      exec_rate, avg_predicted, avg_exec_rate, avg_gap, avg_delay, now))
+
+            conn.commit()
+            if rows:
+                logger.info(f"Aggregated execution statistics: {len(rows)} currency-period combos for {today}")
+            else:
+                logger.debug(f"No validated orders today ({today}) to aggregate")
+
+        except Exception as e:
+            logger.error(f"Failed to aggregate execution statistics: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

@@ -194,7 +194,8 @@ class EnhancedModelTrainer:
             'future_conservative', 'future_aggressive', 'future_balanced', 'future_execution_prob',
             'actual_execution_binary', 'revenue_reward', 'rate_competitiveness',
             'status', 'order_timestamp', 'predicted_rate', 'execution_confidence',
-            'total_score', 'market_median', 'execution_rate'
+            'total_score', 'market_median', 'execution_rate',
+            'revenue_optimized_target',
         ]
 
         feature_cols = [c for c in df.columns if c not in exclude_cols]
@@ -202,13 +203,13 @@ class EnhancedModelTrainer:
         print(f"\n特征数量: {len(feature_cols)}")
         return feature_cols
 
-    def train_xgboost_regression(self, X_train, y_train, X_val, y_val):
+    def train_xgboost_regression(self, X_train, y_train, X_val, y_val, sample_weight=None):
         """训练XGBoost回归模型"""
         params = self.xgb_params.copy()
         params['objective'] = 'reg:absoluteerror'
         params['eval_metric'] = 'mae'
 
-        dtrain = xgb.DMatrix(X_train, label=y_train)
+        dtrain = xgb.DMatrix(X_train, label=y_train, weight=sample_weight)
         dval = xgb.DMatrix(X_val, label=y_val)
 
         model = xgb.train(
@@ -224,13 +225,13 @@ class EnhancedModelTrainer:
         mae = mean_absolute_error(y_val, pred_val)
         return model, mae
 
-    def train_xgboost_classification(self, X_train, y_train, X_val, y_val):
+    def train_xgboost_classification(self, X_train, y_train, X_val, y_val, sample_weight=None):
         """训练XGBoost分类模型"""
         params = self.xgb_params.copy()
         params['objective'] = 'binary:logistic'
         params['eval_metric'] = 'auc'
 
-        dtrain = xgb.DMatrix(X_train, label=y_train)
+        dtrain = xgb.DMatrix(X_train, label=y_train, weight=sample_weight)
         dval = xgb.DMatrix(X_val, label=y_val)
 
         model = xgb.train(
@@ -246,13 +247,13 @@ class EnhancedModelTrainer:
         auc = roc_auc_score(y_val, pred_val)
         return model, auc
 
-    def train_lightgbm_regression(self, X_train, y_train, X_val, y_val):
+    def train_lightgbm_regression(self, X_train, y_train, X_val, y_val, sample_weight=None):
         """训练LightGBM回归模型"""
         params = self.lgb_params.copy()
         params['objective'] = 'mae'
         params['metric'] = 'mae'
 
-        train_data = lgb.Dataset(X_train, label=y_train)
+        train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
         model = lgb.train(
@@ -268,13 +269,13 @@ class EnhancedModelTrainer:
         mae = mean_absolute_error(y_val, pred_val)
         return model, mae
 
-    def train_lightgbm_classification(self, X_train, y_train, X_val, y_val):
+    def train_lightgbm_classification(self, X_train, y_train, X_val, y_val, sample_weight=None):
         """训练LightGBM分类模型"""
         params = self.lgb_params.copy()
         params['objective'] = 'binary'
         params['metric'] = 'auc'
 
-        train_data = lgb.Dataset(X_train, label=y_train)
+        train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
         model = lgb.train(
@@ -290,14 +291,14 @@ class EnhancedModelTrainer:
         auc = roc_auc_score(y_val, pred_val)
         return model, auc
 
-    def train_catboost_regression(self, X_train, y_train, X_val, y_val):
+    def train_catboost_regression(self, X_train, y_train, X_val, y_val, sample_weight=None):
         """训练CatBoost回归模型"""
         params = self.catboost_params.copy()
         params['loss_function'] = 'MAE'
 
         model = CatBoostRegressor(**params, iterations=2000, early_stopping_rounds=50)
 
-        train_pool = Pool(X_train, y_train)
+        train_pool = Pool(X_train, y_train, weight=sample_weight)
         val_pool = Pool(X_val, y_val)
 
         model.fit(train_pool, eval_set=val_pool, verbose=False)
@@ -306,14 +307,14 @@ class EnhancedModelTrainer:
         mae = mean_absolute_error(y_val, pred_val)
         return model, mae
 
-    def train_catboost_classification(self, X_train, y_train, X_val, y_val):
+    def train_catboost_classification(self, X_train, y_train, X_val, y_val, sample_weight=None):
         """训练CatBoost分类模型"""
         params = self.catboost_params.copy()
         params['loss_function'] = 'Logloss'
 
         model = CatBoostClassifier(**params, iterations=2000, early_stopping_rounds=50)
 
-        train_pool = Pool(X_train, y_train)
+        train_pool = Pool(X_train, y_train, weight=sample_weight)
         val_pool = Pool(X_val, y_val)
 
         model.fit(train_pool, eval_set=val_pool, verbose=False)
@@ -358,6 +359,20 @@ class EnhancedModelTrainer:
 
         print(f"有效样本: {len(valid_df):,}")
 
+        # S4: 计算时间衰减权重 (半衰期30天)
+        sample_weights = None
+        if 'datetime' in valid_df.columns:
+            try:
+                now = pd.Timestamp.now()
+                dt_series = pd.to_datetime(valid_df['datetime'])
+                days_ago = (now - dt_series).dt.total_seconds() / 86400.0
+                sample_weights = np.power(0.5, days_ago / 30.0)  # 30天半衰期
+                sample_weights = sample_weights.values
+                print(f"时间衰减权重: min={sample_weights.min():.4f}, max={sample_weights.max():.4f}, mean={sample_weights.mean():.4f}")
+            except Exception as e:
+                print(f"⚠️  时间衰减计算失败: {e}, 使用均等权重")
+                sample_weights = None
+
         # 准备特征
         feature_cols = self.prepare_features(valid_df)
         X = valid_df[feature_cols]
@@ -368,47 +383,51 @@ class EnhancedModelTrainer:
         X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
         y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
 
+        # S4: Split sample weights accordingly
+        w_train = sample_weights[:split_idx] if sample_weights is not None else None
+        w_val = sample_weights[split_idx:] if sample_weights is not None else None
+
         print(f"训练集: {len(X_train):,}, 验证集: {len(X_val):,}")
 
         models = {}
         scores = {}
 
-        # 训练三个模型
+        # 训练三个模型 (传入 sample_weight)
         if task_type == 'regression':
             # XGBoost
             models['xgb'], scores['xgb'] = self.train_xgboost_regression(
-                X_train, y_train, X_val, y_val
+                X_train, y_train, X_val, y_val, sample_weight=w_train
             )
             print(f"  XGBoost MAE: {scores['xgb']:.6f}")
 
             # LightGBM
             models['lgb'], scores['lgb'] = self.train_lightgbm_regression(
-                X_train, y_train, X_val, y_val
+                X_train, y_train, X_val, y_val, sample_weight=w_train
             )
             print(f"  LightGBM MAE: {scores['lgb']:.6f}")
 
             # CatBoost
             models['cat'], scores['cat'] = self.train_catboost_regression(
-                X_train, y_train, X_val, y_val
+                X_train, y_train, X_val, y_val, sample_weight=w_train
             )
             print(f"  CatBoost MAE: {scores['cat']:.6f}")
 
         else:  # classification
             # XGBoost
             models['xgb'], scores['xgb'] = self.train_xgboost_classification(
-                X_train, y_train, X_val, y_val
+                X_train, y_train, X_val, y_val, sample_weight=w_train
             )
             print(f"  XGBoost AUC: {scores['xgb']:.6f}")
 
             # LightGBM
             models['lgb'], scores['lgb'] = self.train_lightgbm_classification(
-                X_train, y_train, X_val, y_val
+                X_train, y_train, X_val, y_val, sample_weight=w_train
             )
             print(f"  LightGBM AUC: {scores['lgb']:.6f}")
 
             # CatBoost
             models['cat'], scores['cat'] = self.train_catboost_classification(
-                X_train, y_train, X_val, y_val
+                X_train, y_train, X_val, y_val, sample_weight=w_train
             )
             print(f"  CatBoost AUC: {scores['cat']:.6f}")
 
