@@ -1234,23 +1234,16 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
             if force:
                 cmd.append("--force")
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(BASE_DIR)
+            stdout_text, stderr_text, rc = await _run_subprocess_with_timeout(
+                cmd, BASE_DIR, TIMEOUT_TRAIN, "Closed-Loop Retraining"
             )
-            stdout, stderr = await process.communicate()
-
-            stdout_text = stdout.decode().strip()
-            stderr_text = stderr.decode().strip()
 
             if stdout_text:
                 logger.info(f"Retraining output (last 1000 chars):\n{stdout_text[-1000:]}")
             if stderr_text:
                 logger.warning(f"Retraining stderr (last 500 chars):\n{stderr_text[-500:]}")
 
-            if process.returncode != 0:
+            if rc != 0:
                 err_msg = stderr_text or stdout_text or "Retraining failed"
                 logger.error(f"❌ Closed-loop retraining failed: {err_msg}")
                 update_status("error", "Closed-Loop Retraining", f"Failed: {err_msg[-200:]}")

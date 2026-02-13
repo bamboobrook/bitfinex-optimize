@@ -898,5 +898,10 @@ class EnsemblePredictor:
         # ============================================================
 
 if __name__ == "__main__":
+    # 子进程也写入主日志文件，确保 v2 模型活动可追踪
+    import pathlib
+    _log_path = pathlib.Path(__file__).resolve().parent.parent / "log" / "ml_optimizer.log"
+    logger.add(str(_log_path), retention='7 days', rotation="10 MB")
+
     predictor = EnsemblePredictor()
     predictor.generate_recommendations()

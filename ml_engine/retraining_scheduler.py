@@ -44,7 +44,7 @@ class RetrainingScheduler:
         db_path: str = 'data/lending_history.db',
         production_model_dir: str = 'data/models',
         backup_dir: str = 'data/models_backup',
-        log_dir: str = 'log'
+        log_dir: str = 'data'
     ):
         """
         初始化

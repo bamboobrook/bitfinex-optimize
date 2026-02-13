@@ -67,8 +67,8 @@ class EnhancedModelTrainer:
         self.lgb_params = {
             'device': 'cpu',
             'learning_rate': 0.03,
-            'max_depth': 10,
-            'num_leaves': 127,
+            'max_depth': 7,
+            'num_leaves': 31,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
             'n_jobs': 24,
@@ -215,7 +215,7 @@ class EnhancedModelTrainer:
         model = xgb.train(
             params,
             dtrain,
-            num_boost_round=2000,
+            num_boost_round=500,
             evals=[(dtrain, 'train'), (dval, 'val')],
             early_stopping_rounds=50,
             verbose_eval=False
@@ -237,7 +237,7 @@ class EnhancedModelTrainer:
         model = xgb.train(
             params,
             dtrain,
-            num_boost_round=2000,
+            num_boost_round=500,
             evals=[(dtrain, 'train'), (dval, 'val')],
             early_stopping_rounds=50,
             verbose_eval=False
@@ -259,7 +259,7 @@ class EnhancedModelTrainer:
         model = lgb.train(
             params,
             train_data,
-            num_boost_round=2000,
+            num_boost_round=500,
             valid_sets=[train_data, val_data],
             valid_names=['train', 'val'],
             callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
@@ -281,7 +281,7 @@ class EnhancedModelTrainer:
         model = lgb.train(
             params,
             train_data,
-            num_boost_round=2000,
+            num_boost_round=500,
             valid_sets=[train_data, val_data],
             valid_names=['train', 'val'],
             callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
