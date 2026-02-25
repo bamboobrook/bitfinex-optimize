@@ -737,6 +737,145 @@ grep -E "Error|Exception|Traceback" log/ml_optimizer.log | tail -20
 2. **60/90d 仍100%**: max_up 0.45 → 0.55, 或 conf_w 上限 0.85 → 0.90
 3. **conf_w 过强导致短周期过调**: 门槛从 0.08 → 0.12
 
+## 2025-02-26 v5.3 长周期(>=60d)利率预测降敏（部署后12-24h审核）
+
+解决120天预测利率因短期市场波动过度下跌的问题。核心矛盾：120天借出承诺期间利率会波动无数次，短期低点是噪声，但系统把它当信号。修改了2个文件共4项改动。部署时间: 2026-02-26 07:23。
+
+### 问题诊断
+
+三个环节都对短期波动过度敏感：
+1. **市场锚定**: `current_rate` 是最新1分钟K线，瞬时暴跌直接拖低预测
+2. **安全边界**: `bound_base` 中 `ma_1440`(24h均线) 跟踪短期下跌太快，1-2天后 bounds 同步收缩
+3. **趋势修正**: 120d 用24h变化率，短期噪声叠加放大
+
+### 修改内容（4项）
+
+**改动1: 新增长期均线特征（data_processor.py:183-185）**
+- 新增 `ma_4320`(3天MA) 和 `ma_10080`(7天MA)
+- 不扩展原 `windows` 列表，避免生成不需要的 `std_10080`/`zscore_10080`
+
+**改动2: 长周期安全边界使用长期均线（predictor.py:498-506）**
+- >=60d: `bound_base = 0.8 * ma_10080 + 0.2 * ma_1440`（current_rate 完全移除）
+- >=20d: `bound_base = 0.6 * ma_4320 + 0.4 * ma_1440`
+- <20d: 不变 `0.6 * ma_1440 + 0.4 * current_rate`
+
+**改动3: 长周期市场锚定用长期均线替代 current_rate（predictor.py:458-467）**
+- >=60d: `anchor_rate = ma_10080`，`conf_weight += 0.10`（上限0.90）
+- >=20d: `anchor_rate = ma_4320`
+- <20d: `anchor_rate = current_rate`（不变）
+
+**改动4: 超长周期禁用趋势修正（predictor.py:477-482）**
+- >=90d: `trend=0, weight=0`（完全禁用）
+- >=60d: `weight=0.01`（从0.03降到0.01）
+- <60d: 不变
+
+### 修改后首次预测验证数据（2026-02-26 07:27 DIAG）
+
+| 币种-周期 | current | adj | conf_w | final | trend_adj | bounds | 说明 |
+|-----------|---------|-----|--------|-------|-----------|--------|------|
+| fUSD-90d | 5.58 | 1.4500 | 0.80 | 15.04 | 0.00 | [7.81,23.44] | 趋势禁用，锚定7天MA，未被current=5.58拖低 |
+| fUSD-120d | 5.66 | 1.2707 | 0.64 | 11.17 | 0.00 | [7.49,15.61] | 趋势禁用，bounds基于7天MA稳定 |
+| fUST-60d | 13.77 | 1.4500 | 0.80 | 11.81 | -0.02 | [7.40,15.42] | conf_w含+0.10 boost |
+| fUST-90d | 18.25 | 1.4500 | 0.85 | 13.94 | 0.00 | [9.80,20.41] | 趋势禁用 |
+| fUST-120d | 7.07 | 1.0459 | 0.60 | 9.22 | 0.00 | [6.93,14.43] | 趋势禁用 |
+| fUSD-60d | (v5.2旧值对比) | 1.4500 | 0.70→ | 10.58→ | 有→0 | | 降敏前有趋势干扰 |
+
+### 审核26: 长期均线特征是否正确生成（data_processor.py）
+- **怎么查**: 检查 processed 数据中是否包含 ma_4320/ma_10080
+  ```bash
+  python3 -c "
+  import pandas as pd
+  df = pd.read_parquet('data/processed/fUSD_2_features.parquet')
+  print(f'ma_4320 NaN%: {df[\"ma_4320\"].isna().mean()*100:.1f}%')
+  print(f'ma_10080 NaN%: {df[\"ma_10080\"].isna().mean()*100:.1f}%')
+  print(f'ma_4320 sample: {df[\"ma_4320\"].dropna().tail(3).tolist()}')
+  print(f'ma_10080 sample: {df[\"ma_10080\"].dropna().tail(3).tolist()}')
+  "
+  ```
+- **期望结果**: 两列均存在，NaN% 在预期范围内（ma_4320 前3天为NaN，ma_10080 前7天为NaN）
+
+### 审核27: 长周期 bounds 是否不再被 current_rate 影响（predictor.py）
+- **怎么查**: PREDICTION_DIAG 中 >=60d 的 bounds 字段
+  ```bash
+  grep "PREDICTION_DIAG.*\(60d\|90d\|120d\)" log/ml_optimizer.log | tail -10
+  ```
+- **期望结果**: 当 current_rate 处于瞬时低点时（如 fUSD-120d current=5.66），bounds 仍保持较高水平（[7.49,15.61]而非被压缩到[3.x,7.x]）
+- **对比**: v5.2 中 bound_base = 0.6*ma_1440 + 0.4*current_rate，current_rate=5.66 时 bounds 会被显著拉低
+
+### 审核28: 市场锚定 anchor_rate 替代验证（predictor.py）
+- **怎么查**: 对比 >=60d 的 conf_w 值，应比 v5.2 高 0.10
+  ```bash
+  grep "PREDICTION_DIAG" log/ml_optimizer.log | tail -28
+  ```
+- **期望结果**:
+  - fUSD-90d: conf_w=0.80（base 0.65 + extreme_boost + 0.10 长周期boost）
+  - fUST-60d: conf_w=0.80（含 +0.10）
+  - 短周期 conf_w 不变
+
+### 审核29: 趋势修正禁用/降低验证（predictor.py）
+- **怎么查**: DIAG 日志中 >=90d 的 trend_adj 字段
+- **期望结果**: 90d/120d 的 `trend_adj=0.0000`（完全禁用）；60d 的 trend_adj 绝对值应很小（weight从0.03→0.01）
+- **已验证**: fUSD-90d trend_adj=0.0, fUSD-120d trend_adj=0.0, fUST-60d trend_adj=-0.02（极小）
+
+### 量化验证（部署后12-24h运行）
+
+```bash
+# 1. 检查长周期诊断数据
+grep "PREDICTION_DIAG" log/ml_optimizer.log | grep -E "(60d|90d|120d)" | tail -12
+
+# 2. 长周期执行率趋势
+sqlite3 data/lending_history.db "
+SELECT currency, period, COUNT(*) as total,
+       SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed,
+       ROUND(100.0*SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END)/COUNT(*),1) as exec_rate
+FROM virtual_orders WHERE order_timestamp>=datetime('now','-24 hours')
+  AND status IN('EXECUTED','FAILED') AND period IN(60,90,120)
+GROUP BY currency, period ORDER BY currency, period;"
+
+# 3. 短周期回归验证（应不受影响）
+sqlite3 data/lending_history.db "
+SELECT currency, period, COUNT(*) as total,
+       SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed,
+       ROUND(100.0*SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END)/COUNT(*),1) as exec_rate
+FROM virtual_orders WHERE order_timestamp>=datetime('now','-24 hours')
+  AND status IN('EXECUTED','FAILED') AND period IN(2,3,4,5,7,10,15,30)
+GROUP BY currency, period ORDER BY currency, period;"
+
+# 4. 确认无报错
+grep -E "Error|Exception|Traceback" log/ml_optimizer.log | grep "$(date +%Y-%m-%d)" | tail -20
+
+# 5. 对比长周期预测利率
+python3 -c "
+import json
+data = json.load(open('data/optimal_combination.json'))
+for r in data.get('recommendations', []):
+    p = r.get('period', 0)
+    if p >= 60:
+        cur = r.get('details', {}).get('current', 0)
+        rate = r.get('rate', 0)
+        dev = ((rate - cur) / cur * 100) if cur > 0 else 0
+        print(f\"{r['currency']} {p}d: predicted={rate:.4f} current={cur:.4f} deviation={dev:+.1f}%\")
+"
+```
+
+**关键观察点**:
+- 120d 利率在市场短期下跌时不再大幅跟跌
+- bounds 保持在7天均线附近而非被当日低点压缩
+- 60/90d 同样受益但程度略小
+- 短周期(2-30d)行为完全不变
+
+**不受影响的部分**:
+- 短周期(2-30d)市场锚定、bounds、趋势修正均不变
+- 模型预测本身不变（模型不使用MA特征，无需重训练）
+- 执行反馈调整(`_get_unified_adjustment`)不变
+- 贝叶斯校准、策略选择不变
+
+**如果效果不理想的调参方向**:
+1. **120d 仍被短期波动影响**: ma_10080 不够稳，可考虑 ma_20160(14天MA)
+2. **60d bounds 过于宽松**: 0.8*ma_10080 + 0.2*ma_1440 中 ma_10080 权重可从 0.8 → 0.6
+3. **conf_weight 上限0.90过高导致预测偏离市场**: 降到 0.85
+4. **60d 趋势修正0.01仍有噪声**: 可改为 0.0（与90d+一样完全禁用）
+
 ## Data Files (all in .gitignore)
 
 | Path | Content |
