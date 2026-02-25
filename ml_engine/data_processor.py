@@ -242,6 +242,7 @@ class DataProcessor:
 
         # ============ 7. 执行反馈特征 (Execution Feedback Features) ============
         # 从虚拟订单历史中提取成交统计，动态调整预测策略
+        # v5: 按时间窗口滚动计算,而非所有样本共享同一值
         try:
             from ml_engine.execution_features import ExecutionFeatures
 
@@ -249,24 +250,76 @@ class DataProcessor:
             currency = df['currency'].iloc[0] if 'currency' in df.columns else 'fUSD'
             period = df['period'].iloc[0] if 'period' in df.columns else 30
 
-            # 计算所有执行反馈特征
             exec_calc = ExecutionFeatures()
-            exec_features = exec_calc.get_all_features(currency, period)
 
-            # 7.1 成交率统计 (7日和30日)
-            df['exec_rate_7d'] = exec_features['exec_rate_7d']
-            df['exec_rate_30d'] = exec_features['exec_rate_30d']
+            # 按时间采样计算执行特征 (每周一个采样点)
+            # 对于每个时间点,使用 as_of_date 参数计算当时的执行率
+            if 'datetime' in df.columns and len(df) > 0:
+                # 获取数据的时间范围
+                min_date = df['datetime'].min()
+                max_date = df['datetime'].max()
+
+                # 生成每周采样日期
+                sample_dates = pd.date_range(start=min_date, end=max_date, freq='7D')
+
+                if len(sample_dates) >= 2:
+                    # 为每个采样日期计算执行率
+                    sample_exec_7d = []
+                    sample_exec_30d = []
+                    sample_timestamps = []
+
+                    for sd in sample_dates:
+                        try:
+                            exec_calc.clear_cache()
+                            er_7d = exec_calc.calculate_execution_rate(currency, period, 7, as_of_date=sd.to_pydatetime())
+                            er_30d = exec_calc.calculate_execution_rate(currency, period, 30, as_of_date=sd.to_pydatetime())
+                            sample_exec_7d.append(er_7d)
+                            sample_exec_30d.append(er_30d)
+                            sample_timestamps.append(sd)
+                        except Exception:
+                            pass
+
+                    if len(sample_timestamps) >= 2:
+                        # 创建采样 Series 并对齐到数据时间线
+                        exec_7d_series = pd.Series(sample_exec_7d, index=sample_timestamps)
+                        exec_30d_series = pd.Series(sample_exec_30d, index=sample_timestamps)
+
+                        # 用最近邻插值对齐到原始数据时间
+                        df['exec_rate_7d'] = exec_7d_series.reindex(
+                            df['datetime'], method='ffill'
+                        ).fillna(exec_7d_series.iloc[-1]).values
+                        df['exec_rate_30d'] = exec_30d_series.reindex(
+                            df['datetime'], method='ffill'
+                        ).fillna(exec_30d_series.iloc[-1]).values
+                    else:
+                        # 采样点不够,回退到当前快照值
+                        exec_features = exec_calc.get_all_features(currency, period)
+                        df['exec_rate_7d'] = exec_features['exec_rate_7d']
+                        df['exec_rate_30d'] = exec_features['exec_rate_30d']
+                else:
+                    # 时间范围太短,回退
+                    exec_features = exec_calc.get_all_features(currency, period)
+                    df['exec_rate_7d'] = exec_features['exec_rate_7d']
+                    df['exec_rate_30d'] = exec_features['exec_rate_30d']
+            else:
+                exec_features = exec_calc.get_all_features(currency, period)
+                df['exec_rate_7d'] = exec_features['exec_rate_7d']
+                df['exec_rate_30d'] = exec_features['exec_rate_30d']
+
+            # 以下特征仍用当前快照(非时间敏感或数据量不足以滚动)
+            exec_calc.clear_cache()
+            exec_features_snapshot = exec_calc.get_all_features(currency, period)
 
             # 7.2 利差统计 (成交订单的平均利差)
-            df['avg_spread_7d'] = exec_features['avg_spread_7d']
-            df['avg_spread_30d'] = exec_features['avg_spread_30d']
+            df['avg_spread_7d'] = exec_features_snapshot['avg_spread_7d']
+            df['avg_spread_30d'] = exec_features_snapshot['avg_spread_30d']
 
             # 7.3 失败订单利率差距
-            df['avg_rate_gap_failed_7d'] = exec_features['avg_rate_gap_failed_7d']
+            df['avg_rate_gap_failed_7d'] = exec_features_snapshot['avg_rate_gap_failed_7d']
 
             # 7.4 成交延迟分布
-            df['exec_delay_p50'] = exec_features['exec_delay_p50']
-            df['exec_delay_p90'] = exec_features['exec_delay_p90']
+            df['exec_delay_p50'] = exec_features_snapshot['exec_delay_p50']
+            df['exec_delay_p90'] = exec_features_snapshot['exec_delay_p90']
 
             # 7.5 市场竞争力评分 (当前利率相对MA的位置)
             df['market_competitiveness'] = df['close_annual'] / (df['ma_1440'] + 1e-8)
@@ -279,16 +332,19 @@ class DataProcessor:
                 (df['market_competitiveness'] - 1.0).clip(lower=0, upper=0.2) * 1.5
             )
 
-            # 7.7 动态风险调整因子
-            # 根据近期成交率自动调整预测激进程度
-            df['risk_adjustment_factor'] = np.where(
-                df['exec_rate_7d'] < 0.5,
-                0.90,  # 成交率低于50%时降低10%
-                np.where(
-                    df['exec_rate_7d'] > 0.8,
-                    1.02,  # 成交率高于80%时略微提高2%
-                    1.0    # 正常情况不调整
-                )
+            # 7.7 动态风险调整因子 — 对称化, 与 execution_features.py 保持一致
+            df['risk_adjustment_factor'] = np.select(
+                [
+                    df['exec_rate_7d'] < 0.3,
+                    df['exec_rate_7d'] < 0.4,
+                    df['exec_rate_7d'] < 0.5,
+                    df['exec_rate_7d'] <= 0.6,
+                    df['exec_rate_7d'] <= 0.7,
+                    df['exec_rate_7d'] <= 0.85,
+                    df['exec_rate_7d'] > 0.85,
+                ],
+                [0.90, 0.94, 0.97, 1.0, 1.03, 1.06, 1.10],
+                default=1.0
             )
 
             # 7.8 成交率趋势 (短期vs长期)

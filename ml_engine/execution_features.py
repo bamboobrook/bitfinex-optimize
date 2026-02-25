@@ -77,8 +77,16 @@ class ExecutionFeatures:
             total = row[0] or 0
             executed = row[1] or 0
 
-            if total < 10:  # Cold start threshold
-                exec_rate = 0.6
+            # 长周期(>=60天)订单天然较少,降低冷启动阈值加速脱离默认值
+            cold_start_threshold = 5 if period >= 60 else 10
+            if total < cold_start_threshold:
+                # 冷启动默认值按周期差异化
+                if period <= 7:
+                    exec_rate = 0.55   # 短周期天然执行率更高
+                elif period <= 30:
+                    exec_rate = 0.50   # 中周期
+                else:
+                    exec_rate = 0.45   # 长周期天然执行率更低
             else:
                 exec_rate = executed / total
 
@@ -244,17 +252,22 @@ class ExecutionFeatures:
         features['exec_rate_trend'] = features['exec_rate_7d'] / (features['exec_rate_30d'] + 1e-8)
         features['rate_gap_trend'] = features['avg_rate_gap_failed_7d']
 
-        # Risk adjustment factor
-        if features['exec_rate_7d'] < 0.5:
+        # Risk adjustment factor — 对称化: 3级下调 + 3级上调, [0.5, 0.6] 为中性区间
+        exec_r = features['exec_rate_7d']
+        if exec_r < 0.3:
             features['risk_adjustment_factor'] = 0.90
-        elif features['exec_rate_7d'] < 0.6:
-            features['risk_adjustment_factor'] = 0.95
-        elif features['exec_rate_7d'] < 0.7:
-            features['risk_adjustment_factor'] = 0.98
-        elif features['exec_rate_7d'] > 0.85:
-            features['risk_adjustment_factor'] = 1.02
+        elif exec_r < 0.4:
+            features['risk_adjustment_factor'] = 0.94
+        elif exec_r < 0.5:
+            features['risk_adjustment_factor'] = 0.97
+        elif exec_r <= 0.6:
+            features['risk_adjustment_factor'] = 1.0    # 目标区间
+        elif exec_r <= 0.7:
+            features['risk_adjustment_factor'] = 1.03
+        elif exec_r <= 0.85:
+            features['risk_adjustment_factor'] = 1.06
         else:
-            features['risk_adjustment_factor'] = 1.0
+            features['risk_adjustment_factor'] = 1.10
 
         return features
 

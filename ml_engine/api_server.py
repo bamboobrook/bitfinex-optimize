@@ -670,13 +670,17 @@ async def run_full_pipeline():
 
             # 检查输出中是否包含"需要重训练"
             if "需要重训练" in stdout:
-                # 修改1.3: 限制强制重训练频率 - 检查上次重训练时间
-                if _last_forced_retrain_time and (datetime.now() - _last_forced_retrain_time) < timedelta(hours=24):
-                    logger.info(f"ℹ️  Retraining triggered but skipped: last retrained {datetime.now() - _last_forced_retrain_time} ago (< 24h)")
+                # 紧急重训练(单period异常)冷却6h，普通重训练冷却24h
+                is_urgent = "紧急重训练" in stdout
+                cooldown = timedelta(hours=6) if is_urgent else timedelta(hours=24)
+                cooldown_label = "6h" if is_urgent else "24h"
+
+                if _last_forced_retrain_time and (datetime.now() - _last_forced_retrain_time) < cooldown:
+                    logger.info(f"ℹ️  Retraining triggered but skipped: last retrained {datetime.now() - _last_forced_retrain_time} ago (< {cooldown_label})")
                     should_retrain = False
                 else:
                     should_retrain = True
-                    logger.info(f"✅ Retraining trigger detected: {stdout[-300:]}")
+                    logger.info(f"✅ Retraining trigger detected (urgent={is_urgent}): {stdout[-300:]}")
             else:
                 logger.info(f"ℹ️  No retraining needed: {stdout[-300:]}")
 

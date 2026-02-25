@@ -375,26 +375,54 @@ class EnsemblePredictor:
             logger.info(f"v2 blend for {currency}-{period}: traditional={prob:.4f}, v2={v2_execution_prob:.4f}, blended={blended_prob:.4f}")
             prob = blended_prob
 
-        # ========== 校准执行概率 (Calibrated Probability) ==========
-        # 温和校准: 50%原始概率 + 50%历史校准, 避免过度压低
-        exec_rate_7d = row_data.get('exec_rate_7d', 0.6)
-        raw_calibrated = prob * (exec_rate_7d / 0.7)
-        calibrated_prob = 0.5 * prob + 0.5 * raw_calibrated  # 混合校准,保留模型信心
+        # ========== 校准执行概率 (Bayesian-style Calibration) ==========
+        # 根据数据充分度动态加权模型概率和历史执行率
+        # v5 核心修复: 消除双重惩罚和硬性下限覆盖
+        try:
+            from ml_engine.execution_features import ExecutionFeatures
+            _exec_calc = ExecutionFeatures()
+            exec_rate_7d = _exec_calc.calculate_execution_rate(currency, period, 7)
+            exec_rate_30d = _exec_calc.calculate_execution_rate(currency, period, 30)
+            avg_rate_gap = _exec_calc.calculate_avg_rate_gap(currency, period, 7)
+            order_count = _exec_calc.get_order_count(currency, period)
+            logger.debug(f"Live execution stats for {currency}-{period}: exec_rate_7d={exec_rate_7d:.4f}, exec_rate_30d={exec_rate_30d:.4f}, orders={order_count}")
+        except Exception as e:
+            logger.warning(f"Failed to get live execution stats for {currency}-{period}: {e}, using feature data")
+            exec_rate_7d = row_data.get('exec_rate_7d', 0.6)
+            exec_rate_30d = row_data.get('exec_rate_30d', 0.6)
+            avg_rate_gap = row_data.get('avg_rate_gap_failed_7d', 0.0)
+            order_count = 0
+
+        # 贝叶斯风格校准: 根据数据充分度动态加权
+        # order_count 少时信任模型,多时信任历史执行率
+        evidence_weight = min(order_count / 50.0, 0.5)
+        calibrated_prob = (1.0 - evidence_weight) * prob + evidence_weight * exec_rate_7d
         calibrated_prob = np.clip(calibrated_prob, 0.0, 1.0)
 
-        # 根据校准后概率动态选择策略 (收益率优先)
-        if calibrated_prob < 0.40:
-            # 仅在校准概率极低时才走保守
-            base_rate = p_cons * 0.6 + p_bal * 0.4
-            strategy_desc = "High Certainty (Low Calibrated Prob)"
+        # 诊断日志: 记录关键决策变量
+        logger.debug(
+            f"Strategy decision for {currency}-{period}: "
+            f"prob={prob:.4f}, exec_rate_7d={exec_rate_7d:.4f}, "
+            f"calibrated_prob={calibrated_prob:.4f}"
+        )
+
+        # 连续插值策略选择 (消除硬阈值跳变)
+        # w_cons: calibrated_prob < 0.45 时为1, > 0.45 时线性降至0 (在0.10宽度内)
+        # w_aggr: calibrated_prob > 0.55 时开始上升, 0.90 时为1
+        # w_bal: 填补中间区域
+        w_cons = float(np.clip((0.45 - calibrated_prob) / 0.35, 0, 1))
+        w_aggr = float(np.clip((calibrated_prob - 0.55) / 0.35, 0, 1))
+        w_bal = 1.0 - w_cons - w_aggr
+        base_rate = w_cons * p_cons + w_bal * p_bal + w_aggr * p_aggr
+
+        # 策略标签和置信度
+        if w_cons > 0.5:
+            strategy_desc = "Conservative-leaning"
             confidence = "Low"
-        elif calibrated_prob > 0.75:
-            # 高概率时偏激进,最大化收益
-            base_rate = p_aggr * 0.6 + p_bal * 0.3 + p_cons * 0.1
-            strategy_desc = "High Yield (High Prob)"
+        elif w_aggr > 0.5:
+            strategy_desc = "Aggressive-leaning"
             confidence = "High"
         else:
-            base_rate = p_bal
             strategy_desc = "Balanced"
             confidence = "Medium"
 
@@ -407,22 +435,25 @@ class EnsemblePredictor:
             if old_confidence != confidence:
                 logger.info(f"Confidence degraded for {currency}-{period}: {old_confidence} -> {confidence} (data age: {data_age_hours:.1f}h)")
 
-        # ========== 执行反馈调整 (Execution Feedback Adjustment) ==========
-        # exec_rate_7d already fetched above for calibration
-        exec_rate_30d = row_data.get('exec_rate_30d', 0.6)
-        avg_rate_gap = row_data.get('avg_rate_gap_failed_7d', 0.0)
-        risk_adjustment = row_data.get('risk_adjustment_factor', 1.0)
+        # ========== 执行反馈调整 (Unified Adjustment) ==========
+        # exec_rate_7d, exec_rate_30d, avg_rate_gap 已在上方从DB实时获取
+        # 统一调整因子: 消除原来三因子(execution_adj × risk_adj × currency_factor)的重复计算
 
-        # 计算执行调整系数
-        execution_adjustment = self._calculate_execution_adjustment(
-            exec_rate_7d, exec_rate_30d, avg_rate_gap, base_rate
+        adjustment = self._get_unified_adjustment(
+            exec_rate_7d, exec_rate_30d, avg_rate_gap, base_rate, period, currency
         )
 
-        # ⭐ 新增:币种差异化因子
-        currency_factor = self._get_currency_adjustment_factor(currency, period, exec_rate_7d)
+        # 应用调整
+        model_rate = base_rate * adjustment
+        # 市场锚定: 基于 confidence 动态权重,不再对 current_rate 乘调整系数
+        conf_weight = {"High": 0.65, "Medium": 0.50, "Low": 0.35}.get(confidence, 0.50)
 
-        # 应用调整 (执行反馈 × 风险因子 × 币种因子)
-        adjusted_rate = base_rate * execution_adjustment * risk_adjustment * currency_factor
+        # 当调整因子偏离显著时,增加模型权重,避免市场锚定抵消纠偏
+        if adjustment > 1.15 or adjustment < 0.85:
+            extreme_boost = min(abs(adjustment - 1.0) - 0.15, 0.15)
+            conf_weight = min(conf_weight + extreme_boost, 0.80)
+
+        adjusted_rate = conf_weight * model_rate + (1 - conf_weight) * current_rate
 
         # S1: 融合 v2 revenue_optimized 预测 (如果可用)
         if v2_revenue_rate is not None and v2_revenue_rate > 0:
@@ -431,10 +462,18 @@ class EnsemblePredictor:
             logger.debug(f"v2 revenue blend for {currency}-{period}: adjusted={adjusted_rate:.4f}")
         # ====================================================================
 
-        # 趋势修正 (降低趋势影响权重从0.15到0.10)
-        trend = float(row_data.get('rate_chg_60', 0))
+        # 趋势修正 — 按周期选择趋势窗口和权重,减少短期噪音对长周期的影响
+        if period >= 60:
+            trend = float(row_data.get('rate_chg_1440', 0))  # 24h窗口
+            trend_weight = 0.03
+        elif period >= 20:
+            trend = float(row_data.get('rate_chg_240', 0))   # 4h窗口
+            trend_weight = 0.05
+        else:
+            trend = float(row_data.get('rate_chg_60', 0))    # 1h窗口
+            trend_weight = 0.08
         trend_factor = np.clip(trend / 5.0, -1.0, 1.0)
-        trend_adjustment = trend_factor * 0.10 * adjusted_rate
+        trend_adjustment = trend_factor * trend_weight * adjusted_rate
         final_rate = adjusted_rate + trend_adjustment
 
         # B4 FIX: Check for NaN in final_rate before clipping
@@ -442,24 +481,21 @@ class EnsemblePredictor:
             logger.error(f"NaN detected in final_rate for {currency}-{period}, skipping prediction")
             raise ValueError(f"NaN in final_rate for {currency}-{period}")
 
-        # 动态安全边界: 根据执行概率调整激进程度 (修改2.2: 收紧bounds)
-        # 高概率(>0.8): 宽边界 - 信任模型预测
-        # 中等概率(0.5-0.8): 收紧边界 - 适度控制 (0.45x-1.2x → 0.50x-1.10x)
-        # 低概率(<0.5): 窄边界 - 保守策略 (0.5x-1.05x → 0.55x-1.0x)
-        if prob > 0.8:
-            # 高执行概率 = 激进策略
-            min_bound = max(current_rate * 0.4, 0.01)
-            max_bound = current_rate * 1.5
+        # 动态安全边界: 基于24h均线和当前价的加权值,避免市场低点过度收紧
+        ma_1440 = float(row_data.get('ma_1440', current_rate))
+        bound_base = 0.6 * ma_1440 + 0.4 * current_rate
+
+        if calibrated_prob > 0.8:
+            min_bound = max(bound_base * 0.50, 0.01)
+            max_bound = bound_base * 1.5
             strategy_label = "aggressive"
-        elif prob > 0.5:
-            # 中等概率 = 收紧平衡策略
-            min_bound = max(current_rate * 0.50, 0.01)
-            max_bound = current_rate * 1.10
+        elif calibrated_prob > 0.5:
+            min_bound = max(bound_base * 0.60, 0.01)
+            max_bound = bound_base * 1.25
             strategy_label = "balanced"
         else:
-            # 低概率 = 收紧保守策略
-            min_bound = max(current_rate * 0.55, 0.01)
-            max_bound = current_rate * 1.0
+            min_bound = max(bound_base * 0.65, 0.01)
+            max_bound = bound_base * 1.0
             strategy_label = "conservative"
 
         clipped_rate = np.clip(final_rate, min_bound, max_bound)
@@ -474,6 +510,18 @@ class EnsemblePredictor:
                 f"strategy={strategy_label}, reduction={reduction_pct:.1f}%)"
             )
         final_rate = clipped_rate
+
+        # ========== 结构化诊断日志 ==========
+        logger.info(
+            f"PREDICTION_DIAG {currency}-{period}d: "
+            f"current={current_rate:.4f} base={base_rate:.4f} "
+            f"adj={adjustment:.4f} model_rate={model_rate:.4f} "
+            f"conf_w={conf_weight:.2f} adjusted={adjusted_rate:.4f} "
+            f"trend_adj={trend_adjustment:.4f} final={final_rate:.4f} "
+            f"exec_7d={exec_rate_7d:.3f} exec_30d={exec_rate_30d:.3f} "
+            f"calib_prob={calibrated_prob:.3f} strategy={strategy_desc} "
+            f"clipped={was_clipped} bounds=[{min_bound:.4f},{max_bound:.4f}]"
+        )
 
         return {
             "currency": currency,
@@ -491,7 +539,7 @@ class EnsemblePredictor:
             "prediction_timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # When prediction was made
             # 新增调试信息
             "execution_rate_7d": exec_rate_7d,
-            "execution_adjustment_applied": execution_adjustment,
+            "execution_adjustment_applied": adjustment,
             # v2 model info (S1)
             "v2_execution_prob": v2_execution_prob,
             "v2_revenue_rate": v2_revenue_rate,
@@ -501,98 +549,69 @@ class EnsemblePredictor:
             "clipping_bounds": {"min": float(min_bound), "max": float(max_bound)}
         }
 
-    def _calculate_execution_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
-                                         avg_gap: float, base_rate: float) -> float:
+    def _get_unified_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
+                                avg_gap: float, base_rate: float,
+                                period: int, currency: str) -> float:
         """
-        根据成交历史计算利率调整系数 - v3 收益率优先版
+        统一调整因子 — 消除对 exec_rate 的重复计算
 
-        调整逻辑(温和版 - 避免过度压低利率):
-        - 成交率 < 10%: 降低15% (极端低成交,仅温和调整)
-        - 成交率 < 30%: 降低10%
-        - 成交率 < 50%: 降低5%
-        - 成交率 50-70%: 基本不调整
-        - 成交率 > 70%: 适度提高,鼓励更高收益
-        - 成交率 > 90%: 提高8%
+        替代原来的三因子乘法: execution_adjustment × risk_adjustment × currency_factor
+        三因子都对 exec_rate_7d 做出反应,导致同一信号被计入三次
+
+        新设计: 单一函数,非线性映射,周期感知灵敏度
 
         Args:
             exec_rate_7d: 7日成交率
             exec_rate_30d: 30日成交率
             avg_gap: 失败订单平均利率差距
             base_rate: 基础预测利率
+            period: 周期天数
+            currency: 币种
 
         Returns:
-            调整系数 (0.82-1.18)
+            调整系数 (0.70-1.35)
         """
-        # 基础调整 - 温和版,收益率优先
-        if exec_rate_7d < 0.1:
-            adjustment = 0.85      # 极端低成交,温和降低
-        elif exec_rate_7d < 0.3:
-            adjustment = 0.90      # 低成交,适度降低
-        elif exec_rate_7d < 0.5:
-            adjustment = 0.95      # 中低成交,微调
-        elif exec_rate_7d < 0.7:
-            adjustment = 1.0       # 正常区间,不调整
-        elif exec_rate_7d > 0.9:
-            adjustment = 1.08      # 高成交,鼓励提高利率
-        elif exec_rate_7d > 0.7:
-            adjustment = 1.04      # 较高成交,适度提高
-        else:
-            adjustment = 1.0
+        target = 0.50
+        deviation = exec_rate_7d - target  # [-0.5, +0.5]
 
-        # 利率差距惩罚 (温和版,上限10%)
+        # 周期感知灵敏度 (4级分类)
+        if period >= 60:
+            max_up, max_down = 0.35, 0.30    # 长周期: 最高+35%/-30%
+        elif period >= 20:
+            max_up, max_down = 0.28, 0.24    # 中周期(20-59d)
+        elif period >= 8:
+            max_up, max_down = 0.26, 0.20    # 近中周期(8-19d): 48h验证窗口,较低波动性
+        else:
+            max_up, max_down = 0.18, 0.16    # 超短周期(2-7d): 降低调整力度,减少过调
+
+        # 非线性映射: 偏离目标越远,调整越激进
+        if deviation > 0:
+            # 上调(定价过低): 用幂函数加速响应
+            norm_dev = deviation / 0.50  # [0, 1]
+            if norm_dev > 0.8:
+                # 极端偏离区(exec>90%): 混合power 0.7和0.5,加速收敛
+                adj_factor = 0.5 * (norm_dev ** 0.7) + 0.5 * (norm_dev ** 0.5)
+            else:
+                adj_factor = norm_dev ** 0.7
+            adjustment = 1.0 + max_up * adj_factor
+        else:
+            # 下调(定价过高): 线性
+            norm_dev = abs(deviation) / 0.50
+            adjustment = 1.0 - max_down * norm_dev
+
+        # 利率差距惩罚(仅下调方向)
         if avg_gap > 0:
-            gap_penalty = min(avg_gap / (base_rate + 1e-8), 0.10)
+            gap_penalty = min(avg_gap / (base_rate + 1e-8), 0.12)
             adjustment *= (1.0 - gap_penalty)
 
-        # 趋势因素
-        exec_trend = exec_rate_7d / (exec_rate_30d + 1e-8)
-        if exec_trend < 0.8:  # 成交率显著恶化
+        # 趋势微调
+        trend = exec_rate_7d / (exec_rate_30d + 1e-8)
+        if trend < 0.8:
             adjustment *= 0.98
-        elif exec_trend > 1.2:  # 成交率改善
-            adjustment *= 1.02
+        elif trend > 1.2:
+            adjustment *= 1.01
 
-        # 安全边界 (收窄范围,避免极端调整)
-        adjustment = np.clip(adjustment, 0.82, 1.18)
-
-        return adjustment
-
-    def _get_currency_adjustment_factor(self, currency: str, period: int, exec_rate: float) -> float:
-        """
-        币种和周期差异化调整因子 - v3 收益率优先版
-
-        策略:
-        - 基于exec_rate与目标(0.50)的偏差,使用连续函数
-        - 高于目标: 线性放大至+12% (鼓励高执行率组合追求更高收益)
-        - 低于目标: 线性缩减至-12% (温和惩罚,不过度压低)
-        - 长周期奖励: period >= 60d 额外+5% (鼓励长周期)
-        - 最终clamp到[0.88, 1.18]
-
-        Args:
-            currency: 币种 (fUSD/fUST)
-            period: 期限 (天)
-            exec_rate: 执行成交率
-
-        Returns:
-            调整因子 (0.88-1.18)
-        """
-        target_exec_rate = 0.50
-        deviation = exec_rate - target_exec_rate
-
-        if deviation >= 0:
-            # Above target: scale up to +12% (at exec_rate=1.0, deviation=0.50 -> +12%)
-            adjustment = 1.0 + (deviation / 0.50) * 0.12
-        else:
-            # Below target: scale down to -12% (at exec_rate=0.0, deviation=-0.50 -> -12%)
-            adjustment = 1.0 + (deviation / 0.50) * 0.12
-
-        # Long period bonus: +5% for period >= 60d (不依赖exec_rate,鼓励长周期)
-        if period >= 60:
-            adjustment += 0.05
-
-        # Clamp to safe range (比之前收窄,避免极端调整)
-        adjustment = np.clip(adjustment, 0.88, 1.18)
-
-        return adjustment
+        return np.clip(adjustment, 1.0 - max_down, 1.0 + max_up)
 
     def get_latest_predictions(self):
         """获取最新预测结果 - 并行化版本"""

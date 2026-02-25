@@ -114,7 +114,7 @@ class RetrainingScheduler:
 
     def get_recent_execution_rate(self, days: int = 7) -> float:
         """
-        获取近期成交率
+        获取近期全局成交率
 
         Args:
             days: 天数
@@ -146,13 +146,74 @@ class RetrainingScheduler:
 
         return executed / total
 
+    def get_per_period_execution_anomalies(self, days: int = 7, min_orders: int = 5) -> list:
+        """
+        按 currency+period 分组检查成交率异常
+
+        避免全局平均稀释单个 period 的低执行率问题。
+        例如 60/90天75%执行率 + 120天25%执行率 = 全局55%（看似正常）
+
+        Args:
+            days: 回看天数
+            min_orders: 最少订单数（低于此数忽略，避免噪声）
+
+        Returns:
+            异常列表 [{"currency": str, "period": int, "exec_rate": float, "total": int}, ...]
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        since_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        query = """
+        SELECT
+            currency, period,
+            COUNT(*) as total,
+            SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed
+        FROM virtual_orders
+        WHERE order_timestamp >= ?
+          AND status IN ('EXECUTED', 'FAILED')
+        GROUP BY currency, period
+        HAVING COUNT(*) >= ?
+        """
+
+        cursor.execute(query, (since_date, min_orders))
+        rows = cursor.fetchall()
+        conn.close()
+
+        anomalies = []
+        for currency, period, total, executed in rows:
+            exec_rate = executed / total
+            # 严重性分级:
+            # critical: exec_rate < 0.20 或 > 0.85
+            # warning: exec_rate < 0.30 或 > 0.65
+            severity = None
+            if exec_rate < 0.20 or exec_rate > 0.85:
+                severity = "critical"
+            elif exec_rate < 0.30 or exec_rate > 0.65:
+                severity = "warning"
+
+            if severity:
+                anomalies.append({
+                    "currency": currency,
+                    "period": period,
+                    "exec_rate": exec_rate,
+                    "total": total,
+                    "severity": severity
+                })
+
+        return anomalies
+
     def should_retrain(self) -> Tuple[bool, Optional[str]]:
         """
         判断是否需要重训练
 
         触发条件:
         1. 距离上次训练 >= 7天 且 新增执行结果 >= 500条
-        2. 近期成交率异常 (< 40% or > 60%)
+        2. 全局近期成交率异常 (< 40% or > 60%)
+        3. 单个 currency+period 成交率异常:
+           - critical: < 20% 或 > 85%
+           - warning: < 30% 或 > 65%
 
         Returns:
             (是否需要重训练, 原因)
@@ -172,9 +233,18 @@ class RetrainingScheduler:
         new_orders = self.count_new_execution_results(last_train_date)
         print(f"新增执行结果: {new_orders} 条")
 
-        # 条件2: 近期成交率
+        # 条件2: 全局近期成交率
         exec_rate_7d = self.get_recent_execution_rate(days=7)
-        print(f"近7天成交率: {exec_rate_7d:.2%}")
+        print(f"近7天全局成交率: {exec_rate_7d:.2%}")
+
+        # 条件3: 按 period 分组检查
+        period_anomalies = self.get_per_period_execution_anomalies(days=7, min_orders=5)
+        if period_anomalies:
+            print(f"按 period 分组异常:")
+            for a in period_anomalies:
+                print(f"   - [{a['severity']}] {a['currency']} {a['period']}天: {a['exec_rate']:.2%} ({a['total']}单)")
+        else:
+            print(f"按 period 分组: 无异常")
 
         print("\n判断结果:")
 
@@ -184,23 +254,70 @@ class RetrainingScheduler:
             print(f"✅ 需要重训练: {reason}")
             return True, reason
 
-        # 紧急重训练 - 成交率过低
+        # 紧急重训练 - 全局成交率过低
         if exec_rate_7d < 0.4:
-            reason = f"成交率过低 ({exec_rate_7d:.2%} < 40%), 紧急重训练"
+            reason = f"全局成交率过低 ({exec_rate_7d:.2%} < 40%), 紧急重训练"
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
 
-        # 紧急重训练 - 成交率过高
+        # 紧急重训练 - 全局成交率过高
         if exec_rate_7d > 0.6:
-            reason = f"成交率过高 ({exec_rate_7d:.2%} > 60%), 紧急重训练"
+            reason = f"全局成交率过高 ({exec_rate_7d:.2%} > 60%), 紧急重训练"
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
+
+        # 紧急重训练 - 单个 period 成交率异常（避免被全局平均稀释）
+        if period_anomalies:
+            # critical 级别的低执行率
+            critical_low = [a for a in period_anomalies if a['exec_rate'] < 0.20 and a['severity'] == 'critical']
+            if critical_low:
+                details = ", ".join(
+                    f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
+                    for a in critical_low
+                )
+                reason = f"单period成交率极低(critical) ({details}), 紧急重训练"
+                print(f"⚠️  需要重训练: {reason}")
+                return True, reason
+
+            # critical 级别的高执行率
+            critical_high = [a for a in period_anomalies if a['exec_rate'] > 0.85 and a['severity'] == 'critical']
+            if critical_high:
+                details = ", ".join(
+                    f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
+                    for a in critical_high
+                )
+                reason = f"单period成交率极高(critical) ({details}), 紧急重训练"
+                print(f"⚠️  需要重训练: {reason}")
+                return True, reason
+
+            # warning 级别: 低执行率 < 0.30
+            warning_low = [a for a in period_anomalies if a['exec_rate'] < 0.30 and a['severity'] == 'warning']
+            if warning_low:
+                details = ", ".join(
+                    f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
+                    for a in warning_low
+                )
+                reason = f"单period成交率过低(warning) ({details}), 紧急重训练"
+                print(f"⚠️  需要重训练: {reason}")
+                return True, reason
+
+            # warning 级别: 高执行率 > 0.65
+            warning_high = [a for a in period_anomalies if a['exec_rate'] > 0.65 and a['severity'] == 'warning']
+            if warning_high:
+                details = ", ".join(
+                    f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
+                    for a in warning_high
+                )
+                reason = f"单period成交率偏高(warning) ({details}), 紧急重训练"
+                print(f"⚠️  需要重训练: {reason}")
+                return True, reason
 
         # 不需要重训练
         print(f"❌ 暂不需要重训练")
         print(f"   - 距上次训练: {days_since_last} 天 (需要 >= 7天)")
         print(f"   - 新增数据: {new_orders} 条 (需要 >= 500条)")
-        print(f"   - 成交率: {exec_rate_7d:.2%} (正常范围: 40%-60%)")
+        print(f"   - 全局成交率: {exec_rate_7d:.2%} (正常范围: 40%-60%)")
+        print(f"   - 分组异常: 无")
 
         return False, None
 
