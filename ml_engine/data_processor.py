@@ -180,6 +180,10 @@ class DataProcessor:
             df[f'zscore_{window}'] = (df['close_annual'] - df[f'ma_{window}']) / (df[f'std_{window}'] + 1e-8)
             df[f'vol_ma_{window}'] = df['volume'].rolling(window=window).mean()
 
+        # 长周期bounds用长期均线,减少短期波动影响
+        df['ma_4320'] = df['close_annual'].rolling(window=4320).mean()   # 3天MA
+        df['ma_10080'] = df['close_annual'].rolling(window=10080).mean() # 7天MA
+
         # ============ 3. 新增技术指标 ============
         # RSI指标 (14期和28期)
         df['rsi_14'] = self.calculate_rsi(df['close_annual'], 14)

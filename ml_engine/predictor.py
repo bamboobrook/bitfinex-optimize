@@ -448,12 +448,23 @@ class EnsemblePredictor:
         # 市场锚定: 基于 confidence 动态权重,不再对 current_rate 乘调整系数
         conf_weight = {"High": 0.65, "Medium": 0.50, "Low": 0.35}.get(confidence, 0.50)
 
-        # 当调整因子偏离显著时,增加模型权重,避免市场锚定抵消纠偏
-        if adjustment > 1.15 or adjustment < 0.85:
-            extreme_boost = min(abs(adjustment - 1.0) - 0.15, 0.15)
-            conf_weight = min(conf_weight + extreme_boost, 0.80)
+        # 当调整因子偏离时,渐进增加模型权重,避免市场锚定抵消纠偏
+        # v5.2: 门槛从1.15/0.85降到1.08/0.92,渐进增强而非突变
+        abs_dev = abs(adjustment - 1.0)
+        if abs_dev > 0.08:
+            extreme_boost = min(abs_dev - 0.08, 0.20)
+            conf_weight = min(conf_weight + extreme_boost, 0.85)
 
-        adjusted_rate = conf_weight * model_rate + (1 - conf_weight) * current_rate
+        # 长周期: 锚定点从 current_rate 换为长期均线,减少瞬时波动影响
+        if period >= 60:
+            anchor_rate = float(row_data.get('ma_10080', current_rate))  # 7天MA
+            conf_weight = min(conf_weight + 0.10, 0.90)                 # 模型权重+10%
+        elif period >= 20:
+            anchor_rate = float(row_data.get('ma_4320', current_rate))   # 3天MA
+        else:
+            anchor_rate = current_rate
+
+        adjusted_rate = conf_weight * model_rate + (1 - conf_weight) * anchor_rate
 
         # S1: 融合 v2 revenue_optimized 预测 (如果可用)
         if v2_revenue_rate is not None and v2_revenue_rate > 0:
@@ -463,9 +474,12 @@ class EnsemblePredictor:
         # ====================================================================
 
         # 趋势修正 — 按周期选择趋势窗口和权重,减少短期噪音对长周期的影响
-        if period >= 60:
-            trend = float(row_data.get('rate_chg_1440', 0))  # 24h窗口
-            trend_weight = 0.03
+        if period >= 90:
+            trend = 0.0                                                # 90d/120d: 完全禁用趋势修正
+            trend_weight = 0.0
+        elif period >= 60:
+            trend = float(row_data.get('rate_chg_1440', 0))            # 24h窗口
+            trend_weight = 0.01                                        # 从0.03降到0.01
         elif period >= 20:
             trend = float(row_data.get('rate_chg_240', 0))   # 4h窗口
             trend_weight = 0.05
@@ -481,9 +495,16 @@ class EnsemblePredictor:
             logger.error(f"NaN detected in final_rate for {currency}-{period}, skipping prediction")
             raise ValueError(f"NaN in final_rate for {currency}-{period}")
 
-        # 动态安全边界: 基于24h均线和当前价的加权值,避免市场低点过度收紧
+        # 动态安全边界: 按周期分级,长周期用长期均线减少短期波动
         ma_1440 = float(row_data.get('ma_1440', current_rate))
-        bound_base = 0.6 * ma_1440 + 0.4 * current_rate
+        if period >= 60:
+            ma_long = float(row_data.get('ma_10080', ma_1440))   # 7天MA, fallback到24h
+            bound_base = 0.8 * ma_long + 0.2 * ma_1440           # current_rate 完全移除
+        elif period >= 20:
+            ma_mid = float(row_data.get('ma_4320', ma_1440))     # 3天MA
+            bound_base = 0.6 * ma_mid + 0.4 * ma_1440
+        else:
+            bound_base = 0.6 * ma_1440 + 0.4 * current_rate      # 短周期不变
 
         if calibrated_prob > 0.8:
             min_bound = max(bound_base * 0.50, 0.01)
@@ -569,20 +590,20 @@ class EnsemblePredictor:
             currency: 币种
 
         Returns:
-            调整系数 (0.70-1.35)
+            调整系数 (0.70-1.45)
         """
         target = 0.50
         deviation = exec_rate_7d - target  # [-0.5, +0.5]
 
         # 周期感知灵敏度 (4级分类)
         if period >= 60:
-            max_up, max_down = 0.35, 0.30    # 长周期: 最高+35%/-30%
+            max_up, max_down = 0.45, 0.30    # 长周期: 最高+45%/-30% (v5.1→v5.2: 0.35→0.45, 60/90d仍100%)
         elif period >= 20:
             max_up, max_down = 0.28, 0.24    # 中周期(20-59d)
         elif period >= 8:
-            max_up, max_down = 0.26, 0.20    # 近中周期(8-19d): 48h验证窗口,较低波动性
+            max_up, max_down = 0.32, 0.20    # 近中周期(8-19d): v5.2 0.26→0.32, 10-15d仍>90%
         else:
-            max_up, max_down = 0.18, 0.16    # 超短周期(2-7d): 降低调整力度,减少过调
+            max_up, max_down = 0.18, 0.16    # 超短周期(2-7d): 保持不变
 
         # 非线性映射: 偏离目标越远,调整越激进
         if deviation > 0:
