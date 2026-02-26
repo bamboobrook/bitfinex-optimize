@@ -466,11 +466,12 @@ class EnsemblePredictor:
 
         adjusted_rate = conf_weight * model_rate + (1 - conf_weight) * anchor_rate
 
-        # S1: 融合 v2 revenue_optimized 预测 (如果可用)
-        if v2_revenue_rate is not None and v2_revenue_rate > 0:
-            # 加权混合: 70% 传统调整后 + 30% v2 收益优化
-            adjusted_rate = 0.7 * adjusted_rate + 0.3 * v2_revenue_rate
-            logger.debug(f"v2 revenue blend for {currency}-{period}: adjusted={adjusted_rate:.4f}")
+        # S1: v2 revenue_optimized 模型已禁用混合
+        # 原因: revenue_optimized 模型的训练目标是 close_annual × revenue_reward (0~2范围的奖励分数)
+        # 但此处将其作为利率(5~18范围)按30%权重混入，导致所有预测被系统性拉低~30%
+        # 保留日志记录用于监控，不参与计算
+        if v2_revenue_rate is not None:
+            logger.debug(f"v2 revenue (disabled, for monitoring only) {currency}-{period}: {v2_revenue_rate:.4f}")
         # ====================================================================
 
         # 趋势修正 — 按周期选择趋势窗口和权重,减少短期噪音对长周期的影响

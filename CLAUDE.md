@@ -876,6 +876,170 @@ for r in data.get('recommendations', []):
 3. **conf_weight 上限0.90过高导致预测偏离市场**: 降到 0.85
 4. **60d 趋势修正0.01仍有噪声**: 可改为 0.0（与90d+一样完全禁用）
 
+## 2025-02-26 Bug修复: Step 6 假订单 + v5.3 降敏首次审核
+
+### Bug修复: api_server.py Step 6 subprocess 创建假订单
+
+**问题**: `run_full_pipeline()` 的 Step 6 通过 `python -m ml_engine.order_manager` subprocess 创建订单，但 `order_manager.py` 的 `__main__` 块只有测试代码，每次运行都会创建一个 `fUSD-30d predicted_rate=12.5` 的假订单。真正的订单已在 Step 5 由 `predictor.py:875 self.order_manager.create_virtual_order(pred)` 创建。
+
+**影响**: 累计产生 185 条假订单（2026-02-07 ~ 2026-02-26），其中 EXECUTED=66, FAILED=99, PENDING=20。这些假订单严重污染了 fUSD-30d 的执行率统计——清理前 7d 执行率显示 64.3%，清理后真实值为 83.3%（说明 fUSD-30d 实际执行率偏高而非接近目标）。
+
+**修复**:
+- `api_server.py`: 删除 Step 6 的 subprocess 调用，改为日志说明订单已在 Step 5 创建
+- `data/lending_history.db`: 已删除 185 条 `WHERE currency='fUSD' AND period=30 AND predicted_rate=12.5` 的假订单
+
+**注意**: `execution_statistics` 表中历史聚合数据包含假订单的影响，将在下次 pipeline 运行时通过 `aggregate_execution_statistics()` 自动更新当天数据。历史天的数据不会被修正，但随着时间推移影响会消退。
+
+### v5.3 降敏首次审核结果（2026-02-26 07:27 唯一一轮）
+
+v5.3 代码于 07:23 部署，07:27 完成首次预测。09:28 的完整 pipeline 因下载超时失败，**v5.3 尚未产生任何虚拟订单**。
+
+4 项改动全部验证通过:
+- 审核29: 90d/120d trend_adj=0.0000（完全禁用），60d=-0.02（极小）
+- 审核28: >=60d conf_w 增加 +0.10（fUST-60d 0.70→0.80）
+- 审核27: bounds 基于7天MA，fUSD-120d current=5.66 但 bounds=[7.49,15.61]（未被拖低）
+- 审核26: ma_4320/ma_10080 特征正常生成
+
+长周期预测利率对比（v5.2→v5.3，同 current_rate）:
+- fUSD-90d: 12.82→15.04 (+17.3%)
+- fUSD-120d: 9.98→11.17 (+11.9%)
+- fUST-120d: 7.41→9.22 (+24.4%)
+
+### 审核30: v5.3 订单创建验证 + fUSD-30d 真实执行率观测
+
+v5.3 尚未产生虚拟订单（09:28 pipeline 下载超时失败）。下次对话时需确认:
+
+1. **v5.3 是否成功创建了订单**: 检查 pipeline 是否完整执行到 Step 5
+   ```bash
+   grep "CLOSED-LOOP Pipeline completed successfully" log/ml_optimizer.log | tail -5
+   ```
+
+2. **fUSD-30d 真实执行率趋势**（假订单清理后基线=83.3%）:
+   ```sql
+   SELECT COUNT(*), SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END),
+          ROUND(100.0*SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END)/COUNT(*),1)
+   FROM virtual_orders
+   WHERE currency='fUSD' AND period=30 AND status IN('EXECUTED','FAILED')
+     AND order_timestamp >= datetime('now','-7 days');
+   ```
+   fUSD-30d 真实执行率 83.3% 说明其实是**偏高**的，系统应该上调利率而非下调。之前因假订单掩盖了真实情况。
+
+3. **长周期降敏效果（需要多轮积累）**:
+   ```bash
+   grep "PREDICTION_DIAG" log/ml_optimizer.log | grep -E "(60d|90d|120d)" | tail -12
+   ```
+   观察: bounds 是否稳定在7天MA附近，trend_adj 是否保持 0 或极小值
+
+4. **全周期执行率**:
+   ```sql
+   SELECT currency, period, COUNT(*) as total,
+          SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed,
+          ROUND(100.0*SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END)/COUNT(*),1) as exec_rate
+   FROM virtual_orders WHERE order_timestamp>=datetime('now','-48 hours')
+     AND status IN('EXECUTED','FAILED')
+   GROUP BY currency, period ORDER BY currency, period;
+   ```
+
+5. **清理后基线对照（2026-02-26 清理后7d真实执行率）**:
+
+   | 币种-周期 | 清理前(含假订单) | 清理后(真实) | 差异 | 说明 |
+   |-----------|-----------------|-------------|------|------|
+   | fUSD 30d | 64.3% | **83.3%** | +19pp | 假订单(12.5%利率大部分FAILED)拉低了统计 |
+   | 其他周期 | 不受影响 | 不受影响 | - | 假订单仅影响fUSD-30d |
+
+## 2025-02-26 v5.3.1 Bug修复: v2 revenue_optimized 模型错误混合（部署后12-24h审核）
+
+**问题诊断**: `predictor.py` 中 S1 逻辑将 v2 `revenue_optimized` 模型的预测值按 30% 权重混入最终利率。但该模型的训练目标是 `close_annual × revenue_reward`（范围约 0~2 的奖励分数），不是实际利率（范围约 5~18）。以 30% 权重混入后，所有预测被系统性拉低约 30%，尤其 120d 等长周期影响最大。
+
+**修改内容（2项，2个文件）**:
+
+### 改动1: 禁用 v2 revenue 混合（predictor.py:469-474）
+- **改了什么**: 注释掉 `adjusted_rate = 0.7 * adjusted_rate + 0.3 * v2_revenue_rate`，保留日志监控
+- **原因**: v2_revenue_rate 实际值 -0.001 ~ 0.16（奖励分数），按利率混入是 bug
+- **影响**: 所有周期预测利率上升约 30%（之前被拉低的恢复）
+
+### 改动2: 移除 Step 6 假订单 subprocess（api_server.py:751-763）
+- 已在上一轮修复中完成，本次一并提交
+
+### 修改后首次预测验证（2026-02-26 22:46 DIAG）
+
+| 币种-周期 | current | adj | conf_w | final | 对比v5.3(07:27) | 变化原因 |
+|-----------|---------|-----|--------|-------|-----------------|---------|
+| fUSD-120d | 3.65 | 1.2726 | 0.90 | 15.64 | 11.17 | +40% 修复v2混合 |
+| fUST-120d | 5.73 | 1.1538 | 0.67 | 14.45 | 9.22 | +57% 修复v2混合 |
+| fUSD-90d | (未出现本轮DIAG) | - | - | - | 15.04 | 待下轮观察 |
+| fUSD-60d | 5.55 | 1.2693 | 0.90 | 17.35 | 9.51→(v5.3无数据) | 显著回升 |
+| fUST-60d | 18.20 | 1.2474 | 0.77 | 15.43 | 11.81 | +31% |
+
+**v2 revenue 监控数据**（禁用后仅记录不参与计算）:
+- fUST-60: 0.1571, fUST-120: 0.0911, fUST-30: 0.0989, fUST-15: -0.0012
+- 这些值如果按旧逻辑以30%权重混入 `adjusted_rate≈15`，会拉低到 `0.7*15 + 0.3*0.15 ≈ 10.55`
+
+### 审核31: v2 revenue 禁用后预测利率是否回升（predictor.py）
+- **怎么查**:
+  ```bash
+  grep "PREDICTION_DIAG" log/ml_optimizer.log | tail -28
+  grep "v2 revenue (disabled" log/ml_optimizer.log | tail -10
+  ```
+- **期望结果**: 日志中出现 "disabled, for monitoring only"；长周期预测利率比 v5.3 显著上升
+- **不应出现**: `v2 revenue blend` 字样（旧版混合日志）
+
+### 审核32: 长周期预测利率合理性验证
+- **怎么查**: 对比 current_rate 和 predicted_rate
+  ```bash
+  python3 -c "
+  import json
+  data = json.load(open('data/optimal_combination.json'))
+  for r in data.get('recommendations', []):
+      p = r.get('period', 0)
+      if p >= 60:
+          cur = r.get('details', {}).get('current', 0)
+          rate = r.get('rate', 0)
+          dev = ((rate - cur) / cur * 100) if cur > 0 else 0
+          print(f\"{r['currency']} {p}d: predicted={rate:.4f} current={cur:.4f} deviation={dev:+.1f}%\")
+  "
+  ```
+- **期望结果**: 120d 预测利率 > 10（之前被压到 9.22/11.17），方向为上调（因 exec_rate 偏高）
+- **注意**: deviation 较大（+100%~+300%）是正常的，因为 current_rate 处于短期低点而长周期用7天MA锚定
+
+### 量化验证（部署后12-24h）
+
+```bash
+# 1. 确认 v2 revenue 已禁用
+grep "v2 revenue" log/ml_optimizer.log | tail -5
+# 应显示 "disabled, for monitoring only"
+
+# 2. 长周期执行率趋势（核心观测）
+sqlite3 data/lending_history.db "
+SELECT currency, period, COUNT(*) as total,
+       SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed,
+       ROUND(100.0*SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END)/COUNT(*),1) as exec_rate
+FROM virtual_orders WHERE order_timestamp>=datetime('now','-24 hours')
+  AND status IN('EXECUTED','FAILED') AND period IN(60,90,120)
+GROUP BY currency, period ORDER BY currency, period;"
+
+# 3. 全周期执行率
+sqlite3 data/lending_history.db "
+SELECT currency, period, COUNT(*) as total,
+       SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed,
+       ROUND(100.0*SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END)/COUNT(*),1) as exec_rate
+FROM virtual_orders WHERE order_timestamp>=datetime('now','-24 hours')
+  AND status IN('EXECUTED','FAILED')
+GROUP BY currency, period ORDER BY currency, period;"
+
+# 4. 无报错
+grep -E "Error|Exception|Traceback" log/ml_optimizer.log | grep "$(date +%Y-%m-%d)" | tail -20
+```
+
+**预期效果**:
+- 长周期(60-120d): 利率上调约30-50%，执行率应从偏高位开始下降
+- 短周期(2-30d): 影响较小（v2 revenue 值接近0时混合影响小），但仍有约30%恢复
+- clipping_rate: 可能因预测利率整体上升而略有变化
+
+**如果120d执行率仍过高**:
+1. v5.3 降敏 + v5.3.1 v2修复 两项叠加后利率已显著上调，给 2-3 轮（4-6h）观察
+2. 若仍>90%: 考虑 max_up 从 0.45 → 0.55
+
 ## Data Files (all in .gitignore)
 
 | Path | Content |

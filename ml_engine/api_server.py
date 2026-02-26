@@ -748,28 +748,13 @@ async def run_full_pipeline():
             return
         # ====================================================================
 
-        # ========== STEP 6: 创建新虚拟订单 (进入下一轮闭环) ==========
-        update_status("processing", "6. Creating Virtual Orders", "Creating new virtual orders...")
-        logger.info("Step 6: 📝 Creating new virtual orders (next cycle)")
-
-        try:
-            stdout, stderr, rc = await _run_subprocess_with_timeout(
-                ["python", "-m", "ml_engine.order_manager"],
-                BASE_DIR, TIMEOUT_ORDERS, "Order Creation"
-            )
-
-            if stdout:
-                logger.info(f"Order creation output (last 500 chars):\n{stdout[-500:]}")
-            if stderr:
-                logger.warning(f"Order creation stderr:\n{stderr[-500:]}")
-
-            if rc != 0:
-                logger.warning(f"⚠️  Order creation had issues (exit code {rc})")
-            else:
-                logger.info(f"✅ Virtual orders created successfully")
-
-        except Exception as e:
-            logger.warning(f"⚠️  Order creation failed: {e}")
+        # ========== STEP 6: 虚拟订单已在 Step 5 预测阶段创建 ==========
+        # 注意: 订单由 predictor.py generate_recommendations() 内部调用
+        # self.order_manager.create_virtual_order(pred) 创建，无需额外 subprocess
+        # 旧版通过 `python -m ml_engine.order_manager` subprocess 调用会执行
+        # order_manager.py 的 __main__ 测试代码，导致每轮多创建一个
+        # fUSD-30d predicted_rate=12.5 的假订单（已累计185条，已清理）
+        logger.info("Step 6: ✅ Virtual orders already created in Step 5 (prediction phase)")
         # ====================================================================
 
         # 全部完成 - 记录统计信息
