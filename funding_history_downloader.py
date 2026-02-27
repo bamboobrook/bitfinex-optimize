@@ -120,20 +120,37 @@ class BitfinexDataDownloader:
             if result and result[0] and result[1]:
                 existing_start, existing_end = result[0], result[1]
                 logger.info(f"    Existing data: {datetime.fromtimestamp(existing_start/1000)} to {datetime.fromtimestamp(existing_end/1000)}")
-                
+
                 # 如果整个时间段都有数据，返回None表示不需要下载
                 if existing_start <= start_ts and existing_end >= end_ts:
                     logger.info(f"    All data already exists in database")
                     return None
-                
+
                 # 计算缺失的时间段
                 missing_ranges = []
                 if existing_start > start_ts:
                     missing_ranges.append((start_ts, existing_start - 60000))  # 减去1分钟避免重叠
                 if existing_end < end_ts:
                     missing_ranges.append((existing_end + 60000, end_ts))  # 加上1分钟避免重叠
-                
-                return missing_ranges
+
+                # P7A: 尾部新鲜度检查 — 即使 existing_end 接近 end_ts,
+                # 如果最新数据距现在超过2小时,强制补充最近数据
+                freshness_threshold_ms = 2 * 3600 * 1000  # 2小时
+                now_ms = int(datetime.now().timestamp() * 1000)
+                if (now_ms - existing_end) > freshness_threshold_ms:
+                    tail_range = (existing_end + 60000, end_ts)
+                    # 避免重复添加
+                    if not missing_ranges or missing_ranges[-1] != tail_range:
+                        # 检查是否已经包含了这段范围
+                        already_covered = any(
+                            s <= existing_end + 60000 and e >= end_ts
+                            for s, e in missing_ranges
+                        )
+                        if not already_covered:
+                            missing_ranges.append(tail_range)
+                            logger.info(f"    Tail freshness: data is {(now_ms - existing_end)/3600000:.1f}h old, adding refresh range")
+
+                return missing_ranges if missing_ranges else None
             else:
                 logger.info(f"    No existing data found")
                 return [(start_ts, end_ts)]
@@ -441,16 +458,31 @@ class BitfinexDataDownloader:
         total_tasks = len(currencies) * len(periods)
         completed_tasks = 0
         successful_tasks = 0
-        
+        failed_items = []
+
         # 单线程顺序下载
         for currency in currencies:
             for period in periods:
                 completed_tasks += 1
                 logger.info(f"\n[{completed_tasks}/{total_tasks}] Processing {currency} period={period}")
-                
+
                 success = self.download_data(currency, period, days)
                 if success:
                     successful_tasks += 1
+                else:
+                    failed_items.append((currency, period))
+
+        # P7B: 对失败项重试一次
+        if failed_items:
+            logger.info(f"\n🔄 Retrying {len(failed_items)} failed downloads...")
+            for currency, period in failed_items:
+                logger.info(f"  Retry: {currency} period={period}")
+                success = self.download_data(currency, period, days)
+                if success:
+                    successful_tasks += 1
+                    logger.info(f"  ✅ Retry succeeded: {currency} period={period}")
+                else:
+                    logger.warning(f"  ❌ Retry failed: {currency} period={period}")
         
         # 生成报告
         end_time = datetime.now()

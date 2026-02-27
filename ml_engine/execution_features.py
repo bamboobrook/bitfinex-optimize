@@ -79,16 +79,24 @@ class ExecutionFeatures:
 
             # 长周期(>=60天)订单天然较少,降低冷启动阈值加速脱离默认值
             cold_start_threshold = 5 if period >= 60 else 10
-            if total < cold_start_threshold:
-                # 冷启动默认值按周期差异化
-                if period <= 7:
-                    exec_rate = 0.55   # 短周期天然执行率更高
-                elif period <= 30:
-                    exec_rate = 0.50   # 中周期
-                else:
-                    exec_rate = 0.45   # 长周期天然执行率更低
+
+            # 冷启动默认值按周期差异化
+            if period <= 7:
+                default_rate = 0.55   # 短周期天然执行率更高
+            elif period <= 30:
+                default_rate = 0.50   # 中周期
             else:
-                exec_rate = executed / total
+                default_rate = 0.45   # 长周期天然执行率更低
+
+            if total == 0:
+                exec_rate = default_rate
+            else:
+                calculated_rate = executed / total
+                # 渐进混合: 避免跨过阈值时从默认值瞬间跳到计算值
+                # blend_ceiling = 2x阈值, 在0~ceiling之间线性过渡
+                blend_ceiling = cold_start_threshold * 2
+                default_weight = max(0.0, 1.0 - total / blend_ceiling)
+                exec_rate = default_weight * default_rate + (1.0 - default_weight) * calculated_rate
 
             self._cache[cache_key] = exec_rate
             return exec_rate

@@ -247,8 +247,8 @@ class EnsemblePredictor:
             data_age = datetime.now() - db_dt
             data_age_hours = data_age.total_seconds() / 3600
 
-            # fUST long periods (90d/120d) have lower liquidity, relaxed thresholds
-            is_low_liquidity = (currency == 'fUST' and period in [90, 120])
+            # fUST medium/long periods (>=14d) have lower liquidity, relaxed thresholds
+            is_low_liquidity = (currency == 'fUST' and period >= 14)
             stale_warn_hours = 8 if is_low_liquidity else 4
             stale_error_hours = 12 if is_low_liquidity else 8
 
@@ -282,7 +282,7 @@ class EnsemblePredictor:
                 # Apply same graduated freshness logic as DB path
                 data_age = datetime.now() - feature_dt
                 data_age_hours = data_age.total_seconds() / 3600
-                is_low_liquidity = (currency == 'fUST' and period in [90, 120])
+                is_low_liquidity = (currency == 'fUST' and period >= 14)
                 stale_warn_hours = 8 if is_low_liquidity else 4
                 stale_error_hours = 12 if is_low_liquidity else 8
 
@@ -395,7 +395,8 @@ class EnsemblePredictor:
 
         # 贝叶斯风格校准: 根据数据充分度动态加权
         # order_count 少时信任模型,多时信任历史执行率
-        evidence_weight = min(order_count / 50.0, 0.5)
+        # sqrt曲线: 50单→ew=0.50, 100单→ew=0.65(上限), 200单→ew=0.65
+        evidence_weight = min(np.sqrt(order_count / 200.0), 0.65)
         calibrated_prob = (1.0 - evidence_weight) * prob + evidence_weight * exec_rate_7d
         calibrated_prob = np.clip(calibrated_prob, 0.0, 1.0)
 
@@ -487,7 +488,14 @@ class EnsemblePredictor:
         else:
             trend = float(row_data.get('rate_chg_60', 0))    # 1h窗口
             trend_weight = 0.08
-        trend_factor = np.clip(trend / 5.0, -1.0, 1.0)
+        # 趋势归一化: 按周期调整基数,长周期24h变化量级更大
+        if period >= 60:
+            trend_norm = 10.0
+        elif period >= 20:
+            trend_norm = 7.0
+        else:
+            trend_norm = 5.0
+        trend_factor = np.clip(trend / trend_norm, -1.0, 1.0)
         trend_adjustment = trend_factor * trend_weight * adjusted_rate
         final_rate = adjusted_rate + trend_adjustment
 
@@ -621,8 +629,8 @@ class EnsemblePredictor:
             norm_dev = abs(deviation) / 0.50
             adjustment = 1.0 - max_down * norm_dev
 
-        # 利率差距惩罚(仅下调方向)
-        if avg_gap > 0:
+        # 利率差距惩罚(仅下调方向: avg_gap>0 说明定价过高, 只在adjustment<1时应用)
+        if avg_gap > 0 and adjustment < 1.0:
             gap_penalty = min(avg_gap / (base_rate + 1e-8), 0.12)
             adjustment *= (1.0 - gap_penalty)
 

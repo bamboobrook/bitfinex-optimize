@@ -1040,6 +1040,113 @@ grep -E "Error|Exception|Traceback" log/ml_optimizer.log | grep "$(date +%Y-%m-%
 1. v5.3 降敏 + v5.3.1 v2修复 两项叠加后利率已显著上调，给 2-3 轮（4-6h）观察
 2. 若仍>90%: 考虑 max_up 从 0.45 → 0.55
 
+## 2025-02-27 v5.4 全面审计 + 8项优化（部署后12-24h审核）
+
+系统状态良好（全局执行率55.2%，27次连续成功），但审计发现8个问题。修改了5个文件。部署时间: 2026-02-27。
+
+### 修改清单
+
+| 编号 | 严重度 | 文件 | 问题 | 修改 |
+|------|--------|------|------|------|
+| P0 | 严重Bug | retraining_scheduler.py | `_compare_model_performance()` 中 `all_pass` 永远为True，异常处理也返回True，任何重训练模型无条件部署 | 新增 `_sanity_check_new_models()`: 验证模型完整性+预测输出合理性(非NaN、范围0.5-50)。异常处理改为返回False |
+| P1 | 中 | execution_features.py | 冷启动硬切换: order_count跨过阈值时exec_rate突变(如0.45→0.0)导致利率暴跌30% | 渐进混合: `default_weight = max(0, 1 - total/(threshold*2))`, `exec_rate = default_weight*default + (1-default_weight)*calculated` |
+| P2 | 低 | predictor.py | evidence_weight = min(count/50, 0.5) 饱和过早，156单仍只给50%权重 | 改为sqrt曲线: `min(sqrt(count/200), 0.65)`, 50单→0.50, 100单→0.65上限 |
+| P3 | 低 | data_processor.py | `_apply_default_exec_features()` 统一用0.6，与execution_features.py冷启动默认值(0.45-0.55)不一致 | 按period区分: ≤7d→0.55, 8-30d→0.50, >30d→0.45 |
+| P4 | 中 | predictor.py | gap_penalty无条件应用，exec_rate=90%时本应上调利率，但gap_penalty削弱上调 | 添加条件: `if avg_gap > 0 and adjustment < 1.0` |
+| P5 | 低 | retraining_scheduler.py | `get_per_period_execution_anomalies` 统一min_orders=5，短周期应用10 | 按period区分: >=60d用5, <60d用10 |
+| P6 | 低 | predictor.py | 趋势因子统一除以5.0归一化，长周期24h变化量级更大 | 按周期: >=60d除10, >=20d除7, <20d除5 |
+| P7 | 中 | funding_history_downloader.py + predictor.py | A: 下载器gap检测只检边界不检尾部新鲜度; B: 失败无重试; C: fUST-20d/60d陈旧阈值过严 | A: existing_end距now>2h时强制补充; B: 收集失败项重试一次; C: fUST >=20d 均用宽松阈值(8h/12h) |
+
+### 审核33: P0 sanity check 是否阻止坏模型部署
+- **怎么查**: 强制重训练测试
+  ```bash
+  curl -X POST "http://localhost:5000/retrain?force=true"
+  grep "sanity check" log/ml_optimizer.log | tail -10
+  ```
+- **期望结果**: 日志中出现 "sanity check通过" 或 "sanity check失败"
+- **不应出现**: 旧版的 "默认通过" 或异常时返回True
+
+### 审核34: P1 冷启动渐进混合验证
+- **怎么查**: 观察新出现的周期组合(order_count < 2*threshold)的exec_rate
+- **期望结果**: order_count=5(长周期)时exec_rate是默认值和计算值的50%混合(而非纯计算值)
+- **关键**: 5单全FAILED不再导致exec_rate=0.0,而是≈0.225(50%×0.45 + 50%×0.0)
+
+### 审核35: P2+P4 证据权重+gap修复联合效果
+- **怎么查**:
+  ```bash
+  grep "PREDICTION_DIAG" log/ml_optimizer.log | tail -28
+  ```
+- **期望结果**: 高exec_rate(>90%)且高order_count(>100)的组合,adj值不再被gap_penalty削弱
+- **量化**: fUSD-60d(156单) evidence_weight从0.50→0.65,校准概率更接近真实执行率
+
+### 审核36: P7 fUST-20d/60d 数据恢复验证
+- **怎么查**:
+  ```bash
+  grep "STALE DATA.*fUST.*20d\|fUST.*60d" log/ml_optimizer.log | tail -5
+  grep "PREDICTION_DIAG.*fUST.*20d\|fUST.*60d" log/ml_optimizer.log | tail -5
+  ```
+- **期望结果**: fUST-20d/60d不再报STALE DATA错误(阈值从4h→8h),恢复正常预测
+
+### 量化验证（部署后12-24h）
+
+```bash
+# 1. 无报错
+grep -E "Error|Exception|Traceback" log/ml_optimizer.log | grep "$(date +%Y-%m-%d)" | tail -20
+
+# 2. PREDICTION_DIAG 完整性(28条=14期×2币种)
+grep "PREDICTION_DIAG" log/ml_optimizer.log | tail -28 | wc -l
+
+# 3. 全周期执行率
+sqlite3 data/lending_history.db "
+SELECT currency, period, COUNT(*) as total,
+       SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed,
+       ROUND(100.0*SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END)/COUNT(*),1) as exec_rate
+FROM virtual_orders WHERE order_timestamp>=datetime('now','-24 hours')
+  AND status IN('EXECUTED','FAILED')
+GROUP BY currency, period ORDER BY currency, period;"
+
+# 4. sanity check 日志
+grep "sanity check" log/ml_optimizer.log | tail -5
+```
+
+### 预期效果
+- P0: 防止坏模型部署(安全网),不影响正常运行
+- P1: 新周期启动无exec_rate突变,利率过渡平稳
+- P2: 数据充分的组合(>50单)反馈收敛更快
+- P3: 训练/推理默认值一致,减少特征分布偏移
+- P4: 高执行率周期adj不再被gap误伤,纠偏加速(预计+5-12%提升)
+- P5: 短周期(<60d)需≥10单才触发异常报告,减少噪声
+- P6: 长周期趋势信号更准确(归一化匹配实际波动幅度)
+- P7: fUST-14d恢复预测(阈值扩到>=14d) + 下载失败自动重试
+
+### 部署后首次验证结果（2026-02-27 11:18）
+
+**Pipeline 状态**: 连续3次成功完成（10:48, 11:03重训练, 11:18完整pipeline）
+
+**P0 sanity check**:
+- 首次部署时因 `pd` 未导入导致误报失败（已修复），新模型被正确拒绝
+- 修复后: 2次连续 "sanity check通过: 模型文件完整、预测输出合理"，新模型成功部署
+
+**P4 gap_penalty 修复验证**:
+- fUSD-120d exec=96.8% → adj=1.4467（接近上限1.45，不再被gap削弱）
+- fUSD-30d exec=86.4% → adj=1.2363
+- fUST-120d exec=86.7% → adj=1.3758
+
+**P7 低流动性阈值**:
+- fUST-14d: 不再报STALE DATA（阈值从8h→12h）
+- fUST-20d/60d: 仍超阈值（14.5h/13.5h > 12h），Bitfinex端流动性不足，非代码问题
+
+**系统指标**: PREDICTION_DIAG=26/28(fUST-20d/60d数据陈旧被拒), clipping_rate=40%, 策略: balanced 76%, conservative 20%, aggressive 4%, 无意外错误
+
+**7天执行率基线（2026-02-27 部署后）**:
+
+| 状态 | 币种-周期 | 执行率 |
+|------|----------|--------|
+| 极高(>85%) | fUST-90d 100%, fUSD-120d 97%, fUSD-30d 87%, fUST-120d 87%, fUSD-60d 86% | 需多轮纠偏 |
+| 偏高(65-85%) | fUSD-20d 79%, fUST-30d 80%, fUSD-14d 76%, fUSD-15d 77%, fUSD-10d 74% | adj上调中 |
+| 接近目标(40-65%) | fUSD-2d 63%, fUST-14d 55%, fUSD-5d 56%, fUST-4d 57%, fUST-20d 61% | 维持 |
+| 偏低(<40%) | fUST-2d 25%, fUSD-3d 37%, fUSD-7d 39% | adj下调中 |
+
 ## Data Files (all in .gitignore)
 
 | Path | Content |

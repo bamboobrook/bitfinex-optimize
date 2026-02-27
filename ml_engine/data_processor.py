@@ -397,10 +397,20 @@ class DataProcessor:
         return df
 
     def _apply_default_exec_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """当计算失败时应用默认执行特征值"""
-        default_features = {
-            'exec_rate_7d': 0.6,
-            'exec_rate_30d': 0.6,
+        """当计算失败时应用默认执行特征值 — 按周期差异化,与 execution_features.py 保持一致"""
+        # exec_rate 默认值按周期区分
+        if 'period' in df.columns:
+            df['exec_rate_7d'] = np.where(
+                df['period'] <= 7, 0.55,
+                np.where(df['period'] <= 30, 0.50, 0.45)
+            )
+            df['exec_rate_30d'] = df['exec_rate_7d']  # 同步
+        else:
+            df['exec_rate_7d'] = 0.50
+            df['exec_rate_30d'] = 0.50
+
+        # 其余特征使用中性默认值
+        other_defaults = {
             'avg_spread_7d': 0.0,
             'avg_spread_30d': 0.0,
             'avg_rate_gap_failed_7d': 0.0,
@@ -415,7 +425,7 @@ class DataProcessor:
             'exec_feature_reserved_2': 0.0,
             'exec_feature_reserved_3': 0.0,
         }
-        for col, val in default_features.items():
+        for col, val in other_defaults.items():
             df[col] = val
         return df
 

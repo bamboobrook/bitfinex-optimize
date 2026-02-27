@@ -146,7 +146,7 @@ class RetrainingScheduler:
 
         return executed / total
 
-    def get_per_period_execution_anomalies(self, days: int = 7, min_orders: int = 5) -> list:
+    def get_per_period_execution_anomalies(self, days: int = 7) -> list:
         """
         按 currency+period 分组检查成交率异常
 
@@ -174,15 +174,20 @@ class RetrainingScheduler:
         WHERE order_timestamp >= ?
           AND status IN ('EXECUTED', 'FAILED')
         GROUP BY currency, period
-        HAVING COUNT(*) >= ?
+        HAVING COUNT(*) >= 5
         """
 
-        cursor.execute(query, (since_date, min_orders))
+        cursor.execute(query, (since_date,))
         rows = cursor.fetchall()
         conn.close()
 
         anomalies = []
         for currency, period, total, executed in rows:
+            # P5: 按周期区分 min_orders 阈值,与 execution_features.py 一致
+            required_min = 5 if period >= 60 else 10
+            if total < required_min:
+                continue
+
             exec_rate = executed / total
             # 严重性分级:
             # critical: exec_rate < 0.20 或 > 0.85
@@ -238,7 +243,7 @@ class RetrainingScheduler:
         print(f"近7天全局成交率: {exec_rate_7d:.2%}")
 
         # 条件3: 按 period 分组检查
-        period_anomalies = self.get_per_period_execution_anomalies(days=7, min_orders=5)
+        period_anomalies = self.get_per_period_execution_anomalies(days=7)
         if period_anomalies:
             print(f"按 period 分组异常:")
             for a in period_anomalies:
@@ -512,9 +517,10 @@ class RetrainingScheduler:
             conn.close()
 
             if len(val_df) < 20:
-                print(f"  验证数据不足 ({len(val_df)} < 20),跳过性能对比,默认通过")
+                print(f"  验证数据不足 ({len(val_df)} < 20),跳过性能对比,执行sanity check")
                 comparison['checks']['performance'] = 'skipped_insufficient_data'
-                return True
+                # 即使跳过性能对比,仍需验证新模型基本可用
+                return self._sanity_check_new_models(new_model_dir)
 
             print(f"  验证数据: {len(val_df)} 条订单 (近7天)")
 
@@ -553,17 +559,125 @@ class RetrainingScheduler:
                 print(f"  {currency}: Execution Rate={exec_rate:.2%}")
 
             comparison['metrics'] = metrics_comparison
+
+            # Sanity check: 验证新模型基本可用
+            sanity_ok = self._sanity_check_new_models(new_model_dir)
+            if not sanity_ok:
+                all_pass = False
+
             comparison['checks']['performance'] = 'passed' if all_pass else 'degraded'
 
-            # 新模型通过条件: 文件完整即可 + 记录指标供后续监控
-            # (真正的 A/B 对比需要新模型实际跑一段时间)
-            print(f"  ✅ 性能指标已记录,新模型通过")
+            if all_pass:
+                print(f"  ✅ 性能指标已记录 + sanity check通过,新模型通过")
+            else:
+                print(f"  ❌ 新模型未通过sanity check")
+            return all_pass
+
+        except Exception as e:
+            print(f"  ❌ 性能对比异常: {e},拒绝部署")
+            comparison['checks']['performance'] = f'error: {e}'
+            return False
+
+    def _sanity_check_new_models(self, model_dir: str) -> bool:
+        """
+        验证新模型基本可用: 文件完整、预测输出合理
+
+        Returns:
+            True if all checks pass
+        """
+        import numpy as np
+        import pandas as pd
+
+        print(f"\n  🔍 Sanity check: 验证新模型基本可用")
+
+        try:
+            # 检查每个币种的4个必要模型
+            for currency in ['fUSD', 'fUST']:
+                required_models = [
+                    f'{currency}_model_execution_prob',
+                    f'{currency}_model_conservative',
+                    f'{currency}_model_aggressive',
+                    f'{currency}_model_balanced',
+                ]
+                for model_prefix in required_models:
+                    meta_file = os.path.join(model_dir, f"{model_prefix}_meta.json")
+                    if not os.path.exists(meta_file):
+                        print(f"  ❌ sanity check失败: 缺少模型文件 {model_prefix}")
+                        return False
+
+            # 加载新模型并做简单预测验证
+            from ml_engine.predictor import EnsemblePredictor
+            test_predictor = EnsemblePredictor(model_dir=model_dir, max_workers=1)
+
+            # 获取最新特征数据做几组预测
+            for currency in ['fUSD', 'fUST']:
+                if currency not in test_predictor.models or not test_predictor.models[currency]:
+                    print(f"  ❌ sanity check失败: {currency} 模型加载失败")
+                    return False
+
+                # 检查所有4个必要模型类型都加载成功
+                required_types = ['model_execution_prob', 'model_conservative',
+                                  'model_aggressive', 'model_balanced']
+                for mt in required_types:
+                    if mt not in test_predictor.models[currency]:
+                        print(f"  ❌ sanity check失败: {currency} 缺少 {mt}")
+                        return False
+
+                # 用最新数据做一组预测
+                meta = test_predictor.meta_info[currency].get('model_conservative')
+                if not meta:
+                    print(f"  ❌ sanity check失败: {currency} meta信息缺失")
+                    return False
+
+                feature_cols = meta['feature_cols']
+                df = test_predictor.processor.load_data(currency)
+                if df.empty:
+                    print(f"  ⚠️  sanity check: {currency} 无数据,跳过预测验证")
+                    continue
+
+                # 取一个period的最新数据
+                df_feat = df.groupby('period', group_keys=False).apply(
+                    test_predictor.processor.add_technical_indicators
+                )
+                sample = df_feat.groupby('period').tail(1).head(3)
+
+                if sample.empty:
+                    print(f"  ⚠️  sanity check: {currency} 特征数据为空")
+                    continue
+
+                for _, row in sample.iterrows():
+                    try:
+                        X_single = pd.DataFrame([{col: row[col] for col in feature_cols}])
+                        pred_cons = test_predictor.predict_with_ensemble(
+                            X_single, currency, 'model_conservative'
+                        )[0]
+                        pred_bal = test_predictor.predict_with_ensemble(
+                            X_single, currency, 'model_balanced'
+                        )[0]
+
+                        # 检查预测值非NaN
+                        if np.isnan(pred_cons) or np.isnan(pred_bal):
+                            print(f"  ❌ sanity check失败: {currency} period={int(row['period'])} 预测输出NaN")
+                            return False
+
+                        # 检查预测范围合理 (0.5-50.0)
+                        for pred_val, pred_name in [(pred_cons, 'conservative'), (pred_bal, 'balanced')]:
+                            if pred_val < 0.5 or pred_val > 50.0:
+                                print(f"  ❌ sanity check失败: {currency} period={int(row['period'])} {pred_name}={pred_val:.4f} 超出合理范围[0.5, 50.0]")
+                                return False
+
+                    except Exception as e:
+                        print(f"  ❌ sanity check失败: {currency} 预测异常: {e}")
+                        return False
+
+            print(f"  ✅ sanity check通过: 模型文件完整、预测输出合理")
             return True
 
         except Exception as e:
-            print(f"  ⚠️  性能对比异常: {e},默认通过")
-            comparison['checks']['performance'] = f'error: {e}'
-            return True
+            print(f"  ❌ sanity check异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def backup_production_models(self) -> bool:
         """
