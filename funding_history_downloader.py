@@ -424,10 +424,9 @@ class BitfinexDataDownloader:
             
         except Exception as e:
             logger.info(f"    ❌ Processing failed: {e}")
-            import traceback
-            traceback.logger.info_exc()
+            logger.exception("Unexpected error during download")
             return False
-    
+
     def download_multiple(self, currencies: List[str], periods: List[int], days: int = 7):
         """
         下载多个币种和周期的数据（单线程）
@@ -643,7 +642,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("\n\nProgram interrupted by user")
     except Exception as e:
-        logger.info(f"\nProgram error: {e}")
-        import traceback
-        traceback.logger.info_exc()
+        logger.exception(f"\nProgram error: {e}")
     # check_database()
