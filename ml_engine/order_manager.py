@@ -60,6 +60,7 @@ class OrderManager:
                 "step_change_pct": "REAL",
                 "step_capped": "INTEGER",
                 "policy_step_cap_pct": "REAL",
+                "probe_type": "TEXT",
                 "gate_reject_reason": "TEXT",
                 "follow_error_at_order": "REAL",
                 "execution_threshold": "REAL",
@@ -93,6 +94,8 @@ class OrderManager:
         """
         order_id = str(uuid.uuid4())
         validation_window = determine_validation_window(prediction['period'])
+        probe_type = str(prediction.get('probe_type', 'normal') or 'normal')
+        force_create = bool(prediction.get('force_create', False))
 
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -113,26 +116,27 @@ class OrderManager:
                 data_timestamp = data_timestamp.replace('T', ' ')[:19]
 
             # 修改5.1: 订单去重 - 检查是否已存在相同 (currency, period, order_timestamp) 的 PENDING 订单
-            cursor.execute("""
-                SELECT COUNT(*) FROM virtual_orders
-                WHERE currency = ? AND period = ? AND order_timestamp = ? AND status = 'PENDING'
-            """, (prediction['currency'], prediction['period'], data_timestamp))
-            existing_count = cursor.fetchone()[0]
-            if existing_count > 0:
-                logger.warning(
-                    f"Duplicate order skipped: {prediction['currency']}-{prediction['period']}d "
-                    f"@ {data_timestamp} already has {existing_count} PENDING order(s)"
-                )
-                conn.close()
-                return f"DUPLICATE_SKIPPED_{prediction['currency']}_{prediction['period']}"
+            if not force_create:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM virtual_orders
+                    WHERE currency = ? AND period = ? AND order_timestamp = ? AND status = 'PENDING'
+                """, (prediction['currency'], prediction['period'], data_timestamp))
+                existing_count = cursor.fetchone()[0]
+                if existing_count > 0:
+                    logger.warning(
+                        f"Duplicate order skipped: {prediction['currency']}-{prediction['period']}d "
+                        f"@ {data_timestamp} already has {existing_count} PENDING order(s)"
+                    )
+                    conn.close()
+                    return f"DUPLICATE_SKIPPED_{prediction['currency']}_{prediction['period']}"
 
             cursor.execute("""
                 INSERT INTO virtual_orders
                 (order_id, currency, period, predicted_rate, order_timestamp,
                  validation_window_hours, prediction_confidence, prediction_strategy,
                  model_version, status, created_at, market_follow_error,
-                 direction_match, step_change_pct, step_capped, policy_step_cap_pct)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)
+                 direction_match, step_change_pct, step_capped, policy_step_cap_pct, probe_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)
             """, (
                 order_id,
                 prediction['currency'],
@@ -149,6 +153,7 @@ class OrderManager:
                 prediction.get('step_change_pct'),
                 int(bool(prediction.get('step_capped', False))) if prediction.get('step_capped') is not None else None,
                 prediction.get('policy_step_cap_pct'),
+                probe_type,
             ))
 
             conn.commit()
@@ -368,6 +373,41 @@ class OrderManager:
         conn.close()
 
         return row[0] or 0
+
+    def get_recent_validation_count(self, currency: str, period: int, lookback_hours: int = 24) -> int:
+        """
+        Count recently validated orders for refresh-probe decision.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cutoff = (datetime.now() - timedelta(hours=lookback_hours)).strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM virtual_orders
+            WHERE currency = ?
+              AND period = ?
+              AND status IN ('EXECUTED', 'FAILED')
+              AND validated_at IS NOT NULL
+              AND validated_at >= ?
+            """,
+            (currency, period, cutoff),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return int(row[0] or 0)
+
+    def needs_refresh_probe(
+        self,
+        currency: str,
+        period: int,
+        lookback_hours: int = 24,
+        min_validations: int = 1
+    ) -> bool:
+        """
+        Decide whether this combo needs a refresh probe order.
+        """
+        return self.get_recent_validation_count(currency, period, lookback_hours) < int(min_validations)
 
     def aggregate_execution_statistics(self):
         """

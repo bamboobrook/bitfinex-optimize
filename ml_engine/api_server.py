@@ -4,6 +4,7 @@ import uvicorn
 import json
 import os
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from loguru import logger
 import sys
@@ -16,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 _pipeline_lock = asyncio.Lock()
 
 logger.add('/home/bumblebee/Project/optimize/log/ml_optimizer.log', retention='7 days', rotation="10 MB")
+# Suppress Uvicorn access logs (e.g. "GET /status 200 OK").
+logging.getLogger("uvicorn.access").disabled = True
 
 app = FastAPI(title="Lending Optimization API", version="3.0")
 
@@ -24,6 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_FILE = str(BASE_DIR / "data" / "optimal_combination.json")
 STATUS_FILE = str(BASE_DIR / "data" / "service_status.json")
 DB_FILE = str(BASE_DIR / "data" / "lending_history.db")
+RETRAIN_STATE_FILE = str(BASE_DIR / "data" / "retraining_state.json")
 
 # --- 辅助函数: 状态管理 ---
 def update_status(status: str, step: str = "", details: str = ""):
@@ -47,6 +51,47 @@ def get_current_status():
             logger.warning(f"Failed to read status file: {e}")
             pass
     return {"status": "unknown", "details": "Status file not found"}
+
+
+def load_retraining_state():
+    """Load retraining cooldown state from disk."""
+    if not os.path.exists(RETRAIN_STATE_FILE):
+        return {"last_forced_retrain_time": None, "last_reason": ""}
+    try:
+        with open(RETRAIN_STATE_FILE, 'r') as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            return {"last_forced_retrain_time": None, "last_reason": ""}
+        return state
+    except Exception as e:
+        logger.warning(f"Failed to load retraining state: {e}")
+        return {"last_forced_retrain_time": None, "last_reason": ""}
+
+
+def save_retraining_state(last_forced_retrain_time: datetime = None, reason: str = ""):
+    """Persist retraining cooldown state to disk."""
+    state = {
+        "last_forced_retrain_time": (
+            last_forced_retrain_time.strftime('%Y-%m-%d %H:%M:%S')
+            if last_forced_retrain_time else None
+        ),
+        "last_reason": reason or "",
+        "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    try:
+        with open(RETRAIN_STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save retraining state: {e}")
+
+
+def parse_datetime_safe(dt_str: str):
+    if not dt_str:
+        return None
+    try:
+        return datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return None
 
 # --- 辅助函数: 获取数据库统计 ---
 def get_db_statistics():
@@ -579,8 +624,9 @@ async def _run_subprocess_with_timeout(cmd, cwd, timeout, step_name):
         await process.wait()
         return "", f"Subprocess timed out after {timeout}s", -1
 
-# Track last forced retraining time to prevent excessive retraining (问题3)
-_last_forced_retrain_time = None
+# Track last forced retraining time to prevent excessive retraining (问题3).
+_initial_retrain_state = load_retraining_state()
+_last_forced_retrain_time = parse_datetime_safe(_initial_retrain_state.get("last_forced_retrain_time"))
 
 async def run_full_pipeline():
     """
@@ -710,6 +756,7 @@ async def run_full_pipeline():
                     # 不返回，继续使用现有模型生成预测
                 else:
                     _last_forced_retrain_time = datetime.now()
+                    save_retraining_state(_last_forced_retrain_time, reason="forced_by_pipeline")
                     logger.info(f"✅ Retraining completed successfully")
 
             except Exception as e:
@@ -741,6 +788,19 @@ async def run_full_pipeline():
                 return
 
             logger.info(f"✅ Prediction completed successfully")
+
+            # Freshness gate may produce stale_data result with empty recommendations.
+            try:
+                if os.path.exists(DATA_FILE):
+                    with open(DATA_FILE, "r") as f:
+                        latest_result = json.load(f)
+                    if isinstance(latest_result, dict) and latest_result.get("stale_data"):
+                        logger.warning(
+                            "Prediction finished with stale_data gate: "
+                            f"{latest_result.get('stale_reason', '')}"
+                        )
+            except Exception as parse_err:
+                logger.warning(f"Failed to inspect prediction result freshness fields: {parse_err}")
 
         except Exception as e:
             logger.error(f"❌ Prediction system error: {e}")
@@ -808,6 +868,11 @@ def get_result():
     try:
         with open(DATA_FILE, 'r') as f:
             data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault("stale_data", False)
+            data.setdefault("stale_minutes", 0)
+            data.setdefault("stale_reason", "")
+            data.setdefault("policy_version", "unknown")
         return data
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Failed to read data: {str(e)}"})
@@ -1214,6 +1279,7 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
         })
 
     async def run_retraining():
+        global _last_forced_retrain_time
         update_status("processing", "Closed-Loop Retraining", "Checking and retraining models...")
         logger.info("🔄 Starting closed-loop retraining task")
 
@@ -1237,6 +1303,9 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
                 logger.error(f"❌ Closed-loop retraining failed: {err_msg}")
                 update_status("error", "Closed-Loop Retraining", f"Failed: {err_msg[-200:]}")
             else:
+                if force:
+                    _last_forced_retrain_time = datetime.now()
+                    save_retraining_state(_last_forced_retrain_time, reason="manual_force")
                 logger.info("✅ Closed-loop retraining completed successfully")
                 update_status("online", "Idle", f"Retraining completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -1256,22 +1325,25 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
 _scheduler_task = None
 
 async def _scheduled_pipeline_loop():
-    """Background loop that runs the pipeline every 2 hours."""
-    logger.info("Built-in scheduler started: pipeline will run every 2 hours")
+    """Background loop that runs the pipeline immediately, then every 2 hours."""
+    logger.info("Built-in scheduler started: first run now, then every 2 hours")
     while True:
-        await asyncio.sleep(2 * 60 * 60)  # Wait 2 hours
-        logger.info("Scheduled pipeline trigger (every 2h)")
         try:
+            logger.info("Scheduled pipeline trigger")
             await run_full_pipeline()
         except Exception as e:
             logger.error(f"Scheduled pipeline error: {e}")
+        await asyncio.sleep(2 * 60 * 60)  # Wait 2 hours
 
 @app.on_event("startup")
 async def startup_event():
     """Start the built-in scheduler on server startup."""
     global _scheduler_task
     _scheduler_task = asyncio.create_task(_scheduled_pipeline_loop())
-    logger.info("Built-in 2-hour scheduler registered")
+    logger.info(
+        "Built-in scheduler registered "
+        f"(last_forced_retrain={_last_forced_retrain_time.strftime('%Y-%m-%d %H:%M:%S') if _last_forced_retrain_time else 'none'})"
+    )
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -1285,4 +1357,4 @@ if __name__ == "__main__":
     # 初始化状态
     update_status("online", "Idle", "Service started")
     # 启动服务
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000, access_log=False)

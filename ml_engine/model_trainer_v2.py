@@ -197,7 +197,7 @@ class EnhancedModelTrainer:
             'total_score', 'market_median', 'execution_rate',
             'follow_error', 'follow_error_at_order', 'direction_match',
             'step_change_pct', 'step_capped', 'policy_step_cap_pct',
-            'gate_reject_reason',
+            'gate_reject_reason', 'probe_type',
             'revenue_optimized_target',
         ]
 
@@ -375,6 +375,19 @@ class EnhancedModelTrainer:
             except Exception as e:
                 print(f"⚠️  时间衰减计算失败: {e}, 使用均等权重")
                 sample_weights = None
+
+        # Refresh probe samples are exploratory; down-weight to avoid overfitting probes.
+        if sample_weights is not None and 'probe_type' in valid_df.columns:
+            try:
+                probe_mask = valid_df['probe_type'].fillna('normal').eq('refresh_probe').values
+                if probe_mask.any():
+                    sample_weights = sample_weights * np.where(probe_mask, 0.3, 1.0)
+                    print(
+                        f"Refresh probe 降权已应用: probes={int(probe_mask.sum())}, "
+                        f"mean_weight={sample_weights.mean():.4f}"
+                    )
+            except Exception as e:
+                print(f"⚠️  probe_type 降权失败: {e}")
 
         # 准备特征
         feature_cols = self.prepare_features(valid_df)

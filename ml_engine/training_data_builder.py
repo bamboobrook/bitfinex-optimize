@@ -86,6 +86,7 @@ class TrainingDataBuilder:
             'step_change_pct',
             'step_capped',
             'policy_step_cap_pct',
+            'probe_type',
         ]
         selected_cols.extend([c for c in optional_cols if c in table_cols])
 
@@ -199,7 +200,7 @@ class TrainingDataBuilder:
             'market_median', 'execution_rate'
         ]
         for c in ['follow_error_at_order', 'gate_reject_reason', 'direction_match',
-                  'step_change_pct', 'step_capped', 'policy_step_cap_pct']:
+                  'step_change_pct', 'step_capped', 'policy_step_cap_pct', 'probe_type']:
             if c in execution_results.columns:
                 merge_cols.append(c)
 
@@ -274,6 +275,10 @@ class TrainingDataBuilder:
             df['step_change_pct'] = np.nan
         if 'step_capped' not in df.columns:
             df['step_capped'] = np.nan
+        if 'probe_type' not in df.columns:
+            df['probe_type'] = 'normal'
+        else:
+            df['probe_type'] = df['probe_type'].fillna('normal')
 
         return df
 

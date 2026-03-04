@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from loguru import logger
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 from typing import Optional, Tuple
 import warnings
@@ -18,7 +18,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from ml_engine.data_processor import DataProcessor
 from ml_engine.execution_features import get_period_window_profile
-from ml_engine.system_policy import load_system_policy, get_step_cap_pct
+from ml_engine.system_policy import load_system_policy, get_step_cap_pct, get_policy_version
 
 class EnsemblePredictor:
     """使用集成模型的增强预测器 - 支持GPU加速和并行化"""
@@ -39,10 +39,16 @@ class EnsemblePredictor:
         self.processor = DataProcessor()
         self._timestamp_deprecation_warned = False  # 废弃警告标志
         self.policy = load_system_policy()
+        self.policy_version = get_policy_version(self.policy)
         self.db_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
             "data", "lending_history.db"
         )
+        self.refresh_probe_state_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+            "data", "refresh_probe_state.json"
+        )
+        self._stale_issues = []
 
         # 导入OrderManager用于创建虚拟订单
         try:
@@ -295,6 +301,46 @@ class EnsemblePredictor:
         step_change_pct = (capped_rate - previous_rate) / previous_rate
         return capped_rate, previous_rate, float(step_change_pct), step_capped, cap_pct
 
+    def _policy_value(self, section: str, key: str, default):
+        return self.policy.get(section, {}).get(key, default)
+
+    def _freshness_thresholds_minutes(self) -> Tuple[float, float]:
+        warn_minutes = float(self._policy_value("automation", "stale_data_warn_minutes", 60))
+        hard_minutes = float(self._policy_value("automation", "stale_data_hard_minutes", 120))
+        if hard_minutes <= warn_minutes:
+            hard_minutes = warn_minutes + 30.0
+        return warn_minutes, hard_minutes
+
+    def _record_stale_issue(self, currency: str, period: int, age_minutes: float, source_ts: str):
+        self._stale_issues.append({
+            "currency": currency,
+            "period": int(period),
+            "age_minutes": float(age_minutes),
+            "source_timestamp": source_ts,
+        })
+
+    def _load_refresh_probe_state(self) -> dict:
+        if not os.path.exists(self.refresh_probe_state_path):
+            return {"counters": {}, "updated_at": None}
+        try:
+            with open(self.refresh_probe_state_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                return {"counters": {}, "updated_at": None}
+            loaded.setdefault("counters", {})
+            return loaded
+        except Exception as e:
+            logger.warning(f"Failed to load refresh probe state: {e}")
+            return {"counters": {}, "updated_at": None}
+
+    def _save_refresh_probe_state(self, state: dict):
+        try:
+            state["updated_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            with open(self.refresh_probe_state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save refresh probe state: {e}")
+
     def predict_single_period(self, row_data: dict, feature_cols: list, currency: str) -> dict:
         """
         对单个period的数据进行预测（用于并行化）- 增强版含执行反馈调整
@@ -310,34 +356,30 @@ class EnsemblePredictor:
         period = int(row_data['period'])
         current_rate_db, data_timestamp = self.get_latest_rate_from_db(currency, period)
 
+        warn_minutes, hard_minutes = self._freshness_thresholds_minutes()
+
         # Use DB rate if available, fallback to feature data
         if current_rate_db is not None:
-            # 修改2.4: Graduated freshness check with confidence degradation
-            from datetime import timedelta
             if isinstance(data_timestamp, str):
                 db_dt = datetime.strptime(data_timestamp, '%Y-%m-%d %H:%M:%S')
             else:
                 db_dt = data_timestamp
 
             data_age = datetime.now() - db_dt
-            data_age_hours = data_age.total_seconds() / 3600
+            data_age_minutes = data_age.total_seconds() / 60.0
 
-            # fUST medium/long periods (>=14d) have lower liquidity, relaxed thresholds
-            is_low_liquidity = (currency == 'fUST' and period >= 14)
-            stale_warn_hours = 8 if is_low_liquidity else 4
-            stale_error_hours = 12 if is_low_liquidity else 8
-
-            if data_age_hours > stale_error_hours:
+            if data_age_minutes > hard_minutes:
                 logger.error(
                     f"STALE DATA for {currency}-{period}: "
-                    f"data is {data_age_hours:.1f}h old (threshold: {stale_error_hours}h). "
+                    f"data is {data_age_minutes:.1f}m old (threshold: {hard_minutes:.1f}m). "
                     f"Refusing to predict."
                 )
-                raise ValueError(f"Stale DB data for {currency}-{period}: {data_age_hours:.1f}h old")
-            elif data_age_hours > stale_warn_hours:
+                self._record_stale_issue(currency, period, data_age_minutes, str(data_timestamp))
+                raise ValueError(f"Stale DB data for {currency}-{period}: {data_age_minutes:.1f}m old")
+            elif data_age_minutes > warn_minutes:
                 logger.warning(
                     f"AGING DATA for {currency}-{period}: "
-                    f"data is {data_age_hours:.1f}h old (warn threshold: {stale_warn_hours}h). "
+                    f"data is {data_age_minutes:.1f}m old (warn threshold: {warn_minutes:.1f}m). "
                     f"Confidence will be degraded."
                 )
 
@@ -348,29 +390,25 @@ class EnsemblePredictor:
             # 验证特征数据时间戳新鲜度
             feature_datetime = row_data.get('datetime')
             if feature_datetime:
-                from datetime import timedelta
                 if isinstance(feature_datetime, str):
                     feature_dt = datetime.strptime(feature_datetime, '%Y-%m-%d %H:%M:%S')
                 else:
                     feature_dt = feature_datetime
 
-                # Apply same graduated freshness logic as DB path
                 data_age = datetime.now() - feature_dt
-                data_age_hours = data_age.total_seconds() / 3600
-                is_low_liquidity = (currency == 'fUST' and period >= 14)
-                stale_warn_hours = 8 if is_low_liquidity else 4
-                stale_error_hours = 12 if is_low_liquidity else 8
+                data_age_minutes = data_age.total_seconds() / 60.0
 
-                if data_age_hours > stale_error_hours:
+                if data_age_minutes > hard_minutes:
                     logger.error(
                         f"STALE DATA for {currency}-{period}: "
-                        f"DB query failed AND feature data is {data_age_hours:.1f}h old. "
+                        f"DB query failed AND feature data is {data_age_minutes:.1f}m old. "
                         f"Refusing to predict."
                     )
-                    raise ValueError(f"Stale data for {currency}-{period}: {data_age_hours:.1f}h old")
-                elif data_age_hours > stale_warn_hours:
+                    self._record_stale_issue(currency, period, data_age_minutes, str(feature_datetime))
+                    raise ValueError(f"Stale data for {currency}-{period}: {data_age_minutes:.1f}m old")
+                elif data_age_minutes > warn_minutes:
                     logger.warning(
-                        f"AGING feature data for {currency}-{period}: {data_age_hours:.1f}h old"
+                        f"AGING feature data for {currency}-{period}: {data_age_minutes:.1f}m old"
                     )
 
                 actual_timestamp = feature_datetime
@@ -383,8 +421,9 @@ class EnsemblePredictor:
                 logger.error(f"No datetime field in feature data for {currency}-{period}")
                 raise ValueError(f"Missing datetime for {currency}-{period}")
 
-            # Ensure data_age_hours is set for confidence degradation below
-            # (already set in both DB and feature branches above)
+        # For confidence degradation logic below
+        data_age_hours = data_age_minutes / 60.0
+        stale_warn_hours = warn_minutes / 60.0
 
         # 构造特征DataFrame
         X_single = pd.DataFrame([{col: row_data[col] for col in feature_cols}])
@@ -696,6 +735,7 @@ class EnsemblePredictor:
             "confidence": confidence,
             "data_timestamp": actual_timestamp,  # Actual timestamp of rate data
             "prediction_timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # When prediction was made
+            "data_age_minutes": float(data_age_minutes),
             # 新增调试信息
             "execution_rate_7d": exec_rate_7d,
             "execution_rate_slow": exec_rate_slow,
@@ -829,7 +869,11 @@ class EnsemblePredictor:
                         result = future.result()
                         all_predictions.append(result)
                     except Exception as e:
-                        logger.error(f"Prediction failed: {e}")
+                        msg = str(e)
+                        if "Stale data" in msg or "Stale DB data" in msg:
+                            logger.warning(f"Prediction skipped due to stale market data: {msg}")
+                        else:
+                            logger.error(f"Prediction failed: {e}")
 
             logger.info(f"Completed predictions for {curr}: {len(all_predictions)} results")
 
@@ -844,9 +888,28 @@ class EnsemblePredictor:
         if output_path is None:
             base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             output_path = os.path.join(base_dir, "data", "optimal_combination.json")
+        self._stale_issues = []
         preds = self.get_latest_predictions()
         if not preds:
-            logger.warning("No predictions generated.")
+            stale_minutes = (
+                max((float(item.get("age_minutes", 0.0)) for item in self._stale_issues), default=0.0)
+                if self._stale_issues else 0.0
+            )
+            stale_result = {
+                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "status": "stale_data" if self._stale_issues else "failed",
+                "strategy_info": "AI-Optimized Multi-Model Ensemble with Execution Feedback Loop",
+                "policy_version": self.policy_version,
+                "stale_data": bool(self._stale_issues),
+                "stale_minutes": int(round(stale_minutes)),
+                "stale_reason": "Market data freshness gate blocked prediction" if self._stale_issues else "No predictions generated",
+                "stale_issues": self._stale_issues[:20],
+                "recommendations": [],
+            }
+            with open(output_path, 'w') as f:
+                json.dump(stale_result, f, indent=4)
+            logger.warning("No valid predictions generated; stale-data result persisted.")
+            print(json.dumps(stale_result, indent=2))
             return
 
         # 排序逻辑：
@@ -900,6 +963,13 @@ class EnsemblePredictor:
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "status": 'success',
             "strategy_info": "AI-Optimized Multi-Model Ensemble with Execution Feedback Loop",
+            "policy_version": self.policy_version,
+            "stale_data": bool(self._stale_issues),
+            "stale_minutes": int(
+                round(max((float(item.get("age_minutes", 0.0)) for item in self._stale_issues), default=0.0))
+            ) if self._stale_issues else 0,
+            "stale_reason": "partial_stale_data_skipped" if self._stale_issues else "",
+            "stale_issues": self._stale_issues[:20] if self._stale_issues else [],
             "recommendations": []
         }
 
@@ -954,6 +1024,10 @@ class EnsemblePredictor:
         # ========== 创建虚拟订单 with Stratified Sampling by Period Tiers ==========
         if self.order_manager is not None:
             try:
+                if self._stale_issues:
+                    print("\n⚠️  Detected stale market data in this cycle. Skip virtual order creation.")
+                    return
+
                 # Stratified sampling configuration by period tiers - 均衡采样
                 # 目标是覆盖全期限，各层级数量均衡
                 # 周期层级配置
@@ -1033,25 +1107,68 @@ class EnsemblePredictor:
                 selected_preds.extend(remaining_preds[:remaining_slots])
 
                 # Create virtual orders
+                probe_state = self._load_refresh_probe_state()
+                counters = probe_state.setdefault("counters", {})
+                lookback_hours = int(self._policy_value("automation", "refresh_probe_lookback_hours", 24))
+                min_validations = int(self._policy_value("automation", "refresh_probe_min_validations", 1))
+                trigger_cycles = int(self._policy_value("automation", "refresh_probe_trigger_cycles", 6))
+                max_probe_per_cycle = int(self._policy_value("automation", "refresh_probe_max_per_cycle", 4))
+                probe_created = 0
+
                 created_orders = []
                 for pred in selected_preds[:TOP_N]:
+                    key = f"{pred['currency']}-{pred['period']}"
+                    recent_feedback_ok = not self.order_manager.needs_refresh_probe(
+                        pred['currency'], pred['period'], lookback_hours, min_validations
+                    )
+
                     order_id = self.order_manager.create_virtual_order(pred)
+                    probe_type = "normal"
+
+                    duplicate_skipped = isinstance(order_id, str) and order_id.startswith("DUPLICATE_SKIPPED")
+                    if duplicate_skipped:
+                        if recent_feedback_ok:
+                            counters[key] = 0
+                        else:
+                            counters[key] = int(counters.get(key, 0)) + 1
+
+                            # Insert a low-weight refresh probe after sustained no-feedback cycles.
+                            if counters[key] >= trigger_cycles and probe_created < max_probe_per_cycle:
+                                probe_pred = dict(pred)
+                                probe_pred["probe_type"] = "refresh_probe"
+                                probe_pred["force_create"] = True
+                                probe_pred["data_timestamp"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                probe_order_id = self.order_manager.create_virtual_order(probe_pred)
+                                if not (isinstance(probe_order_id, str) and probe_order_id.startswith("DUPLICATE_SKIPPED")):
+                                    order_id = probe_order_id
+                                    probe_type = "refresh_probe"
+                                    probe_created += 1
+                                    counters[key] = 0
+                    else:
+                        counters[key] = 0
+
                     created_orders.append({
                         'order_id': order_id,
                         'currency': pred['currency'],
                         'period': pred['period'],
                         'is_cold_start': pred.get('is_cold_start', False),
                         'order_count': pred.get('order_count', 0),
-                        'tier': pred.get('tier', 'unknown')
+                        'tier': pred.get('tier', 'unknown'),
+                        'probe_type': probe_type,
                     })
+
+                self._save_refresh_probe_state(probe_state)
 
                 # Print summary
                 tier_counts = {'short': 0, 'medium': 0, 'long': 0}
                 cold_count = 0
+                probe_count = 0
                 for order in created_orders:
                     tier_counts[order['tier']] += 1
                     if order['is_cold_start']:
                         cold_count += 1
+                    if order.get('probe_type') == 'refresh_probe':
+                        probe_count += 1
 
                 print(f"\n=== Virtual Order Creation Summary ===")
                 print(f"Total orders created: {len(created_orders)}")
@@ -1060,12 +1177,15 @@ class EnsemblePredictor:
                 print(f"  - Medium (10-30d): {tier_counts['medium']} orders")
                 print(f"  - Long (60-120d): {tier_counts['long']} orders")
                 print(f"Cold start combinations: {cold_count}")
+                print(f"Refresh probe orders: {probe_count}")
                 print(f"Sampling strategy: Stratified by Period Tiers")
 
                 # Print details
                 for order in created_orders:
+                    probe_tag = " [PROBE]" if order.get('probe_type') == 'refresh_probe' else ""
                     status = "COLD START" if order['is_cold_start'] else f"WARM ({order['order_count']} orders)"
-                    print(f"  {order['currency']}-{order['period']}d [{order['tier']}]: {status}")
+                    print(f"  {order['currency']}-{order['period']}d [{order['tier']}]"
+                          f"{probe_tag}: {status}")
 
             except Exception as e:
                 print(f"Failed to create virtual orders: {e}")

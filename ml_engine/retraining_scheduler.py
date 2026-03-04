@@ -18,6 +18,7 @@ import json
 import shutil
 import sqlite3
 import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Tuple, Optional, Dict, List
@@ -27,6 +28,9 @@ warnings.filterwarnings('ignore')
 # 添加项目根目录到路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
+from ml_engine.data_processor import DataProcessor
+from ml_engine.predictor import EnsemblePredictor
+from ml_engine.system_policy import load_system_policy
 
 
 class RetrainingScheduler:
@@ -67,6 +71,7 @@ class RetrainingScheduler:
 
         # 重训练历史日志文件
         self.history_log_path = os.path.join(self.log_dir, 'retraining_history.json')
+        self.policy = load_system_policy()
 
     def get_last_training_date(self) -> datetime:
         """
@@ -219,6 +224,89 @@ class RetrainingScheduler:
 
         return anomalies
 
+    def _trigger_thresholds(self) -> Dict[str, float]:
+        cfg = self.policy.get("retrain_trigger", {})
+        return {
+            "score_threshold": float(cfg.get("score_threshold", 1.0)),
+            "follow_mae_ratio_threshold": float(cfg.get("follow_mae_ratio_threshold", 0.65)),
+            "direction_match_threshold": float(cfg.get("direction_match_threshold", 0.40)),
+            "p120_step_p95_threshold": float(cfg.get("p120_step_p95_threshold", 0.05)),
+            "global_exec_low": float(cfg.get("global_exec_low", 0.40)),
+            "global_exec_high": float(cfg.get("global_exec_high", 0.60)),
+        }
+
+    def _compute_retrain_trigger_score(
+        self,
+        exec_rate_7d: float,
+        period_anomalies: List[Dict],
+        follow_metrics: Dict[str, float]
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Multi-signal retraining score. Higher score means stronger retrain urgency.
+        """
+        th = self._trigger_thresholds()
+        components = {
+            "exec_rate_component": 0.0,
+            "period_anomaly_component": 0.0,
+            "follow_component": 0.0,
+            "direction_component": 0.0,
+            "p120_stability_component": 0.0,
+        }
+
+        # Global execution anomaly component.
+        if exec_rate_7d < th["global_exec_low"]:
+            components["exec_rate_component"] = min(
+                (th["global_exec_low"] - exec_rate_7d) / max(th["global_exec_low"], 1e-8),
+                1.0
+            )
+        elif exec_rate_7d > th["global_exec_high"]:
+            components["exec_rate_component"] = min(
+                (exec_rate_7d - th["global_exec_high"]) / max(1.0 - th["global_exec_high"], 1e-8),
+                1.0
+            )
+
+        # Per-period anomaly component (critical weighted higher).
+        critical = sum(1 for x in period_anomalies if x.get("severity") == "critical")
+        warning = sum(1 for x in period_anomalies if x.get("severity") == "warning")
+        if critical or warning:
+            components["period_anomaly_component"] = min(critical * 0.5 + warning * 0.2, 1.0)
+
+        samples = int(follow_metrics.get("samples", 0) or 0)
+        p120_samples = int(follow_metrics.get("p120_samples", 0) or 0)
+        follow_ratio = float(follow_metrics.get("follow_mae_ratio", 0.0) or 0.0)
+        direction_rate = float(follow_metrics.get("direction_match_rate", 0.0) or 0.0)
+        p120_p95 = float(follow_metrics.get("p120_step_p95", 0.0) or 0.0)
+
+        if samples >= 40 and follow_ratio > th["follow_mae_ratio_threshold"]:
+            components["follow_component"] = min(
+                (follow_ratio - th["follow_mae_ratio_threshold"]) /
+                max(th["follow_mae_ratio_threshold"], 1e-8),
+                1.0
+            )
+
+        if samples >= 40 and direction_rate > 0 and direction_rate < th["direction_match_threshold"]:
+            components["direction_component"] = min(
+                (th["direction_match_threshold"] - direction_rate) /
+                max(th["direction_match_threshold"], 1e-8),
+                1.0
+            )
+
+        if p120_samples >= 10 and p120_p95 > th["p120_step_p95_threshold"]:
+            components["p120_stability_component"] = min(
+                (p120_p95 - th["p120_step_p95_threshold"]) /
+                max(th["p120_step_p95_threshold"], 1e-8),
+                1.0
+            )
+
+        score = (
+            0.25 * components["exec_rate_component"] +
+            0.20 * components["period_anomaly_component"] +
+            0.25 * components["follow_component"] +
+            0.15 * components["direction_component"] +
+            0.15 * components["p120_stability_component"]
+        )
+        return float(score), components
+
     def should_retrain(self) -> Tuple[bool, Optional[str]]:
         """
         判断是否需要重训练
@@ -278,6 +366,7 @@ class RetrainingScheduler:
             print("跟随误差指标: 数据不足")
 
         print("\n判断结果:")
+        th = self._trigger_thresholds()
 
         # 定期重训练 — use timedelta for precise comparison
         if time_since_last >= timedelta(days=7) and new_orders >= 500:
@@ -285,32 +374,24 @@ class RetrainingScheduler:
             print(f"✅ 需要重训练: {reason}")
             return True, reason
 
-        # 紧急重训练 - 全局成交率过低
-        if exec_rate_7d < 0.4:
-            reason = f"全局成交率过低 ({exec_rate_7d:.2%} < 40%), 紧急重训练"
-            print(f"⚠️  需要重训练: {reason}")
-            return True, reason
-
-        # 紧急重训练 - 全局成交率过高
-        if exec_rate_7d > 0.6:
-            reason = f"全局成交率过高 ({exec_rate_7d:.2%} > 60%), 紧急重训练"
-            print(f"⚠️  需要重训练: {reason}")
-            return True, reason
-
-        # 闭环触发: 跟随误差恶化
-        if follow_metrics["samples"] >= 40 and follow_metrics["follow_mae_ratio"] > 0.65:
+        # Multi-signal trigger score (execution + follow + stability + per-period anomalies).
+        trigger_score, components = self._compute_retrain_trigger_score(
+            exec_rate_7d=exec_rate_7d,
+            period_anomalies=period_anomalies,
+            follow_metrics=follow_metrics,
+        )
+        print(
+            f"触发分数: {trigger_score:.3f}/{th['score_threshold']:.2f} "
+            f"(exec={components['exec_rate_component']:.2f}, "
+            f"period={components['period_anomaly_component']:.2f}, "
+            f"follow={components['follow_component']:.2f}, "
+            f"direction={components['direction_component']:.2f}, "
+            f"p120={components['p120_stability_component']:.2f})"
+        )
+        if trigger_score >= th["score_threshold"]:
             reason = (
-                "市场跟随误差过大 "
-                f"(MAE比率={follow_metrics['follow_mae_ratio']:.2f} > 0.65), 紧急重训练"
-            )
-            print(f"⚠️  需要重训练: {reason}")
-            return True, reason
-
-        # 闭环触发: 120d稳定性失控
-        if follow_metrics["p120_samples"] >= 10 and follow_metrics["p120_step_p95"] > 0.05:
-            reason = (
-                "120d单步变化超过稳定阈值 "
-                f"(p95={follow_metrics['p120_step_p95']:.2%} > 5%), 紧急重训练"
+                "多信号触发重训练 "
+                f"(score={trigger_score:.2f} >= {th['score_threshold']:.2f})"
             )
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
@@ -365,17 +446,20 @@ class RetrainingScheduler:
         print(f"❌ 暂不需要重训练")
         print(f"   - 距上次训练: {days_since_last} 天 (需要 >= 7天)")
         print(f"   - 新增数据: {new_orders} 条 (需要 >= 500条)")
-        print(f"   - 全局成交率: {exec_rate_7d:.2%} (正常范围: 40%-60%)")
+        print(
+            f"   - 全局成交率: {exec_rate_7d:.2%} "
+            f"(正常范围: {th['global_exec_low']:.0%}-{th['global_exec_high']:.0%})"
+        )
         print(f"   - 分组异常: 无")
         if follow_metrics["samples"] > 0:
             print(
                 f"   - 跟随误差MAE比率: {follow_metrics['follow_mae_ratio']:.2f} "
-                f"(阈值: <= 0.65)"
+                f"(阈值: <= {th['follow_mae_ratio_threshold']:.2f})"
             )
             if follow_metrics["p120_samples"] > 0:
                 print(
                     f"   - 120d稳定性p95: {follow_metrics['p120_step_p95']:.2%} "
-                    f"(阈值: <= 5%)"
+                    f"(阈值: <= {th['p120_step_p95_threshold']:.2%})"
                 )
 
         return False, None
@@ -641,68 +725,49 @@ class RetrainingScheduler:
         使用最近7天的执行数据对比新旧模型性能
 
         Returns:
-            True if new model performance >= old model * 0.95
+            True if new model passes champion/challenger and quality gates
         """
         try:
-            import pandas as pd
-            import numpy as np
-
-            # 获取最近7天的验证数据
-            conn = sqlite3.connect(self.db_path)
-            since_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-
-            val_df = pd.read_sql_query("""
-                SELECT currency, period, predicted_rate, status,
-                       execution_rate, rate_gap
-                FROM virtual_orders
-                WHERE validated_at >= ?
-                  AND status IN ('EXECUTED', 'FAILED')
-            """, conn, params=(since_date,))
-            conn.close()
-
-            if len(val_df) < 20:
-                print(f"  验证数据不足 ({len(val_df)} < 20),跳过性能对比,执行sanity check")
+            val_data = self._prepare_champion_validation_data(days=7, warmup_days=21)
+            val_rows = sum(len(df) for df in val_data.values())
+            if val_rows < 200:
+                print(f"  验证切片不足 ({val_rows} < 200),跳过性能对比,仅执行sanity check")
                 comparison['checks']['performance'] = 'skipped_insufficient_data'
-                # 即使跳过性能对比,仍需验证新模型基本可用
                 return self._sanity_check_new_models(new_model_dir)
 
-            print(f"  验证数据: {len(val_df)} 条订单 (近7天)")
+            print(f"  验证切片样本: {val_rows} 行 (近7天)")
 
-            # 对比每个模型类型的指标
-            metrics_comparison = {}
-            all_pass = True
+            old_eval = self._evaluate_model_dir_on_validation(old_model_dir, val_data)
+            new_eval = self._evaluate_model_dir_on_validation(new_model_dir, val_data)
 
-            for currency in ['fUSD', 'fUST']:
-                curr_df = val_df[val_df['currency'] == currency]
-                if len(curr_df) < 5:
-                    continue
-
-                # 对比回归模型: 使用 predicted_rate vs actual market 的 MAE
-                # 对于 EXECUTED 订单, execution_rate 是实际利率
-                executed_df = curr_df[curr_df['status'] == 'EXECUTED']
-                if len(executed_df) >= 5:
-                    # Compare predicted_rate accuracy
-                    old_mae = float(np.mean(np.abs(
-                        executed_df['predicted_rate'] - executed_df['execution_rate']
-                    )))
-
-                    # 新模型暂时无法直接在这里预测,
-                    # 但我们可以用 rate_gap 作为代理指标
-                    # rate_gap 越小越好 (预测越接近市场)
-                    failed_df = curr_df[curr_df['status'] == 'FAILED']
-                    avg_gap = float(failed_df['rate_gap'].mean()) if len(failed_df) > 0 else 0
-
-                    metrics_comparison[f'{currency}_execution_mae'] = old_mae
-                    metrics_comparison[f'{currency}_avg_failed_gap'] = avg_gap
-
-                    print(f"  {currency}: MAE={old_mae:.4f}, Avg Failed Gap={avg_gap:.4f}")
-
-                # 对比分类模型: 整体执行率
-                exec_rate = len(executed_df) / len(curr_df) if len(curr_df) > 0 else 0
-                metrics_comparison[f'{currency}_execution_rate'] = exec_rate
-                print(f"  {currency}: Execution Rate={exec_rate:.2%}")
-
+            metrics_comparison = {
+                "validation_rows": val_rows,
+                "old_overall_score": old_eval["overall_score"],
+                "new_overall_score": new_eval["overall_score"],
+                "overall_score_delta": new_eval["overall_score"] - old_eval["overall_score"],
+                "old_currency_scores": old_eval["currency_scores"],
+                "new_currency_scores": new_eval["currency_scores"],
+                "old_metrics": old_eval["metrics"],
+                "new_metrics": new_eval["metrics"],
+            }
             comparison['metrics'] = metrics_comparison
+
+            all_pass = True
+            old_score = old_eval["overall_score"]
+            new_score = new_eval["overall_score"]
+
+            # New model should not degrade aggregated score by more than 2%.
+            if old_score > 0 and new_score < old_score * 0.98:
+                print(f"  ❌ 综合分数下降过多: old={old_score:.4f}, new={new_score:.4f}")
+                all_pass = False
+
+            # Per-currency guardrail: not worse than 5%.
+            for currency in ['fUSD', 'fUST']:
+                old_curr = old_eval["currency_scores"].get(currency, 0.0)
+                new_curr = new_eval["currency_scores"].get(currency, 0.0)
+                if old_curr > 0 and new_curr < old_curr * 0.95:
+                    print(f"  ❌ {currency} 分数下降超过5%: old={old_curr:.4f}, new={new_curr:.4f}")
+                    all_pass = False
 
             # Sanity check: 验证新模型基本可用
             sanity_ok = self._sanity_check_new_models(new_model_dir)
@@ -719,9 +784,9 @@ class RetrainingScheduler:
             comparison['checks']['performance'] = 'passed' if all_pass else 'degraded'
 
             if all_pass:
-                print(f"  ✅ 性能指标已记录 + sanity check通过,新模型通过")
+                print(f"  ✅ 新模型通过同集对比 + sanity check + 闭环质量门禁")
             else:
-                print(f"  ❌ 新模型未通过sanity check")
+                print(f"  ❌ 新模型未通过对比门禁")
             return all_pass
 
         except Exception as e:
@@ -729,16 +794,144 @@ class RetrainingScheduler:
             comparison['checks']['performance'] = f'error: {e}'
             return False
 
+    def _prepare_champion_validation_data(self, days: int = 7, warmup_days: int = 21) -> Dict[str, pd.DataFrame]:
+        """
+        Build a shared validation slice for old/new model comparison.
+        """
+        now = datetime.now()
+        start = (now - timedelta(days=days + warmup_days)).strftime('%Y-%m-%d')
+        end = now.strftime('%Y-%m-%d')
+        since_dt = now - timedelta(days=days)
+
+        data_by_currency: Dict[str, pd.DataFrame] = {}
+        processor = DataProcessor(self.db_path)
+
+        for currency in ['fUSD', 'fUST']:
+            df = processor.load_data(currency)
+            if df.empty:
+                continue
+            df = df[df['datetime'] >= pd.to_datetime(start)].copy()
+            if df.empty:
+                continue
+            df_feat = df.groupby('period', group_keys=False).apply(processor.add_technical_indicators)
+            df_feat = df_feat.sort_values(['currency', 'period', 'datetime'])
+
+            # Traditional targets (same definition as trainer).
+            def _compute_targets(group: pd.DataFrame) -> pd.DataFrame:
+                group = group.copy()
+                indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=120)
+                group['future_conservative'] = group['low_annual'].rolling(window=indexer).quantile(0.3)
+                group['future_aggressive'] = group['close_annual'].rolling(window=indexer).quantile(0.6)
+                group['future_balanced'] = group['close_annual'].rolling(window=indexer).quantile(0.7)
+                fut80 = group['close_annual'].rolling(window=indexer).quantile(0.8)
+                group['future_execution_prob'] = (group['close_annual'] <= fut80).astype(float)
+                return group
+
+            df_feat = df_feat.groupby(['currency', 'period'], group_keys=False).apply(_compute_targets)
+
+            val_df = df_feat[df_feat['datetime'] >= since_dt].copy()
+            val_df = val_df.dropna(subset=[
+                'future_conservative',
+                'future_aggressive',
+                'future_balanced',
+                'future_execution_prob',
+            ])
+            if not val_df.empty:
+                data_by_currency[currency] = val_df
+
+        return data_by_currency
+
+    @staticmethod
+    def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+        """
+        AUC without external dependencies. Returns 0.5 when class is single.
+        """
+        y_true = np.asarray(y_true).astype(int)
+        y_score = np.asarray(y_score).astype(float)
+        n_pos = int((y_true == 1).sum())
+        n_neg = int((y_true == 0).sum())
+        if n_pos == 0 or n_neg == 0:
+            return 0.5
+        order = np.argsort(y_score)
+        ranks = np.empty_like(order, dtype=float)
+        ranks[order] = np.arange(1, len(y_score) + 1, dtype=float)
+        pos_rank_sum = ranks[y_true == 1].sum()
+        auc = (pos_rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+        return float(max(0.0, min(1.0, auc)))
+
+    def _evaluate_model_dir_on_validation(
+        self,
+        model_dir: str,
+        val_data: Dict[str, pd.DataFrame]
+    ) -> Dict[str, Dict]:
+        """
+        Evaluate one model directory on shared validation slice.
+        """
+        predictor = EnsemblePredictor(model_dir=model_dir, max_workers=1)
+        currency_scores: Dict[str, float] = {}
+        details: Dict[str, Dict[str, float]] = {}
+
+        tasks = [
+            ('model_execution_prob', 'future_execution_prob', 'classification', 0.25),
+            ('model_conservative', 'future_conservative', 'regression', 0.20),
+            ('model_aggressive', 'future_aggressive', 'regression', 0.20),
+            ('model_balanced', 'future_balanced', 'regression', 0.35),
+        ]
+
+        for currency, df in val_data.items():
+            metric_vals: Dict[str, float] = {}
+            score_parts = []
+
+            for model_type, target, task_type, weight in tasks:
+                if currency not in predictor.meta_info or model_type not in predictor.meta_info[currency]:
+                    continue
+                feature_cols = predictor.meta_info[currency][model_type]['feature_cols']
+                missing = [c for c in feature_cols if c not in df.columns]
+                if missing:
+                    continue
+
+                subset = df[feature_cols + [target]].dropna()
+                if len(subset) < 40:
+                    continue
+                X = subset[feature_cols].copy()
+                y = subset[target].values.astype(float)
+                y_pred = predictor.predict_with_ensemble(X, currency, model_type)
+
+                if task_type == 'classification':
+                    auc = self._safe_auc(y, y_pred)
+                    metric_vals[f"{model_type}_auc"] = float(auc)
+                    score_parts.append(weight * auc)
+                else:
+                    mae = float(np.mean(np.abs(y_pred - y)))
+                    metric_vals[f"{model_type}_mae"] = mae
+                    # Convert MAE to score in (0,1], higher is better.
+                    score_parts.append(weight * (1.0 / (1.0 + mae)))
+
+            if score_parts:
+                currency_scores[currency] = float(sum(score_parts) / sum(w for _, _, _, w in tasks))
+            else:
+                currency_scores[currency] = 0.0
+            details[currency] = metric_vals
+
+        valid_scores = [v for v in currency_scores.values() if v > 0]
+        overall = float(np.mean(valid_scores)) if valid_scores else 0.0
+        return {
+            "overall_score": overall,
+            "currency_scores": currency_scores,
+            "metrics": details,
+        }
+
     def _evaluate_follow_and_stability(self, days: int = 7) -> Tuple[bool, Dict]:
         """
         Deployment gate for closed-loop quality.
 
         Pass criteria:
-        - follow_mae_ratio <= 0.65 (when enough samples)
-        - direction_match_rate >= 0.40 (when enough samples)
-        - p120_step_p95 <= 0.05 (when enough 120d samples)
+        - follow_mae_ratio <= policy threshold (when enough samples)
+        - direction_match_rate >= policy threshold (when enough samples)
+        - p120_step_p95 <= policy threshold (when enough 120d samples)
         """
         metrics = self._get_follow_stability_metrics(days=days)
+        th = self._trigger_thresholds()
         output = {
             "follow_mae_7d": metrics["follow_mae"],
             "follow_mae_ratio_7d": metrics["follow_mae_ratio"],
@@ -747,11 +940,11 @@ class RetrainingScheduler:
         }
 
         passed = True
-        if metrics["samples"] >= 40 and metrics["follow_mae_ratio"] > 0.65:
+        if metrics["samples"] >= 40 and metrics["follow_mae_ratio"] > th["follow_mae_ratio_threshold"]:
             passed = False
-        if metrics["samples"] >= 40 and metrics["direction_match_rate"] > 0 and metrics["direction_match_rate"] < 0.40:
+        if metrics["samples"] >= 40 and metrics["direction_match_rate"] > 0 and metrics["direction_match_rate"] < th["direction_match_threshold"]:
             passed = False
-        if metrics["p120_samples"] >= 10 and metrics["p120_step_p95"] > 0.05:
+        if metrics["p120_samples"] >= 10 and metrics["p120_step_p95"] > th["p120_step_p95_threshold"]:
             passed = False
 
         return passed, output
