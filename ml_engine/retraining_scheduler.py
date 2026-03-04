@@ -17,9 +17,10 @@ import sys
 import json
 import shutil
 import sqlite3
+import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -86,6 +87,15 @@ class RetrainingScheduler:
 
         # 默认返回7天前
         return datetime.now() - timedelta(days=7)
+
+    def _virtual_orders_columns(self) -> List[str]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("PRAGMA table_info(virtual_orders)")
+            return [row[1] for row in cursor.fetchall()]
+        finally:
+            conn.close()
 
     def count_new_execution_results(self, since_date: datetime) -> int:
         """
@@ -251,6 +261,22 @@ class RetrainingScheduler:
         else:
             print(f"按 period 分组: 无异常")
 
+        # 条件4: 跟随误差与120d稳定性 (闭环主质量指标)
+        follow_metrics = self._get_follow_stability_metrics(days=7)
+        if follow_metrics["samples"] > 0:
+            print(
+                f"跟随误差(近7天): MAE={follow_metrics['follow_mae']:.4f}, "
+                f"MAE比率={follow_metrics['follow_mae_ratio']:.3f}, "
+                f"方向一致率={follow_metrics['direction_match_rate']:.2%}"
+            )
+            if follow_metrics["p120_samples"] > 0:
+                print(
+                    f"120d稳定性: p95(|step_change|)={follow_metrics['p120_step_p95']:.2%} "
+                    f"(样本={follow_metrics['p120_samples']})"
+                )
+        else:
+            print("跟随误差指标: 数据不足")
+
         print("\n判断结果:")
 
         # 定期重训练 — use timedelta for precise comparison
@@ -268,6 +294,24 @@ class RetrainingScheduler:
         # 紧急重训练 - 全局成交率过高
         if exec_rate_7d > 0.6:
             reason = f"全局成交率过高 ({exec_rate_7d:.2%} > 60%), 紧急重训练"
+            print(f"⚠️  需要重训练: {reason}")
+            return True, reason
+
+        # 闭环触发: 跟随误差恶化
+        if follow_metrics["samples"] >= 40 and follow_metrics["follow_mae_ratio"] > 0.65:
+            reason = (
+                "市场跟随误差过大 "
+                f"(MAE比率={follow_metrics['follow_mae_ratio']:.2f} > 0.65), 紧急重训练"
+            )
+            print(f"⚠️  需要重训练: {reason}")
+            return True, reason
+
+        # 闭环触发: 120d稳定性失控
+        if follow_metrics["p120_samples"] >= 10 and follow_metrics["p120_step_p95"] > 0.05:
+            reason = (
+                "120d单步变化超过稳定阈值 "
+                f"(p95={follow_metrics['p120_step_p95']:.2%} > 5%), 紧急重训练"
+            )
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
 
@@ -323,8 +367,108 @@ class RetrainingScheduler:
         print(f"   - 新增数据: {new_orders} 条 (需要 >= 500条)")
         print(f"   - 全局成交率: {exec_rate_7d:.2%} (正常范围: 40%-60%)")
         print(f"   - 分组异常: 无")
+        if follow_metrics["samples"] > 0:
+            print(
+                f"   - 跟随误差MAE比率: {follow_metrics['follow_mae_ratio']:.2f} "
+                f"(阈值: <= 0.65)"
+            )
+            if follow_metrics["p120_samples"] > 0:
+                print(
+                    f"   - 120d稳定性p95: {follow_metrics['p120_step_p95']:.2%} "
+                    f"(阈值: <= 5%)"
+                )
 
         return False, None
+
+    def _get_follow_stability_metrics(self, days: int = 7) -> Dict[str, float]:
+        """
+        Calculate closed-loop quality metrics from recent validated orders.
+
+        Metrics:
+        - follow_mae: mean(|predicted - market_median|)
+        - follow_mae_ratio: follow_mae / mean(market_median)
+        - direction_match_rate: mean(direction_match)
+        - p120_step_p95: 95th percentile of abs(step_change_pct) for 120d
+        """
+        conn = sqlite3.connect(self.db_path)
+        columns = set(self._virtual_orders_columns())
+        cursor = conn.cursor()
+
+        since_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        try:
+            select_cols = ["predicted_rate", "market_median", "period"]
+            if "direction_match" in columns:
+                select_cols.append("direction_match")
+            if "step_change_pct" in columns:
+                select_cols.append("step_change_pct")
+
+            query = f"""
+                SELECT {", ".join(select_cols)}
+                FROM virtual_orders
+                WHERE validated_at >= ?
+                  AND status IN ('EXECUTED', 'FAILED')
+                  AND market_median IS NOT NULL
+            """
+            cursor.execute(query, (since_date,))
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return {
+                "samples": 0,
+                "follow_mae": 0.0,
+                "follow_mae_ratio": 0.0,
+                "direction_match_rate": 0.0,
+                "p120_samples": 0,
+                "p120_step_p95": 0.0,
+            }
+
+        col_idx = {name: idx for idx, name in enumerate(select_cols)}
+        abs_errors = []
+        medians = []
+        direction_vals = []
+        p120_steps = []
+
+        for row in rows:
+            pred = row[col_idx["predicted_rate"]]
+            median = row[col_idx["market_median"]]
+            period = row[col_idx["period"]]
+            if pred is not None and median is not None:
+                abs_errors.append(abs(float(pred) - float(median)))
+                medians.append(abs(float(median)))
+
+            if "direction_match" in col_idx:
+                dm = row[col_idx["direction_match"]]
+                if dm is not None:
+                    direction_vals.append(float(dm))
+
+            if "step_change_pct" in col_idx and int(period) == 120:
+                step = row[col_idx["step_change_pct"]]
+                if step is not None:
+                    p120_steps.append(abs(float(step)))
+
+        follow_mae = float(sum(abs_errors) / len(abs_errors)) if abs_errors else 0.0
+        denom = float(sum(medians) / len(medians)) if medians else 0.0
+        follow_mae_ratio = (follow_mae / denom) if denom > 1e-8 else 0.0
+        direction_match_rate = (
+            float(sum(direction_vals) / len(direction_vals))
+            if direction_vals else 0.0
+        )
+        p120_step_p95 = (
+            float(np.percentile(p120_steps, 95))
+            if p120_steps else 0.0
+        )
+
+        return {
+            "samples": len(abs_errors),
+            "follow_mae": follow_mae,
+            "follow_mae_ratio": follow_mae_ratio,
+            "direction_match_rate": direction_match_rate,
+            "p120_samples": len(p120_steps),
+            "p120_step_p95": p120_step_p95,
+        }
 
     def retrain_models(self, output_dir: str = None) -> bool:
         """
@@ -565,6 +709,13 @@ class RetrainingScheduler:
             if not sanity_ok:
                 all_pass = False
 
+            # Closed-loop quality gate: follow error + 120d stability.
+            follow_ok, follow_metrics = self._evaluate_follow_and_stability(days=7)
+            metrics_comparison.update(follow_metrics)
+            if not follow_ok:
+                print("  ❌ 跟随误差/稳定性未达标,拒绝部署")
+                all_pass = False
+
             comparison['checks']['performance'] = 'passed' if all_pass else 'degraded'
 
             if all_pass:
@@ -577,6 +728,33 @@ class RetrainingScheduler:
             print(f"  ❌ 性能对比异常: {e},拒绝部署")
             comparison['checks']['performance'] = f'error: {e}'
             return False
+
+    def _evaluate_follow_and_stability(self, days: int = 7) -> Tuple[bool, Dict]:
+        """
+        Deployment gate for closed-loop quality.
+
+        Pass criteria:
+        - follow_mae_ratio <= 0.65 (when enough samples)
+        - direction_match_rate >= 0.40 (when enough samples)
+        - p120_step_p95 <= 0.05 (when enough 120d samples)
+        """
+        metrics = self._get_follow_stability_metrics(days=days)
+        output = {
+            "follow_mae_7d": metrics["follow_mae"],
+            "follow_mae_ratio_7d": metrics["follow_mae_ratio"],
+            "direction_match_rate_7d": metrics["direction_match_rate"],
+            "p120_step_p95_7d": metrics["p120_step_p95"],
+        }
+
+        passed = True
+        if metrics["samples"] >= 40 and metrics["follow_mae_ratio"] > 0.65:
+            passed = False
+        if metrics["samples"] >= 40 and metrics["direction_match_rate"] > 0 and metrics["direction_match_rate"] < 0.40:
+            passed = False
+        if metrics["p120_samples"] >= 10 and metrics["p120_step_p95"] > 0.05:
+            passed = False
+
+        return passed, output
 
     def _sanity_check_new_models(self, model_dir: str) -> bool:
         """

@@ -14,7 +14,7 @@ import sqlite3
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -34,6 +34,16 @@ class TrainingDataBuilder:
             db_path: 数据库路径
         """
         self.db_path = db_path
+
+    def _get_virtual_orders_columns(self) -> List[str]:
+        """Get virtual_orders column names for backward-compatible SQL building."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("PRAGMA table_info(virtual_orders)")
+            return [row[1] for row in cursor.fetchall()]
+        finally:
+            conn.close()
 
     def load_execution_results(self, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -56,18 +66,32 @@ class TrainingDataBuilder:
             - execution_rate: 实际成交利率
         """
         conn = sqlite3.connect(self.db_path)
+        table_cols = set(self._get_virtual_orders_columns())
 
-        query = """
+        selected_cols = [
+            'order_timestamp',
+            'currency',
+            'period',
+            'predicted_rate',
+            'status',
+            'execution_confidence',
+            'total_score',
+            'market_median',
+            'execution_rate',
+        ]
+        optional_cols = [
+            'follow_error_at_order',
+            'gate_reject_reason',
+            'direction_match',
+            'step_change_pct',
+            'step_capped',
+            'policy_step_cap_pct',
+        ]
+        selected_cols.extend([c for c in optional_cols if c in table_cols])
+
+        query = f"""
         SELECT
-            order_timestamp,
-            currency,
-            period,
-            predicted_rate,
-            status,
-            execution_confidence,
-            total_score,
-            market_median,
-            execution_rate
+            {', '.join(selected_cols)}
         FROM virtual_orders
         WHERE order_timestamp >= ? AND order_timestamp < ?
           AND status IN ('EXECUTED', 'FAILED')
@@ -169,11 +193,19 @@ class TrainingDataBuilder:
         execution_results = execution_results.sort_values('order_timestamp')
 
         # 时间对齐合并
+        merge_cols = [
+            'order_timestamp', 'currency', 'period', 'status',
+            'predicted_rate', 'execution_confidence', 'total_score',
+            'market_median', 'execution_rate'
+        ]
+        for c in ['follow_error_at_order', 'gate_reject_reason', 'direction_match',
+                  'step_change_pct', 'step_capped', 'policy_step_cap_pct']:
+            if c in execution_results.columns:
+                merge_cols.append(c)
+
         merged = pd.merge_asof(
             market_data,
-            execution_results[['order_timestamp', 'currency', 'period', 'status',
-                              'predicted_rate', 'execution_confidence', 'total_score',
-                              'market_median', 'execution_rate']],
+            execution_results[merge_cols],
             left_on='datetime',
             right_on='order_timestamp',
             by=['currency', 'period'],
@@ -224,6 +256,24 @@ class TrainingDataBuilder:
 
         # 标签3: 收益奖励
         df['revenue_reward'] = df.apply(self._compute_revenue_reward, axis=1)
+
+        # 闭环诊断标签: 跟随误差、方向一致性、单步变化
+        if 'follow_error_at_order' in df.columns:
+            df['follow_error'] = df['follow_error_at_order']
+        else:
+            df['follow_error'] = df.apply(
+                lambda row: row['predicted_rate'] - row['market_median']
+                if pd.notna(row.get('predicted_rate')) and pd.notna(row.get('market_median'))
+                else np.nan,
+                axis=1
+            )
+
+        if 'direction_match' not in df.columns:
+            df['direction_match'] = np.nan
+        if 'step_change_pct' not in df.columns:
+            df['step_change_pct'] = np.nan
+        if 'step_capped' not in df.columns:
+            df['step_capped'] = np.nan
 
         return df
 
@@ -368,6 +418,21 @@ class TrainingDataBuilder:
                 print(f"  - 有效样本: {len(valid_comp):,}")
                 print(f"  - 范围: [{valid_comp.min():.2f}, {valid_comp.max():.2f}]")
                 print(f"  - 平均值: {valid_comp.mean():.3f}")
+
+        if 'follow_error' in df.columns:
+            valid_follow = df['follow_error'].dropna()
+            if len(valid_follow) > 0:
+                print(f"\n市场跟随误差统计 (pred - market_median):")
+                print(f"  - 有效样本: {len(valid_follow):,}")
+                print(f"  - MAE: {valid_follow.abs().mean():.4f}")
+                print(f"  - 中位数: {valid_follow.median():.4f}")
+
+        if 'direction_match' in df.columns:
+            valid_match = df['direction_match'].dropna()
+            if len(valid_match) > 0:
+                print(f"\n方向一致性:")
+                print(f"  - 有效样本: {len(valid_match):,}")
+                print(f"  - 一致率: {100.0 * valid_match.mean():.2f}%")
 
         print("-"*60)
 

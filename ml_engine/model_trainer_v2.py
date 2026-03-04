@@ -195,6 +195,9 @@ class EnhancedModelTrainer:
             'actual_execution_binary', 'revenue_reward', 'rate_competitiveness',
             'status', 'order_timestamp', 'predicted_rate', 'execution_confidence',
             'total_score', 'market_median', 'execution_rate',
+            'follow_error', 'follow_error_at_order', 'direction_match',
+            'step_change_pct', 'step_capped', 'policy_step_cap_pct',
+            'gate_reject_reason',
             'revenue_optimized_target',
         ]
 

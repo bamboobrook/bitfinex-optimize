@@ -8,6 +8,7 @@ import sys
 from loguru import logger
 from datetime import datetime
 import numpy as np
+from typing import Optional, Tuple
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
@@ -17,6 +18,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from ml_engine.data_processor import DataProcessor
 from ml_engine.execution_features import get_period_window_profile
+from ml_engine.system_policy import load_system_policy, get_step_cap_pct
 
 class EnsemblePredictor:
     """使用集成模型的增强预测器 - 支持GPU加速和并行化"""
@@ -36,6 +38,11 @@ class EnsemblePredictor:
         self.meta_info = {}  # {curr: {model_type: {weights, features, task_type}}}
         self.processor = DataProcessor()
         self._timestamp_deprecation_warned = False  # 废弃警告标志
+        self.policy = load_system_policy()
+        self.db_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+            "data", "lending_history.db"
+        )
 
         # 导入OrderManager用于创建虚拟订单
         try:
@@ -194,12 +201,7 @@ class EnsemblePredictor:
     def get_latest_rate_from_db(self, currency: str, period: int) -> tuple:
         """Query database directly for the most recent rate"""
         import sqlite3
-        db_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-            "data", "lending_history.db"
-        )
-
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
         try:
@@ -220,6 +222,78 @@ class EnsemblePredictor:
             return None, None
         finally:
             conn.close()
+
+    def _get_previous_predicted_rate(self, currency: str, period: int) -> Optional[float]:
+        """Get the latest historical predicted rate for step-cap control."""
+        import sqlite3
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT predicted_rate
+                FROM virtual_orders
+                WHERE currency = ?
+                  AND period = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (currency, period),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            if row[0] is None:
+                return None
+            return float(row[0])
+        except Exception as e:
+            logger.warning(f"Failed to read previous predicted rate for {currency}-{period}: {e}")
+            return None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _compute_direction_match(predicted_delta: float, market_signal: float) -> Optional[int]:
+        """
+        Compare prediction direction with market direction.
+        Returns 1 (match), 0 (mismatch), or None when signal is too weak.
+        """
+        eps = 1e-8
+        if abs(market_signal) <= eps:
+            return None
+        pred_sign = 1 if predicted_delta > eps else (-1 if predicted_delta < -eps else 0)
+        market_sign = 1 if market_signal > eps else (-1 if market_signal < -eps else 0)
+        if pred_sign == 0:
+            return None
+        return 1 if pred_sign == market_sign else 0
+
+    def _apply_period_step_cap(
+        self,
+        currency: str,
+        period: int,
+        predicted_rate: float
+    ) -> Tuple[float, Optional[float], Optional[float], bool, Optional[float]]:
+        """
+        Apply per-period one-step cap. Currently strict for 120d by policy.
+
+        Returns:
+            (capped_rate, previous_rate, step_change_pct, step_capped, cap_pct)
+        """
+        cap_pct = get_step_cap_pct(self.policy, period)
+        if cap_pct is None:
+            return predicted_rate, None, None, False, None
+
+        previous_rate = self._get_previous_predicted_rate(currency, period)
+        if previous_rate is None or previous_rate <= 0:
+            return predicted_rate, previous_rate, None, False, cap_pct
+
+        lower = previous_rate * (1.0 - cap_pct)
+        upper = previous_rate * (1.0 + cap_pct)
+        capped_rate = float(np.clip(predicted_rate, lower, upper))
+        step_capped = abs(capped_rate - predicted_rate) > 1e-12
+        step_change_pct = (capped_rate - previous_rate) / previous_rate
+        return capped_rate, previous_rate, float(step_change_pct), step_capped, cap_pct
 
     def predict_single_period(self, row_data: dict, feature_cols: list, currency: str) -> dict:
         """
@@ -574,6 +648,27 @@ class EnsemblePredictor:
             )
         final_rate = clipped_rate
 
+        # Enforce policy step cap for selected periods (120d by default).
+        final_rate, previous_rate, step_change_pct, step_capped, step_cap_pct = self._apply_period_step_cap(
+            currency, period, final_rate
+        )
+        if step_capped and previous_rate is not None:
+            logger.info(
+                f"Step cap applied for {currency}-{period}: "
+                f"{clipped_rate:.4f} -> {final_rate:.4f} "
+                f"(prev={previous_rate:.4f}, cap={step_cap_pct:.2%})"
+            )
+
+        # Closed-loop diagnostics: market following error and direction alignment.
+        market_follow_error = float(final_rate - current_rate)
+        if period >= 60:
+            market_signal = float(row_data.get('rate_chg_1440', 0.0))
+        elif period >= 20:
+            market_signal = float(row_data.get('rate_chg_240', 0.0))
+        else:
+            market_signal = float(row_data.get('rate_chg_60', 0.0))
+        direction_match = self._compute_direction_match(final_rate - current_rate, market_signal)
+
         # ========== 结构化诊断日志 ==========
         logger.info(
             f"PREDICTION_DIAG {currency}-{period}d: "
@@ -583,7 +678,8 @@ class EnsemblePredictor:
             f"trend_adj={trend_adjustment:.4f} final={final_rate:.4f} "
             f"exec_fast={exec_rate_fast:.3f}({fast_days}d) exec_slow={exec_rate_slow:.3f}({slow_days}d) "
             f"calib_prob={calibrated_prob:.3f} strategy={strategy_desc} "
-            f"clipped={was_clipped} floor={floor_factor:.3f} bounds=[{min_bound:.4f},{max_bound:.4f}]"
+            f"clipped={was_clipped} step_capped={step_capped} follow_err={market_follow_error:.4f} "
+            f"floor={floor_factor:.3f} bounds=[{min_bound:.4f},{max_bound:.4f}]"
         )
 
         return {
@@ -607,6 +703,11 @@ class EnsemblePredictor:
             "exec_rate_slow_window_days": slow_days,
             "avg_gap_window_days": gap_days,
             "execution_adjustment_applied": adjustment,
+            "market_follow_error": market_follow_error,
+            "direction_match": direction_match,
+            "step_change_pct": step_change_pct,
+            "step_capped": step_capped,
+            "policy_step_cap_pct": step_cap_pct,
             # v2 model info (S1)
             "v2_execution_prob": v2_execution_prob,
             "v2_revenue_rate": v2_revenue_rate,
@@ -858,10 +959,23 @@ class EnsemblePredictor:
                 # 周期层级配置
                 # 注意: 交易所不存在周期8-9
                 # 可用周期: [2,3,4,5,6,7, 10,14,15,20,30, 60,90,120]
+                period_policy = self.policy.get('period_policy', {})
                 TIER_CONFIG = {
-                    'short': {'periods': [2, 3, 4, 5, 6, 7], 'min_orders': 7, 'target_per_period': 1},
-                    'medium': {'periods': [10, 14, 15, 20, 30], 'min_orders': 7, 'target_per_period': 1},
-                    'long': {'periods': [60, 90, 120], 'min_orders': 6, 'target_per_period': 2}
+                    'short': {
+                        'periods': period_policy.get('short_periods', [2, 3, 4, 5, 6, 7]),
+                        'min_orders': 7,
+                        'target_per_period': 1
+                    },
+                    'medium': {
+                        'periods': period_policy.get('medium_periods', [10, 14, 15, 20, 30]),
+                        'min_orders': 7,
+                        'target_per_period': 1
+                    },
+                    'long': {
+                        'periods': period_policy.get('long_periods', [60, 90, 120]),
+                        'min_orders': 6,
+                        'target_per_period': 2
+                    }
                 }
                 TOP_N = 24                 # 增加总订单数到24，确保各层级都有足够覆盖
 

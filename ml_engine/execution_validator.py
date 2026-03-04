@@ -20,10 +20,31 @@ class ExecutionValidator:
 
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
+        self._ensure_schema()
 
     def _get_connection(self):
         """Get database connection"""
         return sqlite3.connect(self.db_path)
+
+    def _ensure_schema(self):
+        """Ensure optional columns used by enhanced validation are available."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("PRAGMA table_info(virtual_orders)")
+            existing = {row[1] for row in cursor.fetchall()}
+            required_columns = {
+                "gate_reject_reason": "TEXT",
+                "follow_error_at_order": "REAL",
+                "execution_threshold": "REAL",
+                "market_percentile_40": "REAL",
+            }
+            for column, col_type in required_columns.items():
+                if column not in existing:
+                    cursor.execute(f"ALTER TABLE virtual_orders ADD COLUMN {column} {col_type}")
+            conn.commit()
+        finally:
+            conn.close()
 
     @staticmethod
     def _get_execution_threshold(period: int) -> float:
@@ -161,7 +182,8 @@ class ExecutionValidator:
             if not market_data:
                 # Mark as EXPIRED if no market data
                 update_data = {
-                    'status': 'EXPIRED'
+                    'status': 'EXPIRED',
+                    'gate_reject_reason': 'NO_MARKET_DATA'
                 }
                 self.update_order_status(order['order_id'], update_data)
                 return {
@@ -195,6 +217,7 @@ class ExecutionValidator:
                 # No valid market data
                 execution_details = {
                     'status': 'FAILED',
+                    'gate_reject_reason': 'NO_VALID_MARKET_DATA',
                     'max_market_rate': 0.0,
                     'rate_gap': predicted_rate
                 }
@@ -203,6 +226,7 @@ class ExecutionValidator:
                 should_execute, confidence, score_details = self._calculate_hybrid_execution_score(
                     predicted_rate, market_close_rates, int(order['period'])
                 )
+                follow_error_at_order = predicted_rate - score_details['market_median']
 
                 if should_execute:
                     executed = True
@@ -226,8 +250,16 @@ class ExecutionValidator:
 
                     if execution_timestamp is None:
                         executed = False
+                        if not q40_gate and not execution_candidates:
+                            reject_reason = 'Q40_AND_FILL_GATE'
+                        elif not q40_gate:
+                            reject_reason = 'Q40_GATE'
+                        else:
+                            reject_reason = 'FILL_GATE'
                         execution_details = {
                             'status': 'FAILED',
+                            'gate_reject_reason': reject_reason,
+                            'follow_error_at_order': follow_error_at_order,
                             'execution_confidence': confidence,
                             **score_details
                         }
@@ -240,6 +272,7 @@ class ExecutionValidator:
                             'executed_at': execution_timestamp,
                             'execution_rate': execution_rate,
                             'execution_delay_minutes': delay_minutes,
+                            'follow_error_at_order': follow_error_at_order,
                             'execution_confidence': confidence,
                             **score_details
                         }
@@ -247,6 +280,8 @@ class ExecutionValidator:
                     # 订单失败
                     execution_details = {
                         'status': 'FAILED',
+                        'gate_reject_reason': 'SCORE_GATE',
+                        'follow_error_at_order': follow_error_at_order,
                         'execution_confidence': confidence,
                         **score_details
                     }
@@ -422,13 +457,17 @@ class ExecutionValidator:
             set_clauses = []
             values = []
 
-            for field in ['status', 'executed_at', 'execution_rate',
-                         'execution_delay_minutes', 'max_market_rate', 'rate_gap',
-                         'execution_confidence', 'percentile_score', 'gap_score',
-                         'density_score', 'total_score', 'market_percentile_25',
-                         'market_percentile_30', 'market_median', 'market_min',
-                         'market_max', 'nearby_rate_count', 'market_percentile_35',
-                         'rate_gap']:
+            for field in [
+                'status', 'executed_at', 'execution_rate',
+                'execution_delay_minutes', 'max_market_rate', 'rate_gap',
+                'execution_confidence', 'percentile_score', 'gap_score',
+                'density_score', 'total_score', 'execution_threshold',
+                'market_percentile_25', 'market_percentile_30',
+                'market_percentile_35', 'market_percentile_40',
+                'market_median', 'market_min', 'market_max',
+                'nearby_rate_count', 'gate_reject_reason',
+                'follow_error_at_order'
+            ]:
                 if field in update_data:
                     set_clauses.append(f"{field} = ?")
                     values.append(update_data[field])

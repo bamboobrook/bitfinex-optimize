@@ -40,10 +40,39 @@ class OrderManager:
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or DB_PATH
+        self._ensure_schema()
 
     def _get_connection(self):
         """Get database connection"""
         return sqlite3.connect(self.db_path)
+
+    def _ensure_schema(self):
+        """Ensure optional columns used by closed-loop diagnostics exist."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("PRAGMA table_info(virtual_orders)")
+            existing = {row[1] for row in cursor.fetchall()}
+
+            required_columns = {
+                "market_follow_error": "REAL",
+                "direction_match": "INTEGER",
+                "step_change_pct": "REAL",
+                "step_capped": "INTEGER",
+                "policy_step_cap_pct": "REAL",
+                "gate_reject_reason": "TEXT",
+                "follow_error_at_order": "REAL",
+                "execution_threshold": "REAL",
+                "market_percentile_40": "REAL",
+            }
+
+            for column, col_type in required_columns.items():
+                if column not in existing:
+                    cursor.execute(f"ALTER TABLE virtual_orders ADD COLUMN {column} {col_type}")
+
+            conn.commit()
+        finally:
+            conn.close()
 
     def create_virtual_order(self, prediction: dict) -> str:
         """
@@ -101,8 +130,9 @@ class OrderManager:
                 INSERT INTO virtual_orders
                 (order_id, currency, period, predicted_rate, order_timestamp,
                  validation_window_hours, prediction_confidence, prediction_strategy,
-                 model_version, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+                 model_version, status, created_at, market_follow_error,
+                 direction_match, step_change_pct, step_capped, policy_step_cap_pct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)
             """, (
                 order_id,
                 prediction['currency'],
@@ -113,7 +143,12 @@ class OrderManager:
                 prediction.get('confidence', 'Medium'),
                 prediction.get('strategy', 'Unknown'),
                 'v1.0',  # Model version
-                current_time  # created_at is when order was inserted
+                current_time,  # created_at is when order was inserted
+                prediction.get('market_follow_error'),
+                prediction.get('direction_match'),
+                prediction.get('step_change_pct'),
+                int(bool(prediction.get('step_capped', False))) if prediction.get('step_capped') is not None else None,
+                prediction.get('policy_step_cap_pct'),
             ))
 
             conn.commit()
