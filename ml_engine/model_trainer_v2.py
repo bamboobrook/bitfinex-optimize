@@ -51,6 +51,9 @@ class EnhancedModelTrainer:
 
         self.model_dir = model_dir
         os.makedirs(model_dir, exist_ok=True)
+        self.cpu_threads = int(
+            os.getenv('ML_CPU_THREADS', str(max(1, min(os.cpu_count() or 8, 32))))
+        )
 
         # XGBoost GPU 参数配置
         self.xgb_params = {
@@ -60,7 +63,9 @@ class EnhancedModelTrainer:
             'max_depth': 10,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
-            'n_jobs': 24,
+            # xgb.train() 优先读取 nthread；保留 n_jobs 兼容部分版本
+            'nthread': self.cpu_threads,
+            'n_jobs': self.cpu_threads,
         }
 
         # LightGBM CPU 参数配置
@@ -71,7 +76,9 @@ class EnhancedModelTrainer:
             'num_leaves': 31,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
-            'n_jobs': 24,
+            'num_threads': self.cpu_threads,
+            'n_jobs': self.cpu_threads,
+            'force_col_wise': True,
             'verbose': -1
         }
 
@@ -83,10 +90,11 @@ class EnhancedModelTrainer:
             'depth': 10,
             'bootstrap_type': 'Bernoulli',
             'subsample': 0.8,
-            'thread_count': 24,
+            'thread_count': self.cpu_threads,
             'verbose': False,
             'allow_writing_files': False
         }
+        print(f"硬件并行配置: CPU threads={self.cpu_threads}, GPU device=0")
 
     def prepare_training_data(
         self,

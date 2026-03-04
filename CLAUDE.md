@@ -143,6 +143,20 @@ rg -n "PREDICTION_DIAG|stale_data|Retraining|Scheduled pipeline" log/ml_optimize
 ### 8.3 日志治理
 - 已关闭 Uvicorn access log, 不再打印常规 `200` 访问日志。
 
+### 8.4 并行性能优化 (2026-03-04 晚间补充)
+- 训练进程线程参数显式化:
+  - XGBoost 增加 `nthread`（并保留 `n_jobs` 兼容）
+  - LightGBM 增加 `num_threads`
+  - CatBoost `thread_count` 跟随 `ML_CPU_THREADS`
+- 预测进程并行增强:
+  - `PREDICT_MAX_WORKERS` 控制 period 级并发
+  - `PREDICT_INFER_THREADS` 控制模型推理线程
+  - LightGBM/CatBoost 推理显式传线程参数
+- API 子进程统一注入线程/GPU环境变量:
+  - `ML_CPU_THREADS / OMP_NUM_THREADS / OPENBLAS_NUM_THREADS / MKL_NUM_THREADS / NUMEXPR_NUM_THREADS`
+  - `PREDICT_MAX_WORKERS / PREDICT_INFER_THREADS`
+  - `CUDA_VISIBLE_DEVICES=0`
+
 ## 9) 下次审核最小检查 (5分钟)
 1. `GET /status` 看是否 online 且 last_update 持续变化。
 2. `GET /result` 看 `policy_version/stale_data` 字段。

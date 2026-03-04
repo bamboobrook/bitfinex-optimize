@@ -27,13 +27,16 @@ class EnsemblePredictor:
     COLD_START_THRESHOLD = 10  # 冷启动数据点阈值
     STALE_DATA_THRESHOLD_HOURS = 2  # 陈旧数据阈值(小时)
 
-    def __init__(self, model_dir=None, max_workers=8):
+    def __init__(self, model_dir=None, max_workers=None):
         # Use absolute path for models directory
         if model_dir is None:
             base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             model_dir = os.path.join(base_dir, "data", "models")
         self.model_dir = model_dir
-        self.max_workers = max_workers  # 并行worker数量
+        cpu_count = os.cpu_count() or 8
+        default_workers = max(4, min(cpu_count, 24))
+        self.max_workers = int(os.getenv("PREDICT_MAX_WORKERS", str(max_workers or default_workers)))
+        self.infer_threads = int(os.getenv("PREDICT_INFER_THREADS", str(min(cpu_count, 24))))
         self.models = {}  # {curr: {model_type: {algo: model}}}
         self.meta_info = {}  # {curr: {model_type: {weights, features, task_type}}}
         self.processor = DataProcessor()
@@ -49,6 +52,10 @@ class EnsemblePredictor:
             "data", "refresh_probe_state.json"
         )
         self._stale_issues = []
+        logger.info(
+            f"Predictor parallel config: max_workers={self.max_workers}, "
+            f"infer_threads={self.infer_threads}"
+        )
 
         # 导入OrderManager用于创建虚拟订单
         try:
@@ -183,19 +190,23 @@ class EnsemblePredictor:
 
         # XGBoost预测
         if 'xgb' in models:
+            try:
+                models['xgb'].set_param({'nthread': self.infer_threads})
+            except Exception:
+                pass
             dtest = xgb.DMatrix(X)
             predictions['xgb'] = models['xgb'].predict(dtest)
 
         # LightGBM预测
         if 'lgb' in models:
-            predictions['lgb'] = models['lgb'].predict(X)
+            predictions['lgb'] = models['lgb'].predict(X, num_threads=self.infer_threads)
 
         # CatBoost预测
         if 'cat' in models:
             if meta['task_type'] == 'classification':
-                predictions['cat'] = models['cat'].predict_proba(X)[:, 1]
+                predictions['cat'] = models['cat'].predict_proba(X, thread_count=self.infer_threads)[:, 1]
             else:
-                predictions['cat'] = models['cat'].predict(X)
+                predictions['cat'] = models['cat'].predict(X, thread_count=self.infer_threads)
 
         # 加权集成
         ensemble_pred = np.zeros(len(X))

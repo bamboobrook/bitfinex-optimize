@@ -607,13 +607,38 @@ TIMEOUT_PREDICT = 300     # 5 minutes
 TIMEOUT_VALIDATE = 300    # 5 minutes
 TIMEOUT_ORDERS = 300      # 5 minutes
 
+
+def _build_subprocess_env():
+    """
+    Build runtime environment for training/prediction subprocesses.
+    Enforces multi-core CPU usage and keeps GPU visible.
+    """
+    env = os.environ.copy()
+    cpu_threads = int(env.get("ML_CPU_THREADS", str(max(1, min(os.cpu_count() or 8, 32)))))
+
+    # Threaded math/runtime libs
+    env["ML_CPU_THREADS"] = str(cpu_threads)
+    env["OMP_NUM_THREADS"] = str(cpu_threads)
+    env["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+    env["MKL_NUM_THREADS"] = str(cpu_threads)
+    env["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+    env["VECLIB_MAXIMUM_THREADS"] = str(cpu_threads)
+
+    # Inference-level parallel controls
+    env.setdefault("PREDICT_MAX_WORKERS", str(max(4, min(cpu_threads, 24))))
+    env.setdefault("PREDICT_INFER_THREADS", str(min(cpu_threads, 24)))
+    env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    return env
+
+
 async def _run_subprocess_with_timeout(cmd, cwd, timeout, step_name):
     """Run subprocess with timeout, kill on timeout. Returns (stdout, stderr, returncode)."""
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=str(cwd)
+        cwd=str(cwd),
+        env=_build_subprocess_env()
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
@@ -1051,7 +1076,8 @@ async def trigger_download(background_tasks: BackgroundTasks):
                 "python", "-m", "funding_history_downloader",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(BASE_DIR)
+                cwd=str(BASE_DIR),
+                env=_build_subprocess_env()
             )
             stdout, stderr = await process.communicate()
 
@@ -1096,7 +1122,8 @@ async def trigger_feature_processing(background_tasks: BackgroundTasks):
                 "python", "-m", "ml_engine.data_processor",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(BASE_DIR)
+                cwd=str(BASE_DIR),
+                env=_build_subprocess_env()
             )
             stdout, stderr = await process.communicate()
 
@@ -1141,7 +1168,8 @@ async def trigger_training(background_tasks: BackgroundTasks):
                 "python", "-m", "ml_engine.model_trainer",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(BASE_DIR)
+                cwd=str(BASE_DIR),
+                env=_build_subprocess_env()
             )
             stdout, stderr = await process.communicate()
 
@@ -1186,7 +1214,8 @@ async def trigger_prediction(background_tasks: BackgroundTasks):
                 "python", "-m", "ml_engine.predictor",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(BASE_DIR)
+                cwd=str(BASE_DIR),
+                env=_build_subprocess_env()
             )
             stdout, stderr = await process.communicate()
 
@@ -1231,7 +1260,8 @@ async def trigger_order_validation(background_tasks: BackgroundTasks):
                 "python", str(BASE_DIR / "ml_engine" / "execution_validator.py"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(BASE_DIR)
+                cwd=str(BASE_DIR),
+                env=_build_subprocess_env()
             )
             stdout, stderr = await process.communicate()
 
