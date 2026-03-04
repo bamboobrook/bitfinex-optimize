@@ -1158,3 +1158,62 @@ grep "sanity check" log/ml_optimizer.log | tail -5
 | `data/models/` | Trained model files |
 | `data/processed/` | Processed feature data |
 | `log/ml_optimizer.log` | Application log |
+
+
+## Update Log (2026-03-04)
+
+### Issue Observed
+
+- Execution rates dropped sharply across periods, with 60/90/120 especially unstable.
+- Long-period pricing was too sticky when market regime shifted, while short/mid periods were not reacting fast enough to recent execution feedback.
+
+### Changes Implemented
+
+- **Period-adaptive lookback profile** (`balanced` default):
+  - 2-7d: `fast=3d`, `slow=14d`
+  - 10-30d: `fast=7d`, `slow=30d`
+  - 60-120d: `fast=21d`, `slow=90d`
+- Added centralized profile function in:
+  - `ml_engine/execution_features.py:get_period_window_profile()`
+- Updated execution feature outputs:
+  - New fields: `exec_rate_fast`, `exec_rate_slow`, `avg_spread_profile`, `avg_rate_gap_failed_profile`
+  - Kept compatibility aliases: `exec_rate_7d`, `exec_rate_30d`, `avg_rate_gap_failed_7d`
+- Updated predictor to use period-adaptive windows and adaptive floor logic:
+  - `predictor.py` now consumes fast/slow/gap windows from profile
+  - Long-period `max_up` reduced from `0.45 -> 0.30` to avoid overshoot
+  - Added adaptive floor factor for clipping bounds to prevent long-period high-floor lock
+  - Added robust anchor usage (`robust_ma_*`) with compatibility fallbacks
+- Updated data processor:
+  - Period-aware outlier thresholds (`<=7/<=30/>=60`) instead of single 200% cutoff
+  - Added robust median anchors: `robust_ma_720/1440/4320/10080`
+  - Execution feature sampling frequency now adapts to profile (1D/2D/3D/7D)
+- Updated execution validator:
+  - Period-aware score thresholds (short more sensitive, long stricter)
+  - Period-aware fill tolerance and q40 gate before marking EXECUTED
+
+### Files Changed
+
+- `ml_engine/execution_features.py`
+- `ml_engine/predictor.py`
+- `ml_engine/data_processor.py`
+- `ml_engine/execution_validator.py`
+- `CLAUDE.md`
+
+### Quick Verification Commands
+
+```bash
+python -m py_compile ml_engine/execution_features.py ml_engine/predictor.py ml_engine/data_processor.py ml_engine/execution_validator.py
+python - <<'PY'
+from ml_engine.execution_features import get_period_window_profile
+print(get_period_window_profile(2), get_period_window_profile(30), get_period_window_profile(120))
+PY
+```
+
+### Rollback Notes
+
+- To disable adaptive window behavior, revert these files to previous commit:
+  - `ml_engine/execution_features.py`
+  - `ml_engine/predictor.py`
+  - `ml_engine/data_processor.py`
+  - `ml_engine/execution_validator.py`
+- Keep `CLAUDE.md` log entry for audit trail even if code rollback is performed.

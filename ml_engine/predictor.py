@@ -16,6 +16,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # 添加父目录到 path 以便导入
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from ml_engine.data_processor import DataProcessor
+from ml_engine.execution_features import get_period_window_profile
 
 class EnsemblePredictor:
     """使用集成模型的增强预测器 - 支持GPU加速和并行化"""
@@ -376,34 +377,48 @@ class EnsemblePredictor:
             prob = blended_prob
 
         # ========== 校准执行概率 (Bayesian-style Calibration) ==========
-        # 根据数据充分度动态加权模型概率和历史执行率
-        # v5 核心修复: 消除双重惩罚和硬性下限覆盖
+        # 根据周期分层窗口动态加权模型概率和历史执行率
+        profile = get_period_window_profile(period)
+        fast_days = profile["fast_days"]
+        slow_days = profile["slow_days"]
+        gap_days = profile["gap_days"]
+
         try:
             from ml_engine.execution_features import ExecutionFeatures
             _exec_calc = ExecutionFeatures()
-            exec_rate_7d = _exec_calc.calculate_execution_rate(currency, period, 7)
-            exec_rate_30d = _exec_calc.calculate_execution_rate(currency, period, 30)
-            avg_rate_gap = _exec_calc.calculate_avg_rate_gap(currency, period, 7)
+            exec_rate_fast = _exec_calc.calculate_execution_rate(currency, period, fast_days)
+            exec_rate_slow = _exec_calc.calculate_execution_rate(currency, period, slow_days)
+            avg_rate_gap = _exec_calc.calculate_avg_rate_gap(currency, period, gap_days)
             order_count = _exec_calc.get_order_count(currency, period)
-            logger.debug(f"Live execution stats for {currency}-{period}: exec_rate_7d={exec_rate_7d:.4f}, exec_rate_30d={exec_rate_30d:.4f}, orders={order_count}")
+            logger.debug(
+                f"Live execution stats for {currency}-{period}: "
+                f"exec_rate_fast={exec_rate_fast:.4f}({fast_days}d), "
+                f"exec_rate_slow={exec_rate_slow:.4f}({slow_days}d), "
+                f"avg_gap={avg_rate_gap:.4f}({gap_days}d), "
+                f"orders={order_count}"
+            )
         except Exception as e:
             logger.warning(f"Failed to get live execution stats for {currency}-{period}: {e}, using feature data")
-            exec_rate_7d = row_data.get('exec_rate_7d', 0.6)
-            exec_rate_30d = row_data.get('exec_rate_30d', 0.6)
-            avg_rate_gap = row_data.get('avg_rate_gap_failed_7d', 0.0)
+            exec_rate_fast = row_data.get('exec_rate_fast', row_data.get('exec_rate_7d', 0.6))
+            exec_rate_slow = row_data.get('exec_rate_slow', row_data.get('exec_rate_30d', 0.6))
+            avg_rate_gap = row_data.get('avg_rate_gap_failed_profile', row_data.get('avg_rate_gap_failed_7d', 0.0))
             order_count = 0
+
+        # Backward-compatible aliases for existing logs/outputs
+        exec_rate_7d = exec_rate_fast
+        exec_rate_30d = exec_rate_slow
 
         # 贝叶斯风格校准: 根据数据充分度动态加权
         # order_count 少时信任模型,多时信任历史执行率
         # sqrt曲线: 50单→ew=0.50, 100单→ew=0.65(上限), 200单→ew=0.65
         evidence_weight = min(np.sqrt(order_count / 200.0), 0.65)
-        calibrated_prob = (1.0 - evidence_weight) * prob + evidence_weight * exec_rate_7d
+        calibrated_prob = (1.0 - evidence_weight) * prob + evidence_weight * exec_rate_fast
         calibrated_prob = np.clip(calibrated_prob, 0.0, 1.0)
 
         # 诊断日志: 记录关键决策变量
         logger.debug(
             f"Strategy decision for {currency}-{period}: "
-            f"prob={prob:.4f}, exec_rate_7d={exec_rate_7d:.4f}, "
+            f"prob={prob:.4f}, exec_rate_fast={exec_rate_fast:.4f}, "
             f"calibrated_prob={calibrated_prob:.4f}"
         )
 
@@ -437,11 +452,11 @@ class EnsemblePredictor:
                 logger.info(f"Confidence degraded for {currency}-{period}: {old_confidence} -> {confidence} (data age: {data_age_hours:.1f}h)")
 
         # ========== 执行反馈调整 (Unified Adjustment) ==========
-        # exec_rate_7d, exec_rate_30d, avg_rate_gap 已在上方从DB实时获取
+        # exec_rate_fast, exec_rate_slow, avg_rate_gap 已在上方从DB实时获取
         # 统一调整因子: 消除原来三因子(execution_adj × risk_adj × currency_factor)的重复计算
 
         adjustment = self._get_unified_adjustment(
-            exec_rate_7d, exec_rate_30d, avg_rate_gap, base_rate, period, currency
+            exec_rate_fast, exec_rate_slow, avg_rate_gap, base_rate, period, currency
         )
 
         # 应用调整
@@ -456,14 +471,19 @@ class EnsemblePredictor:
             extreme_boost = min(abs_dev - 0.08, 0.20)
             conf_weight = min(conf_weight + extreme_boost, 0.85)
 
-        # 长周期: 锚定点从 current_rate 换为长期均线,减少瞬时波动影响
-        if period >= 60:
-            anchor_rate = float(row_data.get('ma_10080', current_rate))  # 7天MA
-            conf_weight = min(conf_weight + 0.10, 0.90)                 # 模型权重+10%
-        elif period >= 20:
-            anchor_rate = float(row_data.get('ma_4320', current_rate))   # 3天MA
+        # 分层锚定: 长周期偏稳健, 短中周期偏敏感
+        anchor_minutes = profile["anchor_minutes"]
+        if anchor_minutes >= 10080:
+            anchor_rate = float(row_data.get('robust_ma_10080', row_data.get('ma_10080', current_rate)))
+        elif anchor_minutes >= 1440:
+            anchor_rate = float(row_data.get('robust_ma_1440', row_data.get('ma_1440', current_rate)))
+        elif anchor_minutes >= 720:
+            anchor_rate = float(row_data.get('robust_ma_720', row_data.get('ma_720', current_rate)))
         else:
             anchor_rate = current_rate
+
+        if period >= 60:
+            conf_weight = min(conf_weight + 0.10, 0.90)  # 长周期增加模型权重
 
         adjusted_rate = conf_weight * model_rate + (1 - conf_weight) * anchor_rate
 
@@ -504,29 +524,42 @@ class EnsemblePredictor:
             logger.error(f"NaN detected in final_rate for {currency}-{period}, skipping prediction")
             raise ValueError(f"NaN in final_rate for {currency}-{period}")
 
-        # 动态安全边界: 按周期分级,长周期用长期均线减少短期波动
-        ma_1440 = float(row_data.get('ma_1440', current_rate))
+        # 动态安全边界: 分层锚点 + 执行率感知 floor，避免长周期卡死高位
+        ma_720 = float(row_data.get('robust_ma_720', row_data.get('ma_720', current_rate)))
+        ma_1440 = float(row_data.get('robust_ma_1440', row_data.get('ma_1440', ma_720)))
+        ma_10080 = float(row_data.get('robust_ma_10080', row_data.get('ma_10080', ma_1440)))
         if period >= 60:
-            ma_long = float(row_data.get('ma_10080', ma_1440))   # 7天MA, fallback到24h
-            bound_base = 0.8 * ma_long + 0.2 * ma_1440           # current_rate 完全移除
+            bound_base = 0.7 * ma_10080 + 0.3 * ma_1440
         elif period >= 20:
-            ma_mid = float(row_data.get('ma_4320', ma_1440))     # 3天MA
-            bound_base = 0.6 * ma_mid + 0.4 * ma_1440
+            bound_base = 0.6 * ma_1440 + 0.4 * ma_720
         else:
-            bound_base = 0.6 * ma_1440 + 0.4 * current_rate      # 短周期不变
+            bound_base = 0.55 * ma_720 + 0.45 * current_rate
 
         if calibrated_prob > 0.8:
-            min_bound = max(bound_base * 0.50, 0.01)
+            floor_base = 0.50
             max_bound = bound_base * 1.5
             strategy_label = "aggressive"
         elif calibrated_prob > 0.5:
-            min_bound = max(bound_base * 0.60, 0.01)
+            floor_base = 0.60
             max_bound = bound_base * 1.25
             strategy_label = "balanced"
         else:
-            min_bound = max(bound_base * 0.65, 0.01)
+            floor_base = 0.65
             max_bound = bound_base * 1.0
             strategy_label = "conservative"
+
+        if period >= 60:
+            exec_penalty = np.clip((0.35 - exec_rate_fast) / 0.35, 0.0, 1.0) * 0.22
+            trend_penalty = 0.06 if exec_rate_fast < exec_rate_slow * 0.75 else 0.0
+            floor_factor = max(0.35, floor_base - exec_penalty - trend_penalty)
+        elif period >= 20:
+            exec_penalty = np.clip((0.35 - exec_rate_fast) / 0.35, 0.0, 1.0) * 0.12
+            floor_factor = max(0.45, floor_base - exec_penalty)
+        else:
+            exec_penalty = np.clip((0.35 - exec_rate_fast) / 0.35, 0.0, 1.0) * 0.08
+            floor_factor = max(0.50, floor_base - exec_penalty)
+
+        min_bound = max(bound_base * floor_factor, 0.01)
 
         clipped_rate = np.clip(final_rate, min_bound, max_bound)
         was_clipped = (clipped_rate != final_rate)
@@ -548,9 +581,9 @@ class EnsemblePredictor:
             f"adj={adjustment:.4f} model_rate={model_rate:.4f} "
             f"conf_w={conf_weight:.2f} adjusted={adjusted_rate:.4f} "
             f"trend_adj={trend_adjustment:.4f} final={final_rate:.4f} "
-            f"exec_7d={exec_rate_7d:.3f} exec_30d={exec_rate_30d:.3f} "
+            f"exec_fast={exec_rate_fast:.3f}({fast_days}d) exec_slow={exec_rate_slow:.3f}({slow_days}d) "
             f"calib_prob={calibrated_prob:.3f} strategy={strategy_desc} "
-            f"clipped={was_clipped} bounds=[{min_bound:.4f},{max_bound:.4f}]"
+            f"clipped={was_clipped} floor={floor_factor:.3f} bounds=[{min_bound:.4f},{max_bound:.4f}]"
         )
 
         return {
@@ -569,6 +602,10 @@ class EnsemblePredictor:
             "prediction_timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # When prediction was made
             # 新增调试信息
             "execution_rate_7d": exec_rate_7d,
+            "execution_rate_slow": exec_rate_slow,
+            "exec_rate_fast_window_days": fast_days,
+            "exec_rate_slow_window_days": slow_days,
+            "avg_gap_window_days": gap_days,
             "execution_adjustment_applied": adjustment,
             # v2 model info (S1)
             "v2_execution_prob": v2_execution_prob,
@@ -606,7 +643,7 @@ class EnsemblePredictor:
 
         # 周期感知灵敏度 (4级分类)
         if period >= 60:
-            max_up, max_down = 0.45, 0.30    # 长周期: 最高+45%/-30% (v5.1→v5.2: 0.35→0.45, 60/90d仍100%)
+            max_up, max_down = 0.30, 0.30    # 长周期降低上调幅度,防止过冲后崩塌
         elif period >= 20:
             max_up, max_down = 0.28, 0.24    # 中周期(20-59d)
         elif period >= 8:
@@ -636,6 +673,9 @@ class EnsemblePredictor:
 
         # 趋势微调
         trend = exec_rate_7d / (exec_rate_30d + 1e-8)
+        if period >= 60 and exec_rate_7d > 0.7 and trend > 1.2 and adjustment > 1.0:
+            # 长周期在高执行率上行阶段适度抑制过冲
+            adjustment = 1.0 + (adjustment - 1.0) * 0.92
         if trend < 0.8:
             adjustment *= 0.98
         elif trend > 1.2:

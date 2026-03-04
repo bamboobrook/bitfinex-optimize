@@ -25,6 +25,36 @@ class ExecutionValidator:
         """Get database connection"""
         return sqlite3.connect(self.db_path)
 
+    @staticmethod
+    def _get_execution_threshold(period: int) -> float:
+        """Period-aware score threshold: short more sensitive, long more conservative."""
+        if period <= 7:
+            return 38.0
+        if period <= 30:
+            return 43.0
+        return 48.0
+
+    @staticmethod
+    def _get_fill_tolerance(period: int) -> float:
+        """
+        Execution candidate tolerance:
+        close_rate >= predicted_rate * tolerance
+        """
+        if period <= 7:
+            return 0.94
+        if period <= 30:
+            return 0.96
+        return 0.98
+
+    @staticmethod
+    def _get_q40_multiplier(period: int) -> float:
+        """Short periods allow slightly higher relative pricing than long periods."""
+        if period <= 7:
+            return 1.08
+        if period <= 30:
+            return 1.04
+        return 1.00
+
     def validate_pending_orders(self) -> Dict:
         """
         Validate all pending orders
@@ -171,7 +201,7 @@ class ExecutionValidator:
             else:
                 # 使用混合判断策略
                 should_execute, confidence, score_details = self._calculate_hybrid_execution_score(
-                    predicted_rate, market_close_rates
+                    predicted_rate, market_close_rates, int(order['period'])
                 )
 
                 if should_execute:
@@ -181,27 +211,38 @@ class ExecutionValidator:
                     execution_timestamp = None
                     execution_rate = None
 
+                    fill_tolerance = self._get_fill_tolerance(int(order['period']))
+                    q40_multiplier = self._get_q40_multiplier(int(order['period']))
+                    q40_gate = predicted_rate <= score_details['market_percentile_40'] * q40_multiplier
+
+                    execution_candidates = []
                     for timestamp_str, close_rate, high_rate in market_data_timestamped:
-                        if close_rate >= predicted_rate * 0.95:  # Within 5% tolerance
-                            execution_timestamp = timestamp_str
-                            execution_rate = close_rate
-                            break
+                        if close_rate >= predicted_rate * fill_tolerance:
+                            execution_candidates.append((timestamp_str, close_rate, high_rate))
+
+                    if execution_candidates and q40_gate:
+                        execution_timestamp = execution_candidates[0][0]
+                        execution_rate = execution_candidates[0][1]
 
                     if execution_timestamp is None:
-                        execution_timestamp = market_data_timestamped[0][0]
-                        execution_rate = market_data_timestamped[0][1]
+                        executed = False
+                        execution_details = {
+                            'status': 'FAILED',
+                            'execution_confidence': confidence,
+                            **score_details
+                        }
+                    else:
+                        row_time = datetime.fromisoformat(execution_timestamp)
+                        delay_minutes = int((row_time - order_time).total_seconds() / 60)
 
-                    row_time = datetime.fromisoformat(execution_timestamp)
-                    delay_minutes = int((row_time - order_time).total_seconds() / 60)
-
-                    execution_details = {
-                        'status': 'EXECUTED',
-                        'executed_at': execution_timestamp,
-                        'execution_rate': execution_rate,
-                        'execution_delay_minutes': delay_minutes,
-                        'execution_confidence': confidence,
-                        **score_details
-                    }
+                        execution_details = {
+                            'status': 'EXECUTED',
+                            'executed_at': execution_timestamp,
+                            'execution_rate': execution_rate,
+                            'execution_delay_minutes': delay_minutes,
+                            'execution_confidence': confidence,
+                            **score_details
+                        }
                 else:
                     # 订单失败
                     execution_details = {
@@ -231,7 +272,8 @@ class ExecutionValidator:
     def _calculate_hybrid_execution_score(
         self,
         predicted_rate: float,
-        market_close_rates: list
+        market_close_rates: list,
+        period: int
     ) -> tuple:
         """
         混合判断: 分位数 + 利率差距 + 市场密度
@@ -298,8 +340,8 @@ class ExecutionValidator:
         # 综合评分 (0-100)
         total_score = percentile_score + gap_score + density_score
 
-        # 执行阈值: 45分 (微调后更接近目标执行率)
-        should_execute = total_score >= 45
+        threshold = self._get_execution_threshold(period)
+        should_execute = total_score >= threshold
         confidence = total_score / 100
 
         score_details = {
@@ -307,9 +349,11 @@ class ExecutionValidator:
             'gap_score': round(gap_score, 2),
             'density_score': round(density_score, 2),
             'total_score': round(total_score, 2),
+            'execution_threshold': round(threshold, 2),
             'market_percentile_25': percentile_25,
             'market_percentile_30': percentile_30,
             'market_percentile_35': percentile_35,
+            'market_percentile_40': percentile_40,
             'market_median': median,
             'market_min': min_rate,
             'market_max': max_rate,

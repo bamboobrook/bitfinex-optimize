@@ -15,6 +15,104 @@ import os
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 DB_PATH = os.path.join(DB_DIR, "lending_history.db")
 
+
+def get_period_window_profile(period: int, profile_name: Optional[str] = None) -> Dict[str, int]:
+    """
+    Return lookback profile for a lending period.
+
+    Profiles:
+    - balanced: default, stable long-term with responsive short-term
+    - high:     more responsive, more volatile
+    - stable:   more conservative, slower reaction
+    """
+    if profile_name is None:
+        profile_name = os.getenv("WINDOW_PROFILE", "balanced")
+    profile_name = str(profile_name).strip().lower()
+
+    if profile_name == "high":
+        if period <= 7:
+            return {
+                "fast_days": 2,
+                "slow_days": 7,
+                "spread_days": 7,
+                "gap_days": 3,
+                "delay_days": 7,
+                "anchor_minutes": 360,
+            }
+        if period <= 30:
+            return {
+                "fast_days": 5,
+                "slow_days": 21,
+                "spread_days": 21,
+                "gap_days": 7,
+                "delay_days": 14,
+                "anchor_minutes": 720,
+            }
+        return {
+            "fast_days": 14,
+            "slow_days": 60,
+            "spread_days": 60,
+            "gap_days": 14,
+            "delay_days": 30,
+            "anchor_minutes": 4320,
+        }
+
+    if profile_name == "stable":
+        if period <= 7:
+            return {
+                "fast_days": 5,
+                "slow_days": 21,
+                "spread_days": 21,
+                "gap_days": 7,
+                "delay_days": 14,
+                "anchor_minutes": 720,
+            }
+        if period <= 30:
+            return {
+                "fast_days": 10,
+                "slow_days": 45,
+                "spread_days": 45,
+                "gap_days": 14,
+                "delay_days": 30,
+                "anchor_minutes": 1440,
+            }
+        return {
+            "fast_days": 30,
+            "slow_days": 120,
+            "spread_days": 120,
+            "gap_days": 30,
+            "delay_days": 60,
+            "anchor_minutes": 10080,
+        }
+
+    # Default balanced profile
+    if period <= 7:
+        return {
+            "fast_days": 3,
+            "slow_days": 14,
+            "spread_days": 14,
+            "gap_days": 7,
+            "delay_days": 7,
+            "anchor_minutes": 720,
+        }
+    if period <= 30:
+        return {
+            "fast_days": 7,
+            "slow_days": 30,
+            "spread_days": 30,
+            "gap_days": 14,
+            "delay_days": 14,
+            "anchor_minutes": 1440,
+        }
+    return {
+        "fast_days": 21,
+        "slow_days": 90,
+        "spread_days": 90,
+        "gap_days": 30,
+        "delay_days": 30,
+        "anchor_minutes": 10080,
+    }
+
 class ExecutionFeatures:
     """Calculates execution feedback features"""
 
@@ -25,6 +123,11 @@ class ExecutionFeatures:
     def _get_connection(self):
         """Get database connection"""
         return sqlite3.connect(self.db_path)
+
+    @staticmethod
+    def get_period_window_profile(period: int, profile_name: Optional[str] = None) -> Dict[str, int]:
+        """Expose period window profile for other modules."""
+        return get_period_window_profile(period, profile_name)
 
     def calculate_execution_rate(self, currency: str, period: int,
                                  lookback_days: int,
@@ -238,30 +341,42 @@ class ExecutionFeatures:
         Returns:
             Dictionary with all execution features
         """
+        profile = get_period_window_profile(period)
+        fast_days = profile["fast_days"]
+        slow_days = profile["slow_days"]
+        spread_days = profile["spread_days"]
+        gap_days = profile["gap_days"]
+        delay_days = profile["delay_days"]
+
+        exec_rate_fast = self.calculate_execution_rate(currency, period, fast_days)
+        exec_rate_slow = self.calculate_execution_rate(currency, period, slow_days)
+        avg_spread_profile = self.calculate_avg_spread(currency, period, spread_days)
+        avg_gap_profile = self.calculate_avg_rate_gap(currency, period, gap_days)
+
         features = {
-            # Execution rates
-            'exec_rate_7d': self.calculate_execution_rate(currency, period, 7),
-            'exec_rate_30d': self.calculate_execution_rate(currency, period, 30),
+            # Profile-aware primary fields
+            'exec_rate_fast': exec_rate_fast,
+            'exec_rate_slow': exec_rate_slow,
+            'avg_spread_profile': avg_spread_profile,
+            'avg_rate_gap_failed_profile': avg_gap_profile,
+            'exec_delay_p50': self.calculate_execution_delay_percentile(currency, period, delay_days, 0.5),
+            'exec_delay_p90': self.calculate_execution_delay_percentile(currency, period, delay_days, 0.9),
 
-            # Spreads (executed orders)
-            'avg_spread_7d': self.calculate_avg_spread(currency, period, 7),
-            'avg_spread_30d': self.calculate_avg_spread(currency, period, 30),
-
-            # Rate gaps (failed orders)
-            'avg_rate_gap_failed_7d': self.calculate_avg_rate_gap(currency, period, 7),
-            'avg_rate_gap_failed_30d': self.calculate_avg_rate_gap(currency, period, 30),
-
-            # Execution delays
-            'exec_delay_p50': self.calculate_execution_delay_percentile(currency, period, 7, 0.5),
-            'exec_delay_p90': self.calculate_execution_delay_percentile(currency, period, 7, 0.9),
+            # Backward-compatible aliases
+            'exec_rate_7d': exec_rate_fast,
+            'exec_rate_30d': exec_rate_slow,
+            'avg_spread_7d': avg_spread_profile,
+            'avg_spread_30d': self.calculate_avg_spread(currency, period, slow_days),
+            'avg_rate_gap_failed_7d': avg_gap_profile,
+            'avg_rate_gap_failed_30d': self.calculate_avg_rate_gap(currency, period, slow_days),
         }
 
         # Derived features
-        features['exec_rate_trend'] = features['exec_rate_7d'] / (features['exec_rate_30d'] + 1e-8)
-        features['rate_gap_trend'] = features['avg_rate_gap_failed_7d']
+        features['exec_rate_trend'] = features['exec_rate_fast'] / (features['exec_rate_slow'] + 1e-8)
+        features['rate_gap_trend'] = features['avg_rate_gap_failed_profile']
 
         # Risk adjustment factor — 对称化: 3级下调 + 3级上调, [0.5, 0.6] 为中性区间
-        exec_r = features['exec_rate_7d']
+        exec_r = features['exec_rate_fast']
         if exec_r < 0.3:
             features['risk_adjustment_factor'] = 0.90
         elif exec_r < 0.4:
