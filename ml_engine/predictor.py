@@ -83,6 +83,12 @@ class EnsemblePredictor:
         if os.path.exists(xgb_path):
             models['xgb'] = xgb.Booster()
             models['xgb'].load_model(xgb_path)
+            # Avoid mutating shared booster params during threaded inference.
+            # Configure once at load time to reduce runtime races.
+            try:
+                models['xgb'].set_param({'nthread': self.infer_threads})
+            except Exception as e:
+                logger.warning(f"Unable to set xgb nthread for {currency}_{prefix}: {e}")
 
         # 加载LightGBM
         lgb_path = os.path.join(self.model_dir, f"{currency}_{prefix}_lgb.txt")
@@ -190,10 +196,6 @@ class EnsemblePredictor:
 
         # XGBoost预测
         if 'xgb' in models:
-            try:
-                models['xgb'].set_param({'nthread': self.infer_threads})
-            except Exception:
-                pass
             dtest = xgb.DMatrix(X)
             predictions['xgb'] = models['xgb'].predict(dtest)
 
