@@ -825,6 +825,18 @@ class EnsemblePredictor:
             gap_penalty = min(avg_gap / (base_rate + 1e-8), 0.12)
             adjustment *= (1.0 - gap_penalty)
 
+        # ========== 阶段3修复: 激进下调当执行率低于30% ==========
+        # 当执行率极低时，启用指数衰减加速响应
+        if exec_rate_7d < 0.30 and exec_rate_7d > 0:
+            # 激进模式：使用指数衰减，exec_rate=0.16时得到约0.73的因子
+            emergency_factor = (exec_rate_7d / 0.30) ** 0.5
+            # 混合激进因子和当前调整值
+            adjustment = min(adjustment, 0.70 * emergency_factor + 0.30 * adjustment)
+
+        # 长周期额外敏感：60天以上且执行率<40%时额外降价8%
+        if period >= 60 and exec_rate_7d < 0.40 and exec_rate_7d > 0:
+            adjustment *= 0.92
+
         # 趋势微调
         trend = exec_rate_7d / (exec_rate_30d + 1e-8)
         if period >= 60 and exec_rate_7d > 0.7 and trend > 1.2 and adjustment > 1.0:

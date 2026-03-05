@@ -46,14 +46,64 @@ class ExecutionValidator:
         finally:
             conn.close()
 
-    @staticmethod
-    def _get_execution_threshold(period: int) -> float:
-        """Period-aware score threshold: short more sensitive, long more conservative."""
+    def _get_recent_validation_count(self, period: int, hours: int = 4) -> int:
+        """
+        获取最近 N 小时内指定周期的验证数量，作为市场活跃度指标。
+
+        Args:
+            period: 周期天数
+            hours: 回看小时数，默认4小时
+
+        Returns:
+            验证数量
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            # 查找包含该周期的订单在最近N小时的验证记录
+            cursor.execute("""
+                SELECT COUNT(DISTINCT o.id)
+                FROM virtual_orders o
+                WHERE o.period = ?
+                  AND o.currency LIKE ?
+                  AND o.validated_at IS NOT NULL
+                  AND o.validated_at >= datetime('now', '-' || ? || ' hours')
+            """, (period, f'%{period}', hours))
+            result = cursor.fetchone()
+            return result[0] if result else 0
+        finally:
+            conn.close()
+
+    def _get_execution_threshold(self, period: int, currency: str = 'fUSD') -> float:
+        """
+        自适应阈值：市场不活跃时自动放宽。
+
+        Period-aware score threshold: short more sensitive, long more conservative.
+        When market is inactive (low validation count), thresholds are relaxed.
+        """
+        # 基础阈值
         if period <= 7:
-            return 38.0
-        if period <= 30:
-            return 43.0
-        return 48.0
+            base = 38.0
+        elif period <= 30:
+            base = 43.0
+        else:
+            base = 48.0
+
+        # 获取最近验证数量作为市场活跃度指标
+        recent_count = self._get_recent_validation_count(period, hours=4)
+
+        # 市场不活跃时放宽阈值
+        if recent_count < 5:
+            # 过去4小时验证少于5条：放宽25%
+            return base * 0.75
+        elif recent_count < 10:
+            # 过去4小时验证少于10条：放宽15%
+            return base * 0.85
+        elif recent_count < 20:
+            # 过去4小时验证少于20条：放宽10%
+            return base * 0.92
+
+        return base
 
     @staticmethod
     def _get_fill_tolerance(period: int) -> float:
@@ -100,6 +150,13 @@ class ExecutionValidator:
             conn.close()  # Close before processing
 
             print(f"Found {len(pending_orders)} pending orders to validate")
+
+            # ========== 阶段4修复: 长周期/高利率优先 ==========
+            # 按周期降序、预测利率降序排序，让长周期高利率订单优先验证
+            pending_orders.sort(key=lambda x: (
+                -x.get('period', 0),        # 周期越长越优先
+                -x.get('predicted_rate', 0) # 利率越高越优先
+            ), reverse=False)
 
             executed_count = 0
             failed_count = 0
@@ -224,7 +281,7 @@ class ExecutionValidator:
             else:
                 # 使用混合判断策略
                 should_execute, confidence, score_details = self._calculate_hybrid_execution_score(
-                    predicted_rate, market_close_rates, int(order['period'])
+                    predicted_rate, market_close_rates, int(order['period']), order['currency']
                 )
                 follow_error_at_order = predicted_rate - score_details['market_median']
 
@@ -308,7 +365,8 @@ class ExecutionValidator:
         self,
         predicted_rate: float,
         market_close_rates: list,
-        period: int
+        period: int,
+        currency: str = 'fUSD'
     ) -> tuple:
         """
         混合判断: 分位数 + 利率差距 + 市场密度
@@ -375,7 +433,7 @@ class ExecutionValidator:
         # 综合评分 (0-100)
         total_score = percentile_score + gap_score + density_score
 
-        threshold = self._get_execution_threshold(period)
+        threshold = self._get_execution_threshold(period, currency)
         should_execute = total_score >= threshold
         confidence = total_score / 100
 
