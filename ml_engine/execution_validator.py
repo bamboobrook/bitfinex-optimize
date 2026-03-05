@@ -62,7 +62,7 @@ class ExecutionValidator:
         try:
             # 查找包含该周期的订单在最近N小时的验证记录
             cursor.execute("""
-                SELECT COUNT(DISTINCT o.id)
+                SELECT COUNT(DISTINCT o.order_id)
                 FROM virtual_orders o
                 WHERE o.period = ?
                   AND o.currency LIKE ?
