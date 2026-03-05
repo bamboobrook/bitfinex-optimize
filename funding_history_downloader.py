@@ -103,58 +103,68 @@ class BitfinexDataDownloader:
     def check_existing_data(self, currency: str, period: int, start_ts: int, end_ts: int) -> tuple:
         """
         检查数据库中已有的数据范围
-        
+
         Returns:
             (start_ts, end_ts): 需要下载的时间范围
         """
+        now_ms = int(datetime.now().timestamp() * 1000)
+
         try:
+            # 首先检查最新一条数据的完整信息（不受查询范围限制）
+            self.cursor.execute(
+                "SELECT MAX(timestamp) FROM funding_rates WHERE currency = ? AND period = ?",
+                (currency, period)
+            )
+            result = self.cursor.fetchone()
+            latest_existing_ts = result[0] if result and result[0] else None
+
+            # 诊断日志：显示当前最新数据时间
+            if latest_existing_ts:
+                latest_dt = datetime.fromtimestamp(latest_existing_ts / 1000)
+                age_minutes = (now_ms - latest_existing_ts) / 60000
+                logger.info(f"    🔍 DB latest: {latest_dt.strftime('%Y-%m-%d %H:%M')} (age: {age_minutes:.0f} min)")
+            else:
+                logger.info(f"    🔍 No data in DB for {currency} period={period}")
+
+            # 计算查询范围内已有的数据
             query = '''
-            SELECT MIN(timestamp), MAX(timestamp) 
-            FROM funding_rates 
+            SELECT MIN(timestamp), MAX(timestamp)
+            FROM funding_rates
             WHERE currency = ? AND period = ?
             AND timestamp >= ? AND timestamp <= ?
             '''
             self.cursor.execute(query, (currency, period, start_ts, end_ts))
-            result = self.cursor.fetchone()
-            
-            if result and result[0] and result[1]:
-                existing_start, existing_end = result[0], result[1]
-                logger.info(f"    Existing data: {datetime.fromtimestamp(existing_start/1000)} to {datetime.fromtimestamp(existing_end/1000)}")
+            range_result = self.cursor.fetchone()
 
-                # 如果整个时间段都有数据，返回None表示不需要下载
-                if existing_start <= start_ts and existing_end >= end_ts:
-                    logger.info(f"    All data already exists in database")
-                    return None
+            # 修复方案B: 简化逻辑 - 如果最新数据过期(>2小时)，直接强制刷新最近7天
+            freshness_threshold_ms = 2 * 3600 * 1000  # 2小时
 
-                # 计算缺失的时间段
-                missing_ranges = []
-                if existing_start > start_ts:
-                    missing_ranges.append((start_ts, existing_start - 60000))  # 减去1分钟避免重叠
-                if existing_end < end_ts:
-                    missing_ranges.append((existing_end + 60000, end_ts))  # 加上1分钟避免重叠
+            if latest_existing_ts and (now_ms - latest_existing_ts) <= freshness_threshold_ms:
+                # 数据是新鲜的，检查范围覆盖
+                if range_result and range_result[0] and range_result[1]:
+                    existing_start, existing_end = range_result[0], range_result[1]
+                    logger.info(f"    Existing data in range: {datetime.fromtimestamp(existing_start/1000)} to {datetime.fromtimestamp(existing_end/1000)}")
 
-                # P7A: 尾部新鲜度检查 — 即使 existing_end 接近 end_ts,
-                # 如果最新数据距现在超过2小时,强制补充最近数据
-                freshness_threshold_ms = 2 * 3600 * 1000  # 2小时
-                now_ms = int(datetime.now().timestamp() * 1000)
-                if (now_ms - existing_end) > freshness_threshold_ms:
-                    tail_range = (existing_end + 60000, end_ts)
-                    # 避免重复添加
-                    if not missing_ranges or missing_ranges[-1] != tail_range:
-                        # 检查是否已经包含了这段范围
-                        already_covered = any(
-                            s <= existing_end + 60000 and e >= end_ts
-                            for s, e in missing_ranges
-                        )
-                        if not already_covered:
-                            missing_ranges.append(tail_range)
-                            logger.info(f"    Tail freshness: data is {(now_ms - existing_end)/3600000:.1f}h old, adding refresh range")
+                    if existing_start <= start_ts and existing_end >= end_ts:
+                        logger.info(f"    ✅ All data already exists and is fresh")
+                        return None
 
-                return missing_ranges if missing_ranges else None
+                    # 计算缺失范围
+                    missing_ranges = []
+                    if existing_start > start_ts:
+                        missing_ranges.append((start_ts, existing_start - 60000))
+                    if existing_end < end_ts:
+                        missing_ranges.append((existing_end + 60000, end_ts))
+
+                    return missing_ranges if missing_ranges else None
+                else:
+                    # 范围外有新数据，但范围内没有
+                    return [(start_ts, end_ts)]
             else:
-                logger.info(f"    No existing data found")
+                # 数据过期或不存在 - 强制刷新
+                logger.warning(f"    ⚠️ Data is stale (age > 2h), forcing refresh of last 7 days")
                 return [(start_ts, end_ts)]
-                
+
         except Exception as e:
             logger.info(f"    Error checking existing data: {e}")
             return [(start_ts, end_ts)]
@@ -167,7 +177,7 @@ class BitfinexDataDownloader:
         try:
             # 准备插入语句
             insert_sql = '''
-            INSERT OR IGNORE INTO funding_rates 
+            INSERT OR REPLACE INTO funding_rates 
             (currency, period, timestamp, datetime, open_rate, close_rate, high_rate, low_rate, volume,
              open_annual, close_annual, high_annual, low_annual, high_rate_flag,
              hour, minute, day_of_week, month, year_month, candle_size)
@@ -569,22 +579,26 @@ class BitfinexDataDownloader:
 
 def main():
     """主函数"""
+    import argparse
+    parser = argparse.ArgumentParser(description='Bitfinex Data Downloader')
+    parser.add_argument('--days', type=int, default=1200, help='Number of days of history to download')
+    args = parser.parse_args()
+
     logger.info("=" * 60)
     logger.info("📊 Bitfinex Data Downloader")
     logger.info("=" * 60)
-    
+
     downloader = BitfinexDataDownloader(
         db_path='/home/bumblebee/Project/optimize/data/lending_history.db',
         max_retries=3,
         rate_limit_delay=2.5
     )
-    
+
     # 完整配置
     currencies = ['fUST', 'fUSD']
     periods = [2,3,4,5,6,7,10,14,15,20,30,60,90,120]
-    days = 1200
-    
-    downloader.download_multiple(currencies, periods, days)
+
+    downloader.download_multiple(currencies, periods, args.days)
     
 def check_database():
     try:

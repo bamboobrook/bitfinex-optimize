@@ -601,7 +601,7 @@ def run_all_validation_tests():
 # --- 核心逻辑: 完整更新流水线 (每2小时运行) - 闭环优化版 ---
 
 # Subprocess timeout constants
-TIMEOUT_DOWNLOAD = 600    # 10 minutes
+TIMEOUT_DOWNLOAD = 1200   # 20 minutes
 TIMEOUT_TRAIN = 3600      # 1 hour
 TIMEOUT_PREDICT = 300     # 5 minutes
 TIMEOUT_VALIDATE = 300    # 5 minutes
@@ -629,6 +629,34 @@ def _build_subprocess_env():
     env.setdefault("PREDICT_INFER_THREADS", str(min(cpu_threads, 24)))
     env.setdefault("CUDA_VISIBLE_DEVICES", "0")
     return env
+
+
+def _check_db_data_freshness(max_age_minutes: int = 240) -> bool:
+    """Check if funding_rates table has data newer than max_age_minutes. Returns True if fresh."""
+    try:
+        import sqlite3 as _sqlite3
+        db_path = str(BASE_DIR / "data" / "lending_history.db")
+        conn = _sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(timestamp) FROM funding_rates")
+        row = cursor.fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return False
+        latest_ts = row[0]
+        if isinstance(latest_ts, str):
+            from datetime import datetime as _dt
+            try:
+                latest_dt = _dt.fromisoformat(latest_ts)
+            except ValueError:
+                latest_dt = _dt.strptime(latest_ts, '%Y-%m-%d %H:%M:%S')
+        else:
+            latest_dt = latest_ts
+        age_minutes = (datetime.now() - latest_dt).total_seconds() / 60
+        return age_minutes <= max_age_minutes
+    except Exception as e:
+        logger.warning(f"_check_db_data_freshness error: {e}")
+        return False
 
 
 async def _run_subprocess_with_timeout(cmd, cwd, timeout, step_name):
@@ -704,7 +732,7 @@ async def run_full_pipeline():
 
         try:
             stdout, stderr, rc = await _run_subprocess_with_timeout(
-                ["python", "-m", "funding_history_downloader"],
+                ["python", "-m", "funding_history_downloader", "--days", "30"],
                 BASE_DIR, TIMEOUT_DOWNLOAD, "Data Download"
             )
 
@@ -714,18 +742,26 @@ async def run_full_pipeline():
                 logger.warning(f"Download stderr:\n{stderr[-500:]}")
 
             if rc != 0:
-                # B1 FIX: Data download failure is CRITICAL - abort pipeline
-                logger.error(f"❌ Data download FAILED (exit code {rc}), aborting pipeline")
-                update_status("error", "2. Downloading Data", f"Download failed (exit code {rc})")
-                return
+                logger.warning(f"⚠️  Data download returned non-zero (exit code {rc}), checking data freshness...")
+                data_age_ok = _check_db_data_freshness(max_age_minutes=240)
+                if data_age_ok:
+                    logger.info("✅ Existing DB data is fresh enough (<4h), continuing pipeline despite download issue")
+                else:
+                    logger.error(f"❌ Data download FAILED and DB data is stale, aborting pipeline")
+                    update_status("error", "2. Downloading Data", f"Download failed and data is stale")
+                    return
 
             logger.info(f"✅ Market data download completed")
 
         except Exception as e:
-            # B1 FIX: Data download failure is CRITICAL - abort pipeline
-            logger.error(f"❌ Data download system error: {e}, aborting pipeline")
-            update_status("error", "2. Downloading Data", str(e))
-            return
+            logger.warning(f"⚠️  Data download system error: {e}, checking data freshness...")
+            data_age_ok = _check_db_data_freshness(max_age_minutes=240)
+            if data_age_ok:
+                logger.info("✅ Existing DB data is fresh enough (<4h), continuing pipeline despite download error")
+            else:
+                logger.error(f"❌ Data download system error and DB data is stale, aborting pipeline")
+                update_status("error", "2. Downloading Data", str(e))
+                return
         # ====================================================================
 
         # ========== STEP 3: 检查是否需要重训练 (闭环核心) ==========

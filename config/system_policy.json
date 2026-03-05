@@ -1,26 +1,28 @@
 {
-  "policy_version": "2026.03.auto.v1",
+  "policy_version": "2026.03.self-adaptive.v2",
   "automation": {
     "stale_data_warn_minutes": 60,
     "stale_data_hard_minutes": 120,
     "refresh_probe_lookback_hours": 24,
     "refresh_probe_min_validations": 1,
-    "refresh_probe_trigger_cycles": 6,
+    "refresh_probe_trigger_cycles": 3,
     "refresh_probe_max_per_cycle": 4
   },
   "period_policy": {
     "step_caps_pct": {
+      "60": 0.08,
+      "90": 0.06,
       "120": 0.05
     },
     "p120_order_share": "current_ratio",
     "p120_stability_mode": "strong"
   },
   "retrain_trigger": {
-    "score_threshold": 1.0,
+    "score_threshold": 0.5,
     "follow_mae_ratio_threshold": 0.65,
     "direction_match_threshold": 0.4,
     "p120_step_p95_threshold": 0.05,
-    "global_exec_low": 0.4,
+    "global_exec_low": 0.30,
     "global_exec_high": 0.6
   }
 }

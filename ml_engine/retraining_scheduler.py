@@ -199,7 +199,7 @@ class RetrainingScheduler:
         anomalies = []
         for currency, period, total, executed in rows:
             # P5: 按周期区分 min_orders 阈值,与 execution_features.py 一致
-            required_min = 5 if period >= 60 else 10
+            required_min = 3 if period >= 60 else 5
             if total < required_min:
                 continue
 
@@ -368,10 +368,26 @@ class RetrainingScheduler:
         print("\n判断结果:")
         th = self._trigger_thresholds()
 
-        # 定期重训练 — use timedelta for precise comparison
-        if time_since_last >= timedelta(days=7) and new_orders >= 500:
+        # 定期重训练 — 双路径: 超时强制 或 常规积累
+        if time_since_last >= timedelta(days=14) and new_orders >= 20:
+            reason = f"超时强制重训练 (距上次{days_since_last}天, 新增{new_orders}条)"
+            print(f"✅ 需要重训练: {reason}")
+            return True, reason
+        if time_since_last >= timedelta(days=7) and new_orders >= 100:
             reason = f"定期重训练 (距上次{days_since_last}天, 新增{new_orders}条数据)"
             print(f"✅ 需要重训练: {reason}")
+            return True, reason
+
+        # 简单直接触发: 全局成交率严重异常 (优先于多信号score，不依赖样本积累)
+        exec_low = th.get("global_exec_low", 0.30)
+        exec_high = th.get("global_exec_high", 0.60)
+        if exec_rate_7d < exec_low:
+            reason = f"全局成交率过低 ({exec_rate_7d:.2%} < {exec_low:.0%}), 紧急重训练"
+            print(f"⚠️  需要重训练: {reason}")
+            return True, reason
+        if exec_rate_7d > exec_high:
+            reason = f"全局成交率过高 ({exec_rate_7d:.2%} > {exec_high:.0%}), 紧急重训练"
+            print(f"⚠️  需要重训练: {reason}")
             return True, reason
 
         # Multi-signal trigger score (execution + follow + stability + per-period anomalies).
@@ -442,10 +458,19 @@ class RetrainingScheduler:
                 print(f"⚠️  需要重训练: {reason}")
                 return True, reason
 
+        # 2天短窗口: 检测急剧崩溃（避免7天窗口稀释0%信号）
+        short_anomalies = self.get_per_period_execution_anomalies(days=2)
+        zero_rate_2d = [a for a in short_anomalies if a['exec_rate'] == 0.0 and a['total'] >= 2]
+        if zero_rate_2d:
+            details = ", ".join(f"{a['currency']}-{a['period']}d" for a in zero_rate_2d)
+            reason = f"2天内执行率归零 ({details}), 紧急重训练"
+            print(f"⚠️  需要重训练: {reason}")
+            return True, reason
+
         # 不需要重训练
         print(f"❌ 暂不需要重训练")
         print(f"   - 距上次训练: {days_since_last} 天 (需要 >= 7天)")
-        print(f"   - 新增数据: {new_orders} 条 (需要 >= 500条)")
+        print(f"   - 新增数据: {new_orders} 条 (需要 >= 100条)")
         print(
             f"   - 全局成交率: {exec_rate_7d:.2%} "
             f"(正常范围: {th['global_exec_low']:.0%}-{th['global_exec_high']:.0%})"
