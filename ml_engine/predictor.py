@@ -317,9 +317,15 @@ class EnsemblePredictor:
     def _policy_value(self, section: str, key: str, default):
         return self.policy.get(section, {}).get(key, default)
 
-    def _freshness_thresholds_minutes(self) -> Tuple[float, float]:
+    def _freshness_thresholds_minutes(self, currency: str = "") -> Tuple[float, float]:
         warn_minutes = float(self._policy_value("automation", "stale_data_warn_minutes", 60))
         hard_minutes = float(self._policy_value("automation", "stale_data_hard_minutes", 120))
+        # fUST has naturally sparse market data (often 4-24h gaps) - use a per-currency override
+        if currency:
+            per_cur_key = f"stale_data_hard_minutes_{currency}"
+            per_cur_hard = self._policy_value("automation", per_cur_key, None)
+            if per_cur_hard is not None:
+                hard_minutes = float(per_cur_hard)
         if hard_minutes <= warn_minutes:
             hard_minutes = warn_minutes + 30.0
         return warn_minutes, hard_minutes
@@ -369,7 +375,7 @@ class EnsemblePredictor:
         period = int(row_data['period'])
         current_rate_db, data_timestamp = self.get_latest_rate_from_db(currency, period)
 
-        warn_minutes, hard_minutes = self._freshness_thresholds_minutes()
+        warn_minutes, hard_minutes = self._freshness_thresholds_minutes(currency)
 
         # Use DB rate if available, fallback to feature data
         if current_rate_db is not None:

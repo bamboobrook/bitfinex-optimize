@@ -1,8 +1,9 @@
 {
-  "policy_version": "2026.03.self-adaptive.v2",
+  "policy_version": "2026.03.self-adaptive.v3",
   "automation": {
     "stale_data_warn_minutes": 60,
     "stale_data_hard_minutes": 120,
+    "stale_data_hard_minutes_fUST": 720,
     "refresh_probe_lookback_hours": 24,
     "refresh_probe_min_validations": 1,
     "refresh_probe_trigger_cycles": 3,
