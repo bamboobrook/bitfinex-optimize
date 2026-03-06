@@ -953,11 +953,11 @@ class EnsemblePredictor:
         # Revenue-optimized scoring: 收益率优先,兼顾成交和长周期
         def calculate_weighted_score(pred):
             """
-            收益率优先评分 (v3):
-            - 30% raw_rate (高利率偏好,直接反映收益能力)
-            - 25% effective_rate (rate * prob - 期望收益)
+            收益率优先评分 (v4):
+            - 40% effective_rate (rate * prob - 期望收益,同时体现利率和成交概率)
+            - 30% raw_rate (高利率偏好)
             - 20% exec_prob (成交保障)
-            - 25% revenue_factor (period_days/120 - 长周期收益)
+            - 10% revenue_factor (period_days/120 - 长周期仅作微调)
             + execution floor: exec_prob < 0.35 gets 0.4x penalty (仅极低概率才惩罚)
             """
             prob = pred['execution_probability']
@@ -976,12 +976,12 @@ class EnsemblePredictor:
             # 4. Execution floor: 仅在极低概率时惩罚
             exec_floor_multiplier = 0.4 if prob < 0.35 else 1.0
 
-            # 5. 最终分数 = 30%原始利率 + 25%有效利率 + 20%执行概率 + 25%周期收益
+            # 5. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
             final_score = (
+                effective_rate * 0.40 +
                 normalized_rate * 0.30 +
-                effective_rate * 0.25 +
                 prob * 0.20 +
-                revenue_factor * 0.25
+                revenue_factor * 0.10
             ) * exec_floor_multiplier
 
             return final_score
