@@ -617,6 +617,17 @@ class EnsemblePredictor:
         if period >= 60:
             conf_weight = min(conf_weight + 0.10, 0.90)  # 长周期增加模型权重
 
+        # 锚点覆盖保护: 调整因子明确下调(adj<0.90)而锚点仍远高于当前市场时，
+        # 将锚点上限设为 max(model_rate×1.1, current_rate×1.5)，
+        # 防止历史高位 MA 逆向拉升、抵消执行率反馈的纠偏效果
+        if adjustment < 0.90 and anchor_rate > current_rate * 2.0 and current_rate > 0:
+            capped_anchor = min(anchor_rate, max(model_rate * 1.1, current_rate * 1.5))
+            logger.debug(
+                f"Anchor capped {currency}-{period}: {anchor_rate:.4f}->{capped_anchor:.4f} "
+                f"(adj={adjustment:.3f} current={current_rate:.4f})"
+            )
+            anchor_rate = capped_anchor
+
         adjusted_rate = conf_weight * model_rate + (1 - conf_weight) * anchor_rate
 
         # S1: v2 revenue_optimized 模型已禁用混合

@@ -653,7 +653,12 @@ def _check_db_data_freshness(fUSD_max: int = 240, fUST_max: int = 1440) -> bool:
                 except ValueError:
                     latest_dt = _dt.strptime(latest_ts, '%Y-%m-%d %H:%M:%S')
             elif isinstance(latest_ts, (int, float)):
-                latest_dt = _dt.fromtimestamp(latest_ts)
+                # funding_rates timestamps may be stored as milliseconds (13-digit)
+                # vs seconds (10-digit); detect by magnitude
+                if latest_ts > 1e10:
+                    latest_dt = _dt.fromtimestamp(latest_ts / 1000)
+                else:
+                    latest_dt = _dt.fromtimestamp(latest_ts)
             else:
                 latest_dt = latest_ts
             age_minutes = (datetime.now() - latest_dt).total_seconds() / 60
