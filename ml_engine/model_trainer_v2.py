@@ -370,14 +370,28 @@ class EnhancedModelTrainer:
 
         print(f"有效样本: {len(valid_df):,}")
 
-        # S4: 计算时间衰减权重 (半衰期30天)
+        # S4: 计算时间衰减权重 (动态半衰期：高波动→短半衰期，低波动→长半衰期)
         sample_weights = None
         if 'datetime' in valid_df.columns:
             try:
                 now = pd.Timestamp.now()
                 dt_series = pd.to_datetime(valid_df['datetime'])
                 days_ago = (now - dt_series).dt.total_seconds() / 86400.0
-                sample_weights = np.power(0.5, days_ago / 30.0)  # 30天半衰期
+
+                # 动态半衰期：基于近30天与整体的波动率比
+                half_life_days = 30.0  # 默认
+                recent_mask = days_ago <= 30
+                if recent_mask.sum() > 10 and 'base_rate' in valid_df.columns and valid_df['base_rate'].std() > 1e-6:
+                    recent_std = valid_df.loc[recent_mask, 'base_rate'].std()
+                    overall_std = valid_df['base_rate'].std()
+                    volatility_ratio = recent_std / (overall_std + 1e-8)
+                    # 高波动 → 短半衰期（更关注近期）；低波动 → 长半衰期（历史更有参考价值）
+                    half_life_days = 30.0 / (1.0 + volatility_ratio)
+                    print(f"动态时间衰减: 波动率比={volatility_ratio:.3f}, 半衰期={half_life_days:.1f}天")
+
+                sample_weights = np.power(0.5, days_ago / half_life_days)
+                # 防止超古老样本权重完全为零（数值稳定性）
+                sample_weights = np.maximum(sample_weights, 0.05)
                 sample_weights = sample_weights.values
                 print(f"时间衰减权重: min={sample_weights.min():.4f}, max={sample_weights.max():.4f}, mean={sample_weights.mean():.4f}")
             except Exception as e:

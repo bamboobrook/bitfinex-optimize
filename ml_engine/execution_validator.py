@@ -46,12 +46,13 @@ class ExecutionValidator:
         finally:
             conn.close()
 
-    def _get_recent_validation_count(self, period: int, hours: int = 4) -> int:
+    def _get_recent_validation_count(self, period: int, currency: str, hours: int = 4) -> int:
         """
-        获取最近 N 小时内指定周期的验证数量，作为市场活跃度指标。
+        获取最近 N 小时内指定周期和货币的验证数量，作为市场活跃度指标。
 
         Args:
             period: 周期天数
+            currency: 货币 (fUSD/fUST)
             hours: 回看小时数，默认4小时
 
         Returns:
@@ -60,15 +61,14 @@ class ExecutionValidator:
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
-            # 查找包含该周期的订单在最近N小时的验证记录
             cursor.execute("""
                 SELECT COUNT(DISTINCT o.order_id)
                 FROM virtual_orders o
                 WHERE o.period = ?
-                  AND o.currency LIKE ?
+                  AND o.currency = ?
                   AND o.validated_at IS NOT NULL
                   AND o.validated_at >= datetime('now', '-' || ? || ' hours')
-            """, (period, f'%{period}', hours))
+            """, (period, currency, hours))
             result = cursor.fetchone()
             return result[0] if result else 0
         finally:
@@ -90,7 +90,7 @@ class ExecutionValidator:
             base = 48.0
 
         # 获取最近验证数量作为市场活跃度指标
-        recent_count = self._get_recent_validation_count(period, hours=4)
+        recent_count = self._get_recent_validation_count(period, currency, hours=4)
 
         # 市场不活跃时放宽阈值
         if recent_count < 5:
@@ -156,7 +156,7 @@ class ExecutionValidator:
             pending_orders.sort(key=lambda x: (
                 -x.get('period', 0),        # 周期越长越优先
                 -x.get('predicted_rate', 0) # 利率越高越优先
-            ), reverse=False)
+            ))
 
             executed_count = 0
             failed_count = 0
@@ -390,20 +390,16 @@ class ExecutionValidator:
         min_rate = np.min(market_close_rates)
         max_rate = np.max(market_close_rates)
 
-        # 1. 分位数得分 (0-40分)
+        # 1. 分位数得分 (0-40分) — 线性衰减，比阶梯式更平滑
         # 预测利率在市场分位数中的位置，越低分数越高
         if predicted_rate <= percentile_25:
-            percentile_score = 40
-        elif predicted_rate <= percentile_30:
-            percentile_score = 35
-        elif predicted_rate <= percentile_35:
-            percentile_score = 28
-        elif predicted_rate <= percentile_40:
-            percentile_score = 20
+            percentile_score = 40.0
         elif predicted_rate <= median:
-            percentile_score = 10
+            # 线性从 40 分(在P25) 衰减到 0 分(在median)
+            ratio = (median - predicted_rate) / (median - percentile_25 + 1e-8)
+            percentile_score = 40.0 * ratio
         else:
-            percentile_score = 0
+            percentile_score = 0.0
 
         # 2. 利率差距得分 (0-30分)
         # 预测利率越接近市场最低值，得分越高

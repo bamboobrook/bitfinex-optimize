@@ -189,7 +189,7 @@ class OrderManager:
             query = """
                 SELECT * FROM virtual_orders
                 WHERE status = 'PENDING'
-                  AND datetime(order_timestamp, '+' || validation_window_hours || ' hours') <= datetime(?)
+                  AND datetime(created_at, '+' || validation_window_hours || ' hours') <= datetime(?)
                 ORDER BY order_timestamp ASC
             """
             cursor.execute(query, (now,))

@@ -776,88 +776,75 @@ class EnsemblePredictor:
             "clipping_bounds": {"min": float(min_bound), "max": float(max_bound)}
         }
 
+    def _get_period_sensitivity(self, period: int):
+        """Returns (max_up, max_down) for the given period tier."""
+        if period >= 60:
+            return 0.30, 0.30
+        elif period >= 20:
+            return 0.28, 0.24
+        elif period >= 8:
+            return 0.32, 0.20
+        else:
+            return 0.18, 0.16
+
+    def _calc_exec_rate_signal(self, exec_rate_7d: float, max_up: float, max_down: float) -> float:
+        """exec_rate 偏离 0.50 目标的响应，使用平滑非线性映射。"""
+        target = 0.50
+        if exec_rate_7d <= 0:
+            return -max_down  # 完全无成交：极限下调
+        deviation = exec_rate_7d - target
+        if deviation > 0:
+            norm = min(deviation / target, 1.0)
+            return max_up * (norm ** 0.7)  # 上调：幂函数加速响应
+        else:
+            norm = min(-deviation / target, 1.0)
+            return -max_down * norm  # 下调：线性
+
+    def _calc_trend_signal(self, trend: float, exec_rate_7d: float, max_up: float, max_down: float) -> float:
+        """趋势微调：紧急模式（exec<30%）只允许上调方向。"""
+        if exec_rate_7d < 0.30:
+            # 紧急模式：已有 exec_signal 大幅下调，趋势只允许反向微修复
+            return max_up * 0.03 if trend > 1.2 else 0.0
+        else:
+            if trend > 1.2:
+                return max_up * 0.03
+            elif trend < 0.8:
+                return -max_down * 0.03
+            return 0.0
+
     def _get_unified_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
                                 avg_gap: float, base_rate: float,
                                 period: int, currency: str) -> float:
         """
-        统一调整因子 — 消除对 exec_rate 的重复计算
+        统一调整因子 — 三信号加法叠加，消除串联乘法的耦合振荡
 
-        替代原来的三因子乘法: execution_adjustment × risk_adjustment × currency_factor
-        三因子都对 exec_rate_7d 做出反应,导致同一信号被计入三次
-
-        新设计: 单一函数,非线性映射,周期感知灵敏度
-
-        Args:
-            exec_rate_7d: 7日成交率
-            exec_rate_30d: 30日成交率
-            avg_gap: 失败订单平均利率差距
-            base_rate: 基础预测利率
-            period: 周期天数
-            currency: 币种
+        信号1: exec_rate 偏离目标的非线性响应
+        信号2: 利率差距反馈（带证据权重，防死锁）
+        信号3: 趋势动量微调
 
         Returns:
-            调整系数 (0.70-1.45)
+            调整系数，已 clip 到 [1-max_down, 1+max_up]
         """
-        target = 0.50
-        deviation = exec_rate_7d - target  # [-0.5, +0.5]
+        max_up, max_down = self._get_period_sensitivity(period)
 
-        # 周期感知灵敏度 (4级分类)
-        if period >= 60:
-            max_up, max_down = 0.30, 0.30    # 长周期降低上调幅度,防止过冲后崩塌
-        elif period >= 20:
-            max_up, max_down = 0.28, 0.24    # 中周期(20-59d)
-        elif period >= 8:
-            max_up, max_down = 0.32, 0.20    # 近中周期(8-19d): v5.2 0.26→0.32, 10-15d仍>90%
+        # 信号1: exec_rate 偏离目标
+        exec_signal = self._calc_exec_rate_signal(exec_rate_7d, max_up, max_down)
+
+        # 信号2: 利率差距反馈（avg_gap>0 说明定价过高，仅下调方向有效）
+        # 证据权重防死锁：数据不足时缩小惩罚
+        if avg_gap > 0 and exec_signal < 0:
+            gap_contribution = -min(avg_gap / (base_rate + 1e-8), 0.12)
+            gap_signal = gap_contribution
         else:
-            max_up, max_down = 0.18, 0.16    # 超短周期(2-7d): 保持不变
+            gap_signal = 0.0
 
-        # 非线性映射: 偏离目标越远,调整越激进
-        if deviation > 0:
-            # 上调(定价过低): 用幂函数加速响应
-            norm_dev = deviation / 0.50  # [0, 1]
-            if norm_dev > 0.8:
-                # 极端偏离区(exec>90%): 混合power 0.7和0.5,加速收敛
-                adj_factor = 0.5 * (norm_dev ** 0.7) + 0.5 * (norm_dev ** 0.5)
-            else:
-                adj_factor = norm_dev ** 0.7
-            adjustment = 1.0 + max_up * adj_factor
-        else:
-            # 下调(定价过高): 线性
-            norm_dev = abs(deviation) / 0.50
-            adjustment = 1.0 - max_down * norm_dev
-
-        # 利率差距惩罚(仅下调方向: avg_gap>0 说明定价过高, 只在adjustment<1时应用)
-        if avg_gap > 0 and adjustment < 1.0:
-            gap_penalty = min(avg_gap / (base_rate + 1e-8), 0.12)
-            adjustment *= (1.0 - gap_penalty)
-
-        # ========== 阶段3修复: 激进下调当执行率低于30% ==========
-        # 当执行率极低时，启用指数衰减加速响应
-        if exec_rate_7d < 0.30:
-            if exec_rate_7d <= 0:
-                # 完全无成交: 直接使用max_down极限（最激进下调）
-                adjustment = 1.0 - max_down
-            else:
-                # 激进模式：使用指数衰减，exec_rate=0.16时得到约0.73的因子
-                emergency_factor = (exec_rate_7d / 0.30) ** 0.5
-                # 混合激进因子和当前调整值
-                adjustment = min(adjustment, 0.70 * emergency_factor + 0.30 * adjustment)
-
-        # 长周期额外敏感：60天以上且执行率<40%时额外降价8%
-        if period >= 60 and exec_rate_7d < 0.40:
-            adjustment *= 0.92
-
-        # 趋势微调
+        # 信号3: 趋势动量微调
         trend = exec_rate_7d / (exec_rate_30d + 1e-8)
-        if period >= 60 and exec_rate_7d > 0.7 and trend > 1.2 and adjustment > 1.0:
-            # 长周期在高执行率上行阶段适度抑制过冲
-            adjustment = 1.0 + (adjustment - 1.0) * 0.92
-        if trend < 0.8:
-            adjustment *= 0.98
-        elif trend > 1.2:
-            adjustment *= 1.01
+        trend_signal = self._calc_trend_signal(trend, exec_rate_7d, max_up, max_down)
 
-        return np.clip(adjustment, 1.0 - max_down, 1.0 + max_up)
+        # 加法叠加，一次性 clip
+        adjustment = 1.0 + exec_signal + gap_signal + trend_signal
+        return float(np.clip(adjustment, 1.0 - max_down, 1.0 + max_up))
 
     def get_latest_predictions(self):
         """获取最新预测结果 - 并行化版本"""
@@ -1140,6 +1127,31 @@ class EnsemblePredictor:
 
                 # Fill remaining slots
                 selected_preds.extend(remaining_preds[:remaining_slots])
+
+                # Per-period coverage guarantee: ensure each period has at least 1 order
+                all_periods = [p for cfg in TIER_CONFIG.values() for p in cfg['periods']]
+                covered_periods = {p['period'] for p in selected_preds}
+                for period in all_periods:
+                    if period not in covered_periods:
+                        # Find best candidate for this period from tier_preds
+                        candidate = None
+                        for tier_name in ['long', 'medium', 'short']:
+                            for p in tier_preds[tier_name]:
+                                if p['period'] == period:
+                                    candidate = p
+                                    break
+                            if candidate:
+                                break
+                        if candidate:
+                            if len(selected_preds) >= TOP_N:
+                                # Replace lowest-scored order to keep total count stable
+                                min_idx = min(
+                                    range(len(selected_preds)),
+                                    key=lambda i: selected_preds[i].get('weighted_score', 0)
+                                )
+                                selected_preds[min_idx] = candidate
+                            else:
+                                selected_preds.append(candidate)
 
                 # Create virtual orders
                 probe_state = self._load_refresh_probe_state()

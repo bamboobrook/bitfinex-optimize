@@ -601,9 +601,9 @@ def run_all_validation_tests():
 # --- 核心逻辑: 完整更新流水线 (每2小时运行) - 闭环优化版 ---
 
 # Subprocess timeout constants
-TIMEOUT_DOWNLOAD = 1200   # 20 minutes
-TIMEOUT_TRAIN = 3600      # 1 hour
-TIMEOUT_PREDICT = 300     # 5 minutes
+TIMEOUT_DOWNLOAD = 600    # 10 minutes (--days 30 incremental is fast)
+TIMEOUT_TRAIN = 1800      # 30 minutes (6 models × 5 min)
+TIMEOUT_PREDICT = 600     # 10 minutes (56 tasks + 24 order creations)
 TIMEOUT_VALIDATE = 300    # 5 minutes
 TIMEOUT_ORDERS = 300      # 5 minutes
 
@@ -631,29 +631,37 @@ def _build_subprocess_env():
     return env
 
 
-def _check_db_data_freshness(max_age_minutes: int = 240) -> bool:
-    """Check if funding_rates table has data newer than max_age_minutes. Returns True if fresh."""
+def _check_db_data_freshness(fUSD_max: int = 240, fUST_max: int = 1440) -> bool:
+    """Check if funding_rates has fresh data for at least one currency. Returns True if any currency is fresh."""
     try:
         import sqlite3 as _sqlite3
+        from datetime import datetime as _dt
         db_path = str(BASE_DIR / "data" / "lending_history.db")
         conn = _sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT MAX(timestamp) FROM funding_rates")
-        row = cursor.fetchone()
+        thresholds = {'fUSD': fUSD_max, 'fUST': fUST_max}
+        any_fresh = False
+        for currency, max_age in thresholds.items():
+            cursor.execute("SELECT MAX(timestamp) FROM funding_rates WHERE currency = ?", (currency,))
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                continue
+            latest_ts = row[0]
+            if isinstance(latest_ts, str):
+                try:
+                    latest_dt = _dt.fromisoformat(latest_ts)
+                except ValueError:
+                    latest_dt = _dt.strptime(latest_ts, '%Y-%m-%d %H:%M:%S')
+            elif isinstance(latest_ts, (int, float)):
+                latest_dt = _dt.fromtimestamp(latest_ts)
+            else:
+                latest_dt = latest_ts
+            age_minutes = (datetime.now() - latest_dt).total_seconds() / 60
+            if age_minutes <= max_age:
+                logger.info(f"✅ {currency} data is fresh (age={age_minutes:.0f}min <= {max_age}min)")
+                any_fresh = True
         conn.close()
-        if not row or not row[0]:
-            return False
-        latest_ts = row[0]
-        if isinstance(latest_ts, str):
-            from datetime import datetime as _dt
-            try:
-                latest_dt = _dt.fromisoformat(latest_ts)
-            except ValueError:
-                latest_dt = _dt.strptime(latest_ts, '%Y-%m-%d %H:%M:%S')
-        else:
-            latest_dt = latest_ts
-        age_minutes = (datetime.now() - latest_dt).total_seconds() / 60
-        return age_minutes <= max_age_minutes
+        return any_fresh
     except Exception as e:
         logger.warning(f"_check_db_data_freshness error: {e}")
         return False
@@ -677,7 +685,36 @@ async def _run_subprocess_with_timeout(cmd, cwd, timeout, step_name):
         await process.wait()
         return "", f"Subprocess timed out after {timeout}s", -1
 
-# Track last forced retraining time to prevent excessive retraining (问题3).
+async def _download_with_retry(cwd, max_retries=3):
+    """Download with exponential backoff retry. Returns True if succeeded or DB data is fresh enough."""
+    download_cmd = ["python", "-m", "funding_history_downloader", "--days", "30"]
+    for attempt in range(max_retries):
+        stdout, stderr, rc = await _run_subprocess_with_timeout(
+            download_cmd, cwd, TIMEOUT_DOWNLOAD, "Data Download"
+        )
+        if stdout:
+            logger.info(f"Download output (last 500 chars):\n{stdout[-500:]}")
+        if stderr:
+            logger.warning(f"Download stderr:\n{stderr[-500:]}")
+        if rc == 0:
+            logger.info("✅ Market data download completed")
+            return True
+        wait_time = 60 * (2 ** attempt)  # 60s, 120s, 240s
+        if attempt < max_retries - 1:
+            logger.warning(f"⚠️  Download failed (attempt {attempt+1}/{max_retries}, exit={rc}), retrying in {wait_time}s")
+            await asyncio.sleep(wait_time)
+        else:
+            logger.warning(f"⚠️  Download failed after {max_retries} attempts (exit={rc}), checking data freshness...")
+    # All retries exhausted: check DB freshness
+    data_age_ok = _check_db_data_freshness()
+    if data_age_ok:
+        logger.info("✅ Existing DB data is fresh enough, continuing pipeline despite download failure")
+        return True
+    logger.error("❌ Data download failed and DB data is stale")
+    return False
+
+
+
 _initial_retrain_state = load_retraining_state()
 _last_forced_retrain_time = parse_datetime_safe(_initial_retrain_state.get("last_forced_retrain_time"))
 
@@ -708,9 +745,29 @@ async def run_full_pipeline():
         logger.info(f">>> Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("=" * 80)
 
-        # ========== STEP 1: 验证虚拟订单 (获取执行反馈) ==========
-        update_status("processing", "1. Validating Orders", "Checking pending orders for execution feedback...")
-        logger.info("Step 1: 🔍 Validating pending virtual orders (execution feedback)")
+        # ========== STEP 1: 下载最新市场数据 (必须！) ⭐ ==========
+        update_status("processing", "1. Downloading Data", "Downloading latest market data...")
+        logger.info("Step 1: 📥 Downloading latest market data (CRITICAL)")
+
+        try:
+            download_ok = await _download_with_retry(BASE_DIR)
+            if not download_ok:
+                update_status("error", "1. Downloading Data", "Download failed and data is stale")
+                return
+        except Exception as e:
+            logger.warning(f"⚠️  Data download system error: {e}, checking data freshness...")
+            data_age_ok = _check_db_data_freshness()
+            if data_age_ok:
+                logger.info("✅ Existing DB data is fresh enough, continuing pipeline despite download error")
+            else:
+                logger.error(f"❌ Data download system error and DB data is stale, aborting pipeline")
+                update_status("error", "1. Downloading Data", str(e))
+                return
+        # ====================================================================
+
+        # ========== STEP 2: 验证虚拟订单 (获取执行反馈) ==========
+        update_status("processing", "2. Validating Orders", "Checking pending orders for execution feedback...")
+        logger.info("Step 2: 🔍 Validating pending virtual orders (execution feedback)")
 
         try:
             stdout, stderr, rc = await _run_subprocess_with_timeout(
@@ -724,44 +781,6 @@ async def run_full_pipeline():
         except Exception as e:
             # Order validation failure is non-critical, continue pipeline
             logger.warning(f"⚠️  Order validation failed: {e}, continuing with pipeline")
-        # ====================================================================
-
-        # ========== STEP 2: 下载最新市场数据 (必须！) ⭐ ==========
-        update_status("processing", "2. Downloading Data", "Downloading latest market data...")
-        logger.info("Step 2: 📥 Downloading latest market data (CRITICAL)")
-
-        try:
-            stdout, stderr, rc = await _run_subprocess_with_timeout(
-                ["python", "-m", "funding_history_downloader", "--days", "30"],
-                BASE_DIR, TIMEOUT_DOWNLOAD, "Data Download"
-            )
-
-            if stdout:
-                logger.info(f"Download output (last 500 chars):\n{stdout[-500:]}")
-            if stderr:
-                logger.warning(f"Download stderr:\n{stderr[-500:]}")
-
-            if rc != 0:
-                logger.warning(f"⚠️  Data download returned non-zero (exit code {rc}), checking data freshness...")
-                data_age_ok = _check_db_data_freshness(max_age_minutes=240)
-                if data_age_ok:
-                    logger.info("✅ Existing DB data is fresh enough (<4h), continuing pipeline despite download issue")
-                else:
-                    logger.error(f"❌ Data download FAILED and DB data is stale, aborting pipeline")
-                    update_status("error", "2. Downloading Data", f"Download failed and data is stale")
-                    return
-
-            logger.info(f"✅ Market data download completed")
-
-        except Exception as e:
-            logger.warning(f"⚠️  Data download system error: {e}, checking data freshness...")
-            data_age_ok = _check_db_data_freshness(max_age_minutes=240)
-            if data_age_ok:
-                logger.info("✅ Existing DB data is fresh enough (<4h), continuing pipeline despite download error")
-            else:
-                logger.error(f"❌ Data download system error and DB data is stale, aborting pipeline")
-                update_status("error", "2. Downloading Data", str(e))
-                return
         # ====================================================================
 
         # ========== STEP 3: 检查是否需要重训练 (闭环核心) ==========

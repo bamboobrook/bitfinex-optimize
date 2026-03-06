@@ -205,13 +205,13 @@ class TrainingDataBuilder:
                 merge_cols.append(c)
 
         merged = pd.merge_asof(
-            market_data,
-            execution_results[merge_cols],
-            left_on='datetime',
-            right_on='order_timestamp',
+            execution_results[merge_cols].sort_values('order_timestamp'),  # 主表：订单
+            market_data.sort_values('datetime'),                            # 右表：市场快照
+            left_on='order_timestamp',
+            right_on='datetime',
             by=['currency', 'period'],
-            direction='backward',  # 向前匹配最近的订单
-            tolerance=pd.Timedelta('24h')  # 最多24小时内的订单
+            direction='nearest',   # 找最近时刻的市场快照
+            tolerance=pd.Timedelta('2h')  # 严格限制在2小时内（原24h太宽）
         )
 
         # 生成增强标签

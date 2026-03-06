@@ -100,7 +100,7 @@ class MetricsCollector:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 
-            # 1. 执行率统计
+            # 1. 执行率统计（包含 EXPIRED，基于有效闭合订单）
             cursor.execute("""
                 SELECT status, COUNT(*) as count
                 FROM virtual_orders
@@ -108,8 +108,10 @@ class MetricsCollector:
             """)
             status_counts = dict(cursor.fetchall())
 
-            total_validated = status_counts.get('EXECUTED', 0) + status_counts.get('FAILED', 0)
-            exec_rate = status_counts.get('EXECUTED', 0) / total_validated * 100 if total_validated > 0 else 0
+            total_closed = (status_counts.get('EXECUTED', 0)
+                            + status_counts.get('FAILED', 0)
+                            + status_counts.get('EXPIRED', 0))
+            exec_rate = status_counts.get('EXECUTED', 0) / total_closed * 100 if total_closed > 0 else 0
 
             # 2. FAILED 订单的平均 rate gap
             cursor.execute("""
@@ -143,6 +145,7 @@ class MetricsCollector:
                 'execution_rate': f"{exec_rate:.1f}%",
                 'total_executed': status_counts.get('EXECUTED', 0),
                 'total_failed': status_counts.get('FAILED', 0),
+                'total_expired': status_counts.get('EXPIRED', 0),
                 'total_pending': status_counts.get('PENDING', 0),
                 'avg_rate_gap_failed': f"{avg_gap:.4f}%" if avg_gap > 0 else "N/A",
                 'cold_start_coverage': f"{cold_start_pct:.1f}%",

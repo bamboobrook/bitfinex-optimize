@@ -189,7 +189,7 @@ class RetrainingScheduler:
         WHERE order_timestamp >= ?
           AND status IN ('EXECUTED', 'FAILED')
         GROUP BY currency, period
-        HAVING COUNT(*) >= 5
+        HAVING COUNT(*) >= 3
         """
 
         cursor.execute(query, (since_date,))
@@ -223,6 +223,22 @@ class RetrainingScheduler:
                 })
 
         return anomalies
+
+    def _check_zero_liquidity_anomaly(self) -> list:
+        """检测某(currency, period)组合7天内虚拟订单极少(<2条)的情况。"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT currency, period, MAX(order_timestamp) as last_order, COUNT(*) as cnt
+                FROM virtual_orders
+                WHERE order_timestamp >= datetime('now', '-7 days')
+                GROUP BY currency, period
+                HAVING cnt < 2
+            """)
+            return cursor.fetchall()
+        finally:
+            conn.close()
 
     def _trigger_thresholds(self) -> Dict[str, float]:
         cfg = self.policy.get("retrain_trigger", {})
@@ -387,6 +403,23 @@ class RetrainingScheduler:
             return True, reason
         if exec_rate_7d > exec_high:
             reason = f"全局成交率过高 ({exec_rate_7d:.2%} > {exec_high:.0%}), 紧急重训练"
+            print(f"⚠️  需要重训练: {reason}")
+            return True, reason
+
+        # 执行率快速下滑检测 (14d→7d 趋势漂移)
+        exec_rate_14d = self.get_recent_execution_rate(days=14)
+        if exec_rate_14d is not None and exec_rate_7d is not None:
+            drift = exec_rate_14d - exec_rate_7d  # 正值 = 近期恶化
+            if drift > 0.15 and exec_rate_7d < exec_high:
+                reason = f"执行率快速下滑: 14d={exec_rate_14d:.1%}→7d={exec_rate_7d:.1%} (跌幅={drift:.1%})"
+                print(f"⚠️  需要重训练: {reason}")
+                return True, reason
+
+        # 货币对零流动性检测
+        zero_liq = self._check_zero_liquidity_anomaly()
+        if zero_liq:
+            currencies = [(r[0], r[1]) for r in zero_liq]
+            reason = f"货币对零流动性 (7天内<2单): {currencies}"
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
 
