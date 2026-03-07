@@ -161,9 +161,11 @@ class BitfinexDataDownloader:
                     # 范围外有新数据，但范围内没有
                     return [(start_ts, end_ts)]
             else:
-                # 数据过期或不存在 - 强制刷新
-                logger.warning(f"    ⚠️ Data is stale (age > 2h), forcing refresh of last 7 days")
-                return [(start_ts, end_ts)]
+                # 数据过期或不存在 - 修复3: 优先尝试最近24小时窗口，避免长周期无效全量扫描
+                logger.warning(f"    ⚠️ Data is stale (age > 2h), trying last 24h window first")
+                recent_start = int((datetime.now() - timedelta(hours=24)).timestamp() * 1000)
+                adjusted_start = max(start_ts, recent_start)
+                return [(adjusted_start, end_ts)]
 
         except Exception as e:
             logger.info(f"    Error checking existing data: {e}")
@@ -213,7 +215,12 @@ class BitfinexDataDownloader:
                 response = self.session.get(url, params=params, timeout=30)
 
                 if response.status_code == 200:
-                    return response.json()
+                    data = response.json()
+                    # 修复2: 检测 Bitfinex 错误响应格式 ["error", 10xxx, "msg"]
+                    if isinstance(data, list) and len(data) >= 2 and data[0] == 'error':
+                        logger.warning(f"    Bitfinex API error response: {data}")
+                        return None
+                    return data
                 elif response.status_code == 429:
                     # 速率限制，等待更长时间
                     wait_time = 60
@@ -289,7 +296,18 @@ class BitfinexDataDownloader:
                 logger.info(f"      Progress: {progress:.1f}% ({len(all_candles)} records)")
             else:
                 break
-        
+
+        # 修复1: hist 返回空时降级调用 /last 端点（流动性枯竭时的 fallback）
+        if not all_candles:
+            fallback_candle_key = f"trade:1m:{currency}:p{period}"
+            last_url = f"{self.base_url}/candles/{fallback_candle_key}/last"
+            last_data = self.rate_limited_request(last_url, {})
+            if last_data and isinstance(last_data, list) and isinstance(last_data[0], (int, float)):
+                all_candles = [last_data]
+                logger.warning(f"    📍 hist returned empty, /last fallback: 1 candle retrieved")
+            else:
+                logger.warning(f"    ⚠️ /last fallback also returned no data for {currency} p{period}")
+
         return all_candles
     
     def process_and_store_candle_data(self, candles: List[List[Any]], 

@@ -665,6 +665,19 @@ def _check_db_data_freshness(fUSD_max: int = 240, fUST_max: int = 1440) -> bool:
             if age_minutes <= max_age:
                 logger.info(f"✅ {currency} data is fresh (age={age_minutes:.0f}min <= {max_age}min)")
                 any_fresh = True
+        # 修复4: fUST 长周期 per-period 诊断（流动性枯竭预警）
+        for period in [30, 60, 90]:
+            cursor.execute("SELECT MAX(timestamp) FROM funding_rates WHERE currency='fUST' AND period=?", (period,))
+            p_row = cursor.fetchone()
+            if p_row and p_row[0]:
+                p_ts = p_row[0]
+                if p_ts > 1e10:
+                    p_dt = _dt.fromtimestamp(p_ts / 1000)
+                else:
+                    p_dt = _dt.fromtimestamp(p_ts)
+                p_age = (_dt.now() - p_dt).total_seconds() / 60
+                if p_age > 900:
+                    logger.warning(f"  WARN: fUST-{period} is {p_age:.0f}min old (>900min, possible liquidity drought)")
         conn.close()
         return any_fresh
     except Exception as e:
