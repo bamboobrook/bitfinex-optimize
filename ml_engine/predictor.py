@@ -757,6 +757,7 @@ class EnsemblePredictor:
             "current_rate": current_rate,
             "predicted_rate": float(final_rate),
             "execution_probability": prob,
+            "calibrated_execution_prob": float(calibrated_prob),  # exec_rate校准后的成交概率（反映真实流动性）
             "conservative_rate": p_cons,
             "aggressive_rate": p_aggr,
             "balanced_rate": p_bal,
@@ -953,36 +954,47 @@ class EnsemblePredictor:
         # Revenue-optimized scoring: 收益率优先,兼顾成交和长周期
         def calculate_weighted_score(pred):
             """
-            收益率优先评分 (v4):
-            - 40% effective_rate (rate * prob - 期望收益,同时体现利率和成交概率)
+            收益率优先评分 (v5):
+            - 40% effective_rate (calibrated_prob * rate - 期望收益)
             - 30% raw_rate (高利率偏好)
-            - 20% exec_prob (成交保障)
+            - 20% exec_prob (成交保障，使用校准概率)
             - 10% revenue_factor (period_days/120 - 长周期仅作微调)
-            + execution floor: exec_prob < 0.35 gets 0.4x penalty (仅极低概率才惩罚)
+            + execution floor: calibrated_prob < 0.35 gets 0.4x penalty
+            + data_age multiplier: 数据越老（流动性越低）评分越低，warn~hard 线性衰减到 0.6x
             """
-            prob = pred['execution_probability']
+            calib_prob = pred.get('calibrated_execution_prob', pred['execution_probability'])
             rate = pred['predicted_rate']
             period = pred['period']
+            data_age = pred.get('data_age_minutes', 0.0)
+            currency = pred.get('currency', '')
 
             # 1. 标准化利率到0-1范围 (假设最高利率40%)
             normalized_rate = min(rate / 40.0, 1.0)
 
-            # 2. Effective rate = rate * prob (期望收益)
-            effective_rate = normalized_rate * prob
+            # 2. Effective rate = rate * calibrated_prob (期望收益，反映真实成交率)
+            effective_rate = normalized_rate * calib_prob
 
             # 3. Revenue factor based on period (continuous, not tiered)
             revenue_factor = min(period / 120.0, 1.0)
 
-            # 4. Execution floor: 仅在极低概率时惩罚
-            exec_floor_multiplier = 0.4 if prob < 0.35 else 1.0
+            # 4. Execution floor: calibrated_prob < 0.35 时惩罚（覆盖零流动性场景）
+            exec_floor_multiplier = 0.4 if calib_prob < 0.35 else 1.0
 
-            # 5. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
+            # 5. Data-age multiplier: 数据老旧 = 流动性可能枯竭，推荐权重线性衰减
+            warn_min, hard_min = self._freshness_thresholds_minutes(currency)
+            if data_age <= warn_min:
+                age_multiplier = 1.0
+            else:
+                # warn~hard 区间线性从 1.0 衰减到 0.6
+                age_multiplier = 1.0 - 0.4 * min((data_age - warn_min) / max(hard_min - warn_min, 1.0), 1.0)
+
+            # 6. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
             final_score = (
                 effective_rate * 0.40 +
                 normalized_rate * 0.30 +
-                prob * 0.20 +
+                calib_prob * 0.20 +
                 revenue_factor * 0.10
-            ) * exec_floor_multiplier
+            ) * exec_floor_multiplier * age_multiplier
 
             return final_score
 
