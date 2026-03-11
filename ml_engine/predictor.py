@@ -1070,8 +1070,13 @@ class EnsemblePredictor:
             # 3. Revenue factor based on period (continuous, not tiered)
             revenue_factor = min(period / 120.0, 1.0)
 
-            # 4. Execution floor: calibrated_prob < 0.35 时惩罚（覆盖零流动性场景）
-            exec_floor_multiplier = 0.4 if calib_prob < 0.35 else 1.0
+            # 4. Execution floor: calibrated_prob < 0.35 时线性衰减惩罚（覆盖零流动性场景）
+            # 线性衰减避免 0.35 处硬跳变，确保低流动性周期仍有订单进入市场（闭环不断裂）
+            # calib_prob=0.26 → 0.4 + 0.6×0.74 = 0.844x（而非原来 0.4x）
+            if calib_prob >= 0.35:
+                exec_floor_multiplier = 1.0
+            else:
+                exec_floor_multiplier = 0.4 + 0.6 * (calib_prob / 0.35)
 
             # 5. Data-age multiplier: 数据老旧 = 流动性可能枯竭，推荐权重线性衰减
             warn_min, hard_min = self._freshness_thresholds_minutes(currency)
