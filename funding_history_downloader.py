@@ -302,9 +302,11 @@ class BitfinexDataDownloader:
             fallback_candle_key = f"trade:1m:{currency}:p{period}"
             last_url = f"{self.base_url}/candles/{fallback_candle_key}/last"
             last_data = self.rate_limited_request(last_url, {})
-            if last_data and isinstance(last_data, list) and isinstance(last_data[0], (int, float)):
+            if isinstance(last_data, list) and len(last_data) >= 6 and isinstance(last_data[0], (int, float)):
                 all_candles = [last_data]
                 logger.warning(f"    📍 hist returned empty, /last fallback: 1 candle retrieved")
+            elif last_data is not None:
+                logger.warning(f"    ⚠️ /last returned incomplete candle for {currency} p{period}: {last_data}")
             else:
                 logger.warning(f"    ⚠️ /last fallback also returned no data for {currency} p{period}")
 
