@@ -751,6 +751,14 @@ class EnsemblePredictor:
             f"floor={floor_factor:.3f} bounds=[{min_bound:.4f},{max_bound:.4f}]"
         )
 
+        volume_ratio = row_data.get('volume_ratio', 1.0)
+        liq_score, liq_level = self._calc_liquidity_score(
+            calibrated_prob=calibrated_prob,
+            volume_ratio=volume_ratio,
+            data_age_minutes=data_age_minutes,
+            currency=currency
+        )
+
         return {
             "currency": currency,
             "period": int(row_data['period']),
@@ -758,6 +766,8 @@ class EnsemblePredictor:
             "predicted_rate": float(final_rate),
             "execution_probability": prob,
             "calibrated_execution_prob": float(calibrated_prob),  # exec_rate校准后的成交概率（反映真实流动性）
+            "liquidity_score": liq_score,
+            "liquidity_level": liq_level,
             "conservative_rate": p_cons,
             "aggressive_rate": p_aggr,
             "balanced_rate": p_bal,
@@ -824,6 +834,36 @@ class EnsemblePredictor:
                 return -max_down * 0.03
             return 0.0
 
+    def _calc_liquidity_score(
+        self,
+        calibrated_prob: float,
+        volume_ratio: float,
+        data_age_minutes: float,
+        currency: str
+    ) -> tuple:
+        """计算 (liquidity_score: float 0-100, liquidity_level: str)"""
+        warn_min, hard_min = self._freshness_thresholds_minutes(currency)
+        if data_age_minutes <= warn_min:
+            freshness_signal = 1.0
+        else:
+            freshness_signal = max(0.2, 1.0 - 0.8 * min(
+                (data_age_minutes - warn_min) / max(hard_min - warn_min, 1.0), 1.0
+            ))
+        # 成交量信号（volume_ratio 上限 3x）
+        volume_signal = min(float(volume_ratio) if volume_ratio else 1.0, 3.0) / 3.0
+        # 综合评分：成交率 50% + 成交量 30% + 新鲜度 20%
+        score = (calibrated_prob * 0.50 + volume_signal * 0.30 + freshness_signal * 0.20) * 100.0
+        score = float(np.clip(score, 0.0, 100.0))
+        if score >= 65.0:
+            level = "high"
+        elif score >= 40.0:
+            level = "medium"
+        elif score >= 20.0:
+            level = "low"
+        else:
+            level = "insufficient"
+        return round(score, 1), level
+
     def _get_unified_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
                                 avg_gap: float, base_rate: float,
                                 period: int, currency: str) -> float:
@@ -857,6 +897,56 @@ class EnsemblePredictor:
         # 加法叠加，一次性 clip
         adjustment = 1.0 + exec_signal + gap_signal + trend_signal
         return float(np.clip(adjustment, 1.0 - max_down, 1.0 + max_up))
+
+    def _calc_market_liquidity(self, preds: list) -> dict:
+        """按 currency 聚合流动性评分，同时查询 24h vs 30d 成交量比率"""
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for p in preds:
+            groups[p['currency']].append(p)
+
+        result = {}
+        for currency, items in groups.items():
+            avg_score = sum(x.get('liquidity_score', 50) for x in items) / len(items)
+            avg_exec = sum(x.get('calibrated_execution_prob', 0.5) for x in items) / len(items)
+
+            # 查 funding_rates 24h vs 30d 平均成交量（用 period=30 作代表性基准）
+            try:
+                import sqlite3
+                with sqlite3.connect(self.db_path) as conn:
+                    row = conn.execute("""
+                        SELECT
+                            AVG(CASE WHEN datetime >= strftime('%Y-%m-%d %H:%M:%S','now','-1 day')
+                                     THEN volume ELSE NULL END) AS vol_24h,
+                            AVG(volume) AS vol_30d
+                        FROM funding_rates
+                        WHERE currency = ?
+                          AND period = 30
+                          AND datetime >= strftime('%Y-%m-%d %H:%M:%S','now','-30 days')
+                    """, (currency,)).fetchone()
+                vol_24h = row[0] or 0.0
+                vol_30d = row[1] or 1e-8
+                volume_ratio_24h = round(vol_24h / (vol_30d + 1e-8), 3)
+            except Exception:
+                volume_ratio_24h = None
+
+            score = round(avg_score, 1)
+            if score >= 65:
+                level = "high"
+            elif score >= 40:
+                level = "medium"
+            elif score >= 20:
+                level = "low"
+            else:
+                level = "insufficient"
+
+            result[currency] = {
+                "level": level,
+                "score": score,
+                "avg_exec_rate": round(avg_exec, 3),
+                "volume_ratio_24h": volume_ratio_24h,
+            }
+        return result
 
     def get_latest_predictions(self):
         """获取最新预测结果 - 并行化版本"""
@@ -951,16 +1041,19 @@ class EnsemblePredictor:
         # 2. 在成交概率合格的基础上，按预测利率降序排列
         valid_preds = [p for p in preds if p['predicted_rate'] > 1.0]
 
+        market_liquidity = self._calc_market_liquidity(preds)
+
         # Revenue-optimized scoring: 收益率优先,兼顾成交和长周期
         def calculate_weighted_score(pred):
             """
-            收益率优先评分 (v5):
+            收益率优先评分 (v6):
             - 40% effective_rate (calibrated_prob * rate - 期望收益)
             - 30% raw_rate (高利率偏好)
             - 20% exec_prob (成交保障，使用校准概率)
             - 10% revenue_factor (period_days/120 - 长周期仅作微调)
             + execution floor: calibrated_prob < 0.35 gets 0.4x penalty
             + data_age multiplier: 数据越老（流动性越低）评分越低，warn~hard 线性衰减到 0.6x
+            + divergence multiplier: 预测利率/当前市场 > 2.5x 时线性降权至 0.5x
             """
             calib_prob = pred.get('calibrated_execution_prob', pred['execution_probability'])
             rate = pred['predicted_rate']
@@ -988,13 +1081,28 @@ class EnsemblePredictor:
                 # warn~hard 区间线性从 1.0 衰减到 0.6
                 age_multiplier = 1.0 - 0.4 * min((data_age - warn_min) / max(hard_min - warn_min, 1.0), 1.0)
 
-            # 6. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
+            # 6. Market divergence multiplier: 预测利率远高于当前市场时降权
+            # 防止"历史高利率残留exec_rate"掩盖当前市场崩塌（如 fUST-60: 预测13% vs 市场2.9%）
+            # 使用相对偏差而非绝对值，避免对高利率市场误惩罚
+            follow_err = pred.get('market_follow_error', 0.0)
+            current_rate_val = pred.get('current_rate', rate)
+            if follow_err > 0 and current_rate_val > 0:
+                relative_err = follow_err / current_rate_val
+                if relative_err > 1.5:
+                    # relative_err 1.5→4.0 线性映射到 multiplier 1.0→0.5
+                    divergence_multiplier = max(0.5, 1.0 - 0.2 * (relative_err - 1.5))
+                else:
+                    divergence_multiplier = 1.0
+            else:
+                divergence_multiplier = 1.0
+
+            # 7. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
             final_score = (
                 effective_rate * 0.40 +
                 normalized_rate * 0.30 +
                 calib_prob * 0.20 +
                 revenue_factor * 0.10
-            ) * exec_floor_multiplier * age_multiplier
+            ) * exec_floor_multiplier * age_multiplier * divergence_multiplier
 
             return final_score
 
@@ -1015,30 +1123,20 @@ class EnsemblePredictor:
             ) if self._stale_issues else 0,
             "stale_reason": "partial_stale_data_skipped" if self._stale_issues else "",
             "stale_issues": self._stale_issues[:20] if self._stale_issues else [],
+            "market_liquidity": market_liquidity,
             "recommendations": []
         }
 
-        # Build recommendations: ensure top 5 + fUSD-2d if not already included
-        recommendations_to_add = []
+        # Build recommendations: rank 1-5 = top 5 (excluding fUSD-2d), rank 6 = fUSD-2d (fixed)
         fusd_2d_pred = None
-
-        # First, add top 5 predictions
-        for pred in sorted_preds[:5]:
-            recommendations_to_add.append(pred)
+        for pred in sorted_preds:
             if pred['currency'] == 'fUSD' and pred['period'] == 2:
                 fusd_2d_pred = pred
+                break
 
-        # If fUSD-2d is not in top 5, find it and add as 6th
-        if fusd_2d_pred is None:
-            for pred in sorted_preds:
-                if pred['currency'] == 'fUSD' and pred['period'] == 2:
-                    fusd_2d_pred = pred
-                    recommendations_to_add.append(pred)
-                    break
-
-        # If still not found (shouldn't happen), add 6th best instead
-        if fusd_2d_pred is None and len(sorted_preds) > 5:
-            recommendations_to_add.append(sorted_preds[5])
+        # rank 1-5: top 5 from sorted_preds excluding fUSD-2d
+        top5 = [p for p in sorted_preds if not (p['currency'] == 'fUSD' and p['period'] == 2)][:5]
+        recommendations_to_add = top5 + ([fusd_2d_pred] if fusd_2d_pred else [])
 
         # Build the recommendations list
         for i, pred in enumerate(recommendations_to_add[:6]):
@@ -1049,6 +1147,8 @@ class EnsemblePredictor:
                 "period": pred['period'],
                 "rate": round(pred['predicted_rate'], 4),
                 "confidence": pred['confidence'],
+                "liquidity_score": pred.get('liquidity_score'),
+                "liquidity_level": pred.get('liquidity_level'),
                 "details": {
                     "current": round(pred['current_rate'], 4),
                     "execution_probability": round(pred['execution_probability'], 4),
