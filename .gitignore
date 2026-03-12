@@ -1,3 +1,7 @@
 /data
 /log
 .env
+
+# Local secrets (never commit real tokens/keys)
+.env.*
+!.env.example
