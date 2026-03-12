@@ -1204,8 +1204,9 @@ class EnsemblePredictor:
         if self.order_manager is not None:
             try:
                 if self._stale_issues:
-                    print("\n⚠️  Detected stale market data in this cycle. Skip virtual order creation.")
-                    return
+                    stale_pairs = [(i['currency'], i['period']) for i in self._stale_issues]
+                    print(f"\n⚠️  Detected stale market data for {len(stale_pairs)} pair(s): {stale_pairs}")
+                    print("    Continuing with virtual order creation for non-stale pairs.")
 
                 # Stratified sampling configuration by period tiers - 均衡采样
                 # 目标是覆盖全期限，各层级数量均衡
