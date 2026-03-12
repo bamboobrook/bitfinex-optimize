@@ -95,7 +95,7 @@ class TrainingDataBuilder:
             {', '.join(selected_cols)}
         FROM virtual_orders
         WHERE order_timestamp >= ? AND order_timestamp < ?
-          AND status IN ('EXECUTED', 'FAILED')
+          AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
         ORDER BY order_timestamp
         """
 
@@ -106,7 +106,8 @@ class TrainingDataBuilder:
         if len(df) > 0:
             df['order_timestamp'] = pd.to_datetime(df['order_timestamp'])
 
-        print(f"✓ 加载执行结果: {len(df)} 条 (EXECUTED: {(df['status']=='EXECUTED').sum()}, FAILED: {(df['status']=='FAILED').sum()})")
+        expired_count = (df['status'] == 'EXPIRED').sum() if len(df) > 0 else 0
+        print(f"✓ 加载执行结果: {len(df)} 条 (EXECUTED: {(df['status']=='EXECUTED').sum()}, FAILED: {(df['status']=='FAILED').sum()}, EXPIRED: {expired_count})")
 
         return df
 
@@ -255,6 +256,10 @@ class TrainingDataBuilder:
         # 标签1: 实际成交二元标签
         df['actual_execution_binary'] = (df['status'] == 'EXECUTED').astype(float)
         df.loc[df['status'].isna(), 'actual_execution_binary'] = np.nan
+        # EXPIRED: 出价太高、市场无机会成交 → 负样本，但降低权重避免过拟合
+        expired_mask = df['status'] == 'EXPIRED'
+        df.loc[expired_mask, 'actual_execution_binary'] = 0.0
+        df['_expired_weight'] = np.where(expired_mask, 0.5, 1.0)
 
         # 标签2: 利率竞争力 (predicted_rate / market_median)
         df['rate_competitiveness'] = df.apply(

@@ -411,6 +411,20 @@ class EnhancedModelTrainer:
             except Exception as e:
                 print(f"⚠️  probe_type 降权失败: {e}")
 
+        # EXPIRED 订单是宝贵负样本但信号较弱，降权 0.5
+        if sample_weights is not None and '_expired_weight' in valid_df.columns:
+            try:
+                expired_w = valid_df['_expired_weight'].fillna(1.0).values
+                expired_count = int((expired_w < 1.0).sum())
+                if expired_count > 0:
+                    sample_weights = sample_weights * expired_w
+                    print(
+                        f"EXPIRED 降权已应用: count={expired_count}, "
+                        f"mean_weight={sample_weights.mean():.4f}"
+                    )
+            except Exception as e:
+                print(f"⚠️  _expired_weight 降权失败: {e}")
+
         # 准备特征
         feature_cols = self.prepare_features(valid_df)
         X = valid_df[feature_cols]

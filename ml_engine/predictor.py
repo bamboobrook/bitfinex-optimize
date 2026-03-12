@@ -291,10 +291,12 @@ class EnsemblePredictor:
         self,
         currency: str,
         period: int,
-        predicted_rate: float
+        predicted_rate: float,
+        current_rate: float = 0.0
     ) -> Tuple[float, Optional[float], Optional[float], bool, Optional[float]]:
         """
         Apply per-period one-step cap. Currently strict for 120d by policy.
+        When predicted_rate diverges greatly from current market (>2.5x), cap is bypassed.
 
         Returns:
             (capped_rate, previous_rate, step_change_pct, step_capped, cap_pct)
@@ -307,8 +309,24 @@ class EnsemblePredictor:
         if previous_rate is None or previous_rate <= 0:
             return predicted_rate, previous_rate, None, False, cap_pct
 
-        lower = previous_rate * (1.0 - cap_pct)
-        upper = previous_rate * (1.0 + cap_pct)
+        # 动态 cap: 预测严重偏离市场时放宽限制，加速收敛
+        if previous_rate > 0 and current_rate > 0:
+            divergence_ratio = predicted_rate / current_rate
+            if divergence_ratio > 2.5:
+                effective_cap = 1.0              # 严重偏离: 单步可大幅调整
+                logger.info(
+                    f"Dynamic cap bypass for {currency}-{period}: "
+                    f"divergence_ratio={divergence_ratio:.2f}>2.5, cap released"
+                )
+            elif divergence_ratio > 1.5:
+                effective_cap = cap_pct * 2.0    # 中度偏离: cap 翻倍
+            else:
+                effective_cap = cap_pct
+        else:
+            effective_cap = cap_pct
+
+        lower = previous_rate * (1.0 - effective_cap)
+        upper = previous_rate * (1.0 + effective_cap)
         capped_rate = float(np.clip(predicted_rate, lower, upper))
         step_capped = abs(capped_rate - predicted_rate) > 1e-12
         step_change_pct = (capped_rate - previous_rate) / previous_rate
@@ -542,8 +560,8 @@ class EnsemblePredictor:
 
         # 贝叶斯风格校准: 根据数据充分度动态加权
         # order_count 少时信任模型,多时信任历史执行率
-        # sqrt曲线: 50单→ew=0.50, 100单→ew=0.65(上限), 200单→ew=0.65
-        evidence_weight = min(np.sqrt(order_count / 200.0), 0.65)
+        # 线性曲线: 50单→ew=0.50, 100单→ew=0.80(上限), 更快适应市场
+        evidence_weight = min(order_count / 100.0, 0.80)
         calibrated_prob = (1.0 - evidence_weight) * prob + evidence_weight * exec_rate_fast
         calibrated_prob = np.clip(calibrated_prob, 0.0, 1.0)
 
@@ -588,7 +606,8 @@ class EnsemblePredictor:
         # 统一调整因子: 消除原来三因子(execution_adj × risk_adj × currency_factor)的重复计算
 
         adjustment = self._get_unified_adjustment(
-            exec_rate_fast, exec_rate_slow, avg_rate_gap, base_rate, period, currency
+            exec_rate_fast, exec_rate_slow, avg_rate_gap, base_rate, period, currency,
+            current_rate=current_rate
         )
 
         # 应用调整
@@ -678,6 +697,13 @@ class EnsemblePredictor:
         else:
             bound_base = 0.55 * ma_720 + 0.45 * current_rate
 
+        # 市场崩塌修复: exec_rate 极低时将 current_rate 混入 bound_base，
+        # 防止历史高位 MA 把 floor 拉得远高于市场
+        if exec_rate_fast < 0.20 and current_rate > 0:
+            alpha = 1.0 - (exec_rate_fast / 0.20)        # exec_rate=0 → alpha=1.0
+            blend_weight = alpha * 0.35                   # 最大混入 35% current_rate
+            bound_base = (1.0 - blend_weight) * bound_base + blend_weight * (current_rate * 1.2)
+
         if calibrated_prob > 0.8:
             floor_base = 0.50
             max_bound = bound_base * 1.5
@@ -719,7 +745,7 @@ class EnsemblePredictor:
 
         # Enforce policy step cap for selected periods (120d by default).
         final_rate, previous_rate, step_change_pct, step_capped, step_cap_pct = self._apply_period_step_cap(
-            currency, period, final_rate
+            currency, period, final_rate, current_rate=current_rate
         )
         if step_capped and previous_rate is not None:
             logger.info(
@@ -866,7 +892,8 @@ class EnsemblePredictor:
 
     def _get_unified_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
                                 avg_gap: float, base_rate: float,
-                                period: int, currency: str) -> float:
+                                period: int, currency: str,
+                                current_rate: float = 0.0) -> float:
         """
         统一调整因子 — 三信号加法叠加，消除串联乘法的耦合振荡
 
@@ -884,7 +911,9 @@ class EnsemblePredictor:
 
         # 信号2: 利率差距反馈（avg_gap>0 说明定价过高，仅下调方向有效）
         # 证据权重防死锁：数据不足时缩小惩罚
-        if avg_gap > 0 and exec_signal < 0:
+        # 独立激活：市场已崩塌但 exec_rate 尚未反应时（avg_gap/current_rate > 2.0），强制激活
+        large_divergence = avg_gap > 0 and current_rate > 0 and (avg_gap / current_rate) > 2.0
+        if avg_gap > 0 and (exec_signal < 0 or large_divergence):
             gap_contribution = -min(avg_gap / (base_rate + 1e-8), 0.12)
             gap_signal = gap_contribution
         else:

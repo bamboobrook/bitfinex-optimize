@@ -166,7 +166,7 @@ class ExecutionFeatures:
               AND period = ?
               AND order_timestamp >= ?
               AND order_timestamp <= ?
-              AND status IN ('EXECUTED', 'FAILED')
+              AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
             """
 
             cursor.execute(query, (
@@ -213,8 +213,8 @@ class ExecutionFeatures:
             else:
                 calculated_rate = executed / total
                 # 渐进混合: 避免跨过阈值时从默认值瞬间跳到计算值
-                # blend_ceiling = 2x阈值, 在0~ceiling之间线性过渡
-                blend_ceiling = cold_start_threshold * 2
+                # blend_ceiling = 1.2x阈值, 避免 blend zone 过宽导致 exec_rate 卡在阈值上
+                blend_ceiling = cold_start_threshold * 1.2
                 default_weight = max(0.0, 1.0 - total / blend_ceiling)
                 exec_rate = default_weight * default_rate + (1.0 - default_weight) * calculated_rate
 

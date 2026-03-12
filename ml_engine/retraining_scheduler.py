@@ -148,7 +148,7 @@ class RetrainingScheduler:
             SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed
         FROM virtual_orders
         WHERE order_timestamp >= ?
-          AND status IN ('EXECUTED', 'FAILED')
+          AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
         """
 
         cursor.execute(query, (since_date,))
@@ -223,6 +223,48 @@ class RetrainingScheduler:
                 })
 
         return anomalies
+
+    def _check_market_divergence_trigger(self) -> bool:
+        """
+        检测多数活跃 (currency, period) 的预测利率是否系统性高于市场 2 倍以上。
+        市场崩塌后 Blend Zone 和 exec_rate 滞后时的补充保险触发器。
+        若 >= 50% 的活跃组合 avg(predicted_rate)/avg(market_median) > 2.0，返回 True。
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            since_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            cursor.execute("""
+                SELECT currency, period,
+                       AVG(predicted_rate) as avg_pred,
+                       AVG(market_median) as avg_market
+                FROM virtual_orders
+                WHERE order_timestamp >= ?
+                  AND market_median IS NOT NULL
+                  AND market_median > 0
+                  AND predicted_rate IS NOT NULL
+                GROUP BY currency, period
+                HAVING COUNT(*) >= 3
+            """, (since_date,))
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return False
+
+        overpriced = sum(
+            1 for r in rows
+            if r[2] is not None and r[3] is not None and (r[2] / (r[3] + 1e-8)) > 2.0
+        )
+        ratio = overpriced / len(rows)
+        if ratio >= 0.5:
+            logger.info(
+                f"Market divergence trigger: {overpriced}/{len(rows)} pairs overpriced >2x "
+                f"({ratio:.0%})"
+            )
+            return True
+        return False
 
     def _check_zero_liquidity_anomaly(self) -> list:
         """检测某(currency, period)组合7天内虚拟订单极少(<2条)的情况。"""
@@ -497,6 +539,12 @@ class RetrainingScheduler:
         if zero_rate_2d:
             details = ", ".join(f"{a['currency']}-{a['period']}d" for a in zero_rate_2d)
             reason = f"2天内执行率归零 ({details}), 紧急重训练"
+            print(f"⚠️  需要重训练: {reason}")
+            return True, reason
+
+        # 市场偏离触发: 多数 pair 预测利率系统性高于市场 2 倍（market regime change）
+        if self._check_market_divergence_trigger():
+            reason = "市场偏离触发: >=50% 活跃组合预测利率高于市场中位 2 倍以上"
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
 
