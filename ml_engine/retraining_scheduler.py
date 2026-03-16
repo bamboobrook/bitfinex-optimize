@@ -259,8 +259,8 @@ class RetrainingScheduler:
         )
         ratio = overpriced / len(rows)
         if ratio >= 0.5:
-            logger.info(
-                f"Market divergence trigger: {overpriced}/{len(rows)} pairs overpriced >2x "
+            print(
+                f"⚠️  Market divergence trigger: {overpriced}/{len(rows)} pairs overpriced >2x "
                 f"({ratio:.0%})"
             )
             return True
@@ -289,7 +289,7 @@ class RetrainingScheduler:
             "follow_mae_ratio_threshold": float(cfg.get("follow_mae_ratio_threshold", 0.65)),
             "direction_match_threshold": float(cfg.get("direction_match_threshold", 0.40)),
             "p120_step_p95_threshold": float(cfg.get("p120_step_p95_threshold", 0.05)),
-            "global_exec_low": float(cfg.get("global_exec_low", 0.40)),
+            "global_exec_low": float(cfg.get("global_exec_low", 0.30)),
             "global_exec_high": float(cfg.get("global_exec_high", 0.60)),
         }
 

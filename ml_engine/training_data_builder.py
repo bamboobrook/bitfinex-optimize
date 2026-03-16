@@ -224,8 +224,8 @@ class TrainingDataBuilder:
         failed_count = (merged['actual_execution_binary'] == 0).sum()
 
         # merge_asof 覆盖率监控（market snapshot 匹配率，低于80%说明市场数据不足）
-        if 'market_rate' in merged.columns:
-            market_matched = merged['market_rate'].notna().sum()
+        if 'close_annual' in merged.columns:
+            market_matched = merged['close_annual'].notna().sum()
             coverage = market_matched / len(merged) if len(merged) > 0 else 0
             if coverage < 0.80:
                 print(f"⚠️  merge_asof market coverage low: {market_matched}/{len(merged)} ({coverage:.1%}) — 市场快照匹配不足")
