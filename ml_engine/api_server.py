@@ -678,6 +678,19 @@ def _check_db_data_freshness(fUSD_max: int = 240, fUST_max: int = 1440) -> bool:
                 p_age = (_dt.now() - p_dt).total_seconds() / 60
                 if p_age > 900:
                     logger.warning(f"  WARN: fUST-{period} is {p_age:.0f}min old (>900min, possible liquidity drought)")
+        # 优化3: fUSD 长周期 per-period 诊断（数据源异常预警）
+        for period in [15, 20, 60, 90, 120]:
+            cursor.execute("SELECT MAX(timestamp) FROM funding_rates WHERE currency='fUSD' AND period=?", (period,))
+            p_row = cursor.fetchone()
+            if p_row and p_row[0]:
+                p_ts = p_row[0]
+                if p_ts > 1e10:
+                    p_dt = _dt.fromtimestamp(p_ts / 1000)
+                else:
+                    p_dt = _dt.fromtimestamp(p_ts)
+                p_age = (_dt.now() - p_dt).total_seconds() / 60
+                if p_age > 300:
+                    logger.warning(f"  WARN: fUSD-{period} is {p_age:.0f}min old (>300min, check Bitfinex data supply)")
         conn.close()
         return any_fresh
     except Exception as e:

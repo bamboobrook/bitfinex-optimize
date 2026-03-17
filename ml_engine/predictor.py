@@ -272,6 +272,48 @@ class EnsemblePredictor:
         finally:
             conn.close()
 
+    def _get_days_since_last_execution(self, currency: str, period: int) -> Optional[int]:
+        """Returns days since last EXECUTED order for (currency, period), or None if never executed."""
+        import sqlite3
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT MAX(created_at) FROM virtual_orders "
+                    "WHERE currency = ? AND period = ? AND status = 'EXECUTED'",
+                    (currency, period)
+                ).fetchone()
+            if row and row[0]:
+                last_exec_dt = datetime.strptime(row[0][:19], '%Y-%m-%d %H:%M:%S')
+                return (datetime.now() - last_exec_dt).days
+            return None
+        except Exception:
+            return None
+
+    def _is_zero_liquidity_suspended(self, currency: str, period: int,
+                                      exec_threshold: float = 0.05,
+                                      min_inactive_days: int = 14) -> bool:
+        """
+        Returns True when this pair should be suspended from virtual order creation.
+        Condition: exec_rate (fast window) < exec_threshold AND days_since_last_exec >= min_inactive_days.
+        """
+        days_no_exec = self._get_days_since_last_execution(currency, period)
+        if days_no_exec is None or days_no_exec < min_inactive_days:
+            return False
+        try:
+            from ml_engine.execution_features import ExecutionFeatures
+            fast_days = 21 if period >= 60 else 7
+            exec_rate = ExecutionFeatures().calculate_execution_rate(currency, period, fast_days)
+            if exec_rate < exec_threshold:
+                logger.info(
+                    f"Zero-liquidity suspension: {currency}-{period} "
+                    f"exec_rate_{fast_days}d={exec_rate:.3f}<{exec_threshold}, "
+                    f"{days_no_exec}d since last exec"
+                )
+                return True
+        except Exception:
+            pass
+        return False
+
     @staticmethod
     def _compute_direction_match(predicted_delta: float, market_signal: float) -> Optional[int]:
         """
@@ -324,6 +366,22 @@ class EnsemblePredictor:
                 effective_cap = cap_pct
         else:
             effective_cap = cap_pct
+
+        # 零成交加速收敛: 长期无成交时放宽 step_cap，加速价格降至市场水平
+        days_no_exec = self._get_days_since_last_execution(currency, period)
+        if days_no_exec is not None:
+            if days_no_exec >= 20:
+                effective_cap = max(effective_cap, 1.0)
+                logger.info(
+                    f"Zero-exec cap bypass {currency}-{period}: "
+                    f"{days_no_exec}d since last exec (>=20d), cap fully released"
+                )
+            elif days_no_exec >= 10:
+                effective_cap = max(effective_cap, cap_pct * 2.0)
+                logger.info(
+                    f"Zero-exec cap relaxed {currency}-{period}: "
+                    f"{days_no_exec}d since last exec (>=10d), cap x2={effective_cap:.3f}"
+                )
 
         lower = previous_rate * (1.0 - effective_cap)
         upper = previous_rate * (1.0 + effective_cap)
@@ -1242,10 +1300,15 @@ class EnsemblePredictor:
 
                 # Group predictions by tier
                 tier_preds = {'short': [], 'medium': [], 'long': []}
+                suspended_pairs = []  # (currency, period) tuples skipped due to zero liquidity
 
                 for pred in sorted_preds:
                     tier = get_tier(pred['period'])
                     if tier:
+                        # Skip zero-liquidity pairs (exec_rate_21d < 5% for 14+ days)
+                        if self._is_zero_liquidity_suspended(pred['currency'], pred['period']):
+                            suspended_pairs.append((pred['currency'], pred['period']))
+                            continue
                         # Check if cold start
                         order_count = self.order_manager.get_order_count(
                             pred['currency'],
@@ -1312,6 +1375,10 @@ class EnsemblePredictor:
                                 selected_preds.append(candidate)
 
                 # Create virtual orders
+                if suspended_pairs:
+                    print(f"\n⏸  Zero-liquidity suspension: {len(suspended_pairs)} pair(s) skipped (no exec for 14+d, exec_rate<5%):")
+                    for cur, per in suspended_pairs:
+                        print(f"   {cur}-{per}d")
                 probe_state = self._load_refresh_probe_state()
                 counters = probe_state.setdefault("counters", {})
                 lookback_hours = int(self._policy_value("automation", "refresh_probe_lookback_hours", 24))
