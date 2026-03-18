@@ -86,18 +86,38 @@ def get_period_window_profile(period: int, profile_name: Optional[str] = None) -
         }
 
     # Default balanced profile
-    if period <= 7:
+    # Fix4: 大幅缩短 fast/slow 窗口，让 exec_rate 更快响应市场变化
+    # 原长周期 fast_days=21, slow_days=90 → 改为 21/60，中周期 7/30 → 14/30
+    if period < 7:
         return {
             "fast_days": 3,
+            "slow_days": 7,
+            "spread_days": 14,
+            "gap_days": 7,
+            "delay_days": 7,
+            "anchor_minutes": 720,
+        }
+    if period < 14:
+        return {
+            "fast_days": 5,
             "slow_days": 14,
             "spread_days": 14,
             "gap_days": 7,
             "delay_days": 7,
             "anchor_minutes": 720,
         }
-    if period <= 30:
+    if period < 30:
         return {
             "fast_days": 7,
+            "slow_days": 21,
+            "spread_days": 30,
+            "gap_days": 14,
+            "delay_days": 14,
+            "anchor_minutes": 1440,
+        }
+    if period < 60:
+        return {
+            "fast_days": 14,
             "slow_days": 30,
             "spread_days": 30,
             "gap_days": 14,
@@ -106,7 +126,7 @@ def get_period_window_profile(period: int, profile_name: Optional[str] = None) -
         }
     return {
         "fast_days": 21,
-        "slow_days": 90,
+        "slow_days": 60,
         "spread_days": 90,
         "gap_days": 30,
         "delay_days": 30,
@@ -193,14 +213,16 @@ class ExecutionFeatures:
 
             if total == 0:
                 # 区分"真正冷启动"与"已成熟但市场死亡"两种情形
-                # 如果历史上该 (currency, period) 已有足够订单，说明市场曾经活跃
-                # 近期窗口 0 成交 = 流动性枯竭，应返回 0.0 而非冷启动默认值
+                # Fix8: 改用最近 90 天订单数判断，避免三个月前的历史记录干扰判断
+                # 近期 0 成交 + 近期有足够记录 = 流动性枯竭，应返回低值而非冷启动默认值
                 cursor2 = conn.cursor()
+                cutoff_90d = (as_of_date - timedelta(days=90)).strftime('%Y-%m-%d %H:%M:%S')
                 cursor2.execute(
                     "SELECT COUNT(*) FROM virtual_orders "
                     "WHERE currency = ? AND period = ? "
-                    "AND status IN ('EXECUTED', 'FAILED')",
-                    (currency, period)
+                    "AND status IN ('EXECUTED', 'FAILED') "
+                    "AND order_timestamp >= ?",
+                    (currency, period, cutoff_90d)
                 )
                 total_ever = cursor2.fetchone()[0] or 0
 

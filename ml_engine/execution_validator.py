@@ -80,6 +80,7 @@ class ExecutionValidator:
 
         Period-aware score threshold: short more sensitive, long more conservative.
         When market is inactive (low validation count), thresholds are relaxed.
+        Fix9: 若 7 天内该 pair 无成交（市场已死亡），不放宽阈值，避免误判。
         """
         # 基础阈值
         if period <= 7:
@@ -88,6 +89,27 @@ class ExecutionValidator:
             base = 43.0
         else:
             base = 48.0
+
+        # Fix9: 检查 7 天内真实成交数（EXECUTED+FAILED，排除 EXPIRED）
+        # 若近 7 天无成交，市场可能已死亡，保持严格阈值，不放宽
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM virtual_orders
+                WHERE currency = ? AND period = ?
+                  AND status IN ('EXECUTED', 'FAILED')
+                  AND order_timestamp >= datetime('now', '-7 days')
+            """, (currency, period))
+            recent_7d_count = cursor.fetchone()[0] or 0
+        except Exception:
+            recent_7d_count = 1  # 查询失败时保守处理，仍允许放宽
+        finally:
+            conn.close()
+
+        if recent_7d_count < 2:
+            # 7 天内几乎无成交，市场可能已死亡，返回严格基础阈值（不放宽）
+            return base
 
         # 获取最近验证数量作为市场活跃度指标
         recent_count = self._get_recent_validation_count(period, currency, hours=4)

@@ -68,9 +68,11 @@ class EnhancedModelTrainer:
             'n_jobs': self.cpu_threads,
         }
 
-        # LightGBM CPU 参数配置
+        # LightGBM GPU 参数配置（编译含 USE_GPU=1 时生效，否则 fallback 到 CPU）
         self.lgb_params = {
-            'device': 'cpu',
+            'device': 'gpu',
+            'gpu_platform_id': 0,
+            'gpu_device_id': 0,
             'learning_rate': 0.03,
             'max_depth': 7,
             'num_leaves': 31,
@@ -152,20 +154,23 @@ class EnhancedModelTrainer:
         df = df.sort_values(['currency', 'period', 'datetime'])
 
         def compute_targets(group):
-            # 使用固定前向窗口 (120小时)
-            indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=120)
+            # Fix3: 用 shift + 后向滚动窗口替代 FixedForwardWindowIndexer，消除前向偏差（数据泄露）
+            # shift(-120): 将序列向未来偏移120步，再用后向窗口取60步分布
+            # 确保标签反映"未来时段的统计分布"，不从当前时刻开始计算
+            low_shifted = group['low_annual'].shift(-120)
+            close_shifted_60 = group['close_annual'].shift(-60)
 
             # Target 1: 保守利率 (30%分位数)
-            group['future_conservative'] = group['low_annual'].rolling(window=indexer).quantile(0.3)
+            group['future_conservative'] = low_shifted.rolling(window=60, min_periods=1).quantile(0.3)
 
             # Target 2: 激进利率 (60%分位数)
-            group['future_aggressive'] = group['close_annual'].rolling(window=indexer).quantile(0.6)
+            group['future_aggressive'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.6)
 
             # Target 3: 平衡利率 (70%分位数)
-            group['future_balanced'] = group['close_annual'].rolling(window=indexer).quantile(0.7)
+            group['future_balanced'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.7)
 
             # Target 4: 成交概率 (二分类标签)
-            future_80pct = group['close_annual'].rolling(window=indexer).quantile(0.8)
+            future_80pct = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.8)
             group['future_execution_prob'] = (group['close_annual'] <= future_80pct).astype(int)
 
             return group
@@ -259,7 +264,7 @@ class EnhancedModelTrainer:
         return model, auc
 
     def train_lightgbm_regression(self, X_train, y_train, X_val, y_val, sample_weight=None):
-        """训练LightGBM回归模型"""
+        """训练LightGBM回归模型（GPU优先，不可用时 fallback 到 CPU）"""
         params = self.lgb_params.copy()
         params['objective'] = 'mae'
         params['metric'] = 'mae'
@@ -267,21 +272,39 @@ class EnhancedModelTrainer:
         train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
-        model = lgb.train(
-            params,
-            train_data,
-            num_boost_round=500,
-            valid_sets=[train_data, val_data],
-            valid_names=['train', 'val'],
-            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
-        )
+        try:
+            model = lgb.train(
+                params,
+                train_data,
+                num_boost_round=500,
+                valid_sets=[train_data, val_data],
+                valid_names=['train', 'val'],
+                callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
+            )
+        except Exception as e:
+            if 'gpu' in str(e).lower() or 'cuda' in str(e).lower():
+                import logging as _lg
+                _lg.getLogger(__name__).warning(f"LightGBM GPU not available ({e}), falling back to CPU")
+                params_cpu = {k: v for k, v in params.items()
+                              if k not in ('device', 'gpu_platform_id', 'gpu_device_id')}
+                params_cpu['device'] = 'cpu'
+                model = lgb.train(
+                    params_cpu,
+                    train_data,
+                    num_boost_round=500,
+                    valid_sets=[train_data, val_data],
+                    valid_names=['train', 'val'],
+                    callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
+                )
+            else:
+                raise
 
         pred_val = model.predict(X_val)
         mae = mean_absolute_error(y_val, pred_val)
         return model, mae
 
     def train_lightgbm_classification(self, X_train, y_train, X_val, y_val, sample_weight=None):
-        """训练LightGBM分类模型"""
+        """训练LightGBM分类模型（GPU优先，不可用时 fallback 到 CPU）"""
         params = self.lgb_params.copy()
         params['objective'] = 'binary'
         params['metric'] = 'auc'
@@ -289,14 +312,32 @@ class EnhancedModelTrainer:
         train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
-        model = lgb.train(
-            params,
-            train_data,
-            num_boost_round=500,
-            valid_sets=[train_data, val_data],
-            valid_names=['train', 'val'],
-            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
-        )
+        try:
+            model = lgb.train(
+                params,
+                train_data,
+                num_boost_round=500,
+                valid_sets=[train_data, val_data],
+                valid_names=['train', 'val'],
+                callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
+            )
+        except Exception as e:
+            if 'gpu' in str(e).lower() or 'cuda' in str(e).lower():
+                import logging as _lg
+                _lg.getLogger(__name__).warning(f"LightGBM GPU not available ({e}), falling back to CPU")
+                params_cpu = {k: v for k, v in params.items()
+                              if k not in ('device', 'gpu_platform_id', 'gpu_device_id')}
+                params_cpu['device'] = 'cpu'
+                model = lgb.train(
+                    params_cpu,
+                    train_data,
+                    num_boost_round=500,
+                    valid_sets=[train_data, val_data],
+                    valid_names=['train', 'val'],
+                    callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
+                )
+            else:
+                raise
 
         pred_val = model.predict(X_val)
         auc = roc_auc_score(y_val, pred_val)

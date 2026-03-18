@@ -334,11 +334,15 @@ class EnsemblePredictor:
         currency: str,
         period: int,
         predicted_rate: float,
-        current_rate: float = 0.0
+        current_rate: float = 0.0,
+        ma_720: float = 0.0
     ) -> Tuple[float, Optional[float], Optional[float], bool, Optional[float]]:
         """
         Apply per-period one-step cap. Currently strict for 120d by policy.
-        When predicted_rate diverges greatly from current market (>2.5x), cap is bypassed.
+        Bypass conditions (three-tier):
+          1. Market velocity > 25% from 12h MA → full bypass
+          2. predicted/current > 1.5x → full bypass
+          3. predicted/current > 1.2x → cap * 3 (max 40%)
 
         Returns:
             (capped_rate, previous_rate, step_change_pct, step_capped, cap_pct)
@@ -351,17 +355,29 @@ class EnsemblePredictor:
         if previous_rate is None or previous_rate <= 0:
             return predicted_rate, previous_rate, None, False, cap_pct
 
-        # 动态 cap: 预测严重偏离市场时放宽限制，加速收敛
+        # 动态 cap: 三层绕过机制，加速收敛
         if previous_rate > 0 and current_rate > 0:
             divergence_ratio = predicted_rate / current_rate
-            if divergence_ratio > 2.5:
-                effective_cap = 1.0              # 严重偏离: 单步可大幅调整
+            # 市场速度信号: current_rate 偏离 12h MA 程度
+            velocity = abs(current_rate - ma_720) / (ma_720 + 1e-8) if ma_720 > 0 else 0.0
+
+            if velocity > 0.25:
+                # 市场已快速移动（偏离12h均值25%+），完全绕过限制
+                effective_cap = 1.0
                 logger.info(
-                    f"Dynamic cap bypass for {currency}-{period}: "
-                    f"divergence_ratio={divergence_ratio:.2f}>2.5, cap released"
+                    f"Dynamic cap bypass (velocity) for {currency}-{period}: "
+                    f"velocity={velocity:.2f}>0.25, cap released"
                 )
             elif divergence_ratio > 1.5:
-                effective_cap = cap_pct * 2.0    # 中度偏离: cap 翻倍
+                # 预测偏离市场 1.5x 以上，完全绕过
+                effective_cap = 1.0
+                logger.info(
+                    f"Dynamic cap bypass for {currency}-{period}: "
+                    f"divergence_ratio={divergence_ratio:.2f}>1.5, cap released"
+                )
+            elif divergence_ratio > 1.2:
+                # 中度偏离: cap 翻3倍（最高40%）
+                effective_cap = min(cap_pct * 3.0, 0.40)
             else:
                 effective_cap = cap_pct
         else:
@@ -705,6 +721,21 @@ class EnsemblePredictor:
             )
             anchor_rate = capped_anchor
 
+        # Fix2: 市场快速变化时动态增加模型权重，减弱历史 MA 锚点的滞后拉力
+        if current_rate > 0 and anchor_rate > 0:
+            anchor_deviation = abs(current_rate - anchor_rate) / anchor_rate
+            if anchor_deviation > 0.40:
+                # 市场已偏离锚点 40%+，强烈信任模型而非历史锚点
+                conf_weight = min(conf_weight + 0.25, 0.90)
+                logger.debug(
+                    f"Anchor deviation boost {currency}-{period}: "
+                    f"deviation={anchor_deviation:.2f}>0.40, conf_weight→{conf_weight:.2f}"
+                )
+            elif anchor_deviation > 0.20:
+                # 市场偏离 20-40%，适度增加模型权重
+                boost = (anchor_deviation - 0.20) / 0.20 * 0.15
+                conf_weight = min(conf_weight + boost, 0.85)
+
         adjusted_rate = conf_weight * model_rate + (1 - conf_weight) * anchor_rate
 
         # S1: v2 revenue_optimized 模型已禁用混合
@@ -803,7 +834,7 @@ class EnsemblePredictor:
 
         # Enforce policy step cap for selected periods (120d by default).
         final_rate, previous_rate, step_change_pct, step_capped, step_cap_pct = self._apply_period_step_cap(
-            currency, period, final_rate, current_rate=current_rate
+            currency, period, final_rate, current_rate=current_rate, ma_720=ma_720
         )
         if step_capped and previous_rate is not None:
             logger.info(
@@ -1198,9 +1229,13 @@ class EnsemblePredictor:
 
             return final_score
 
+        # Fix5: 预先计算并写入 weighted_score，供 per-period 覆盖保证逻辑使用
+        for pred in valid_preds:
+            pred['weighted_score'] = calculate_weighted_score(pred)
+
         sorted_preds = sorted(
             valid_preds,
-            key=calculate_weighted_score,
+            key=lambda p: p['weighted_score'],
             reverse=True
         )
 
@@ -1265,6 +1300,11 @@ class EnsemblePredictor:
                     stale_pairs = [(i['currency'], i['period']) for i in self._stale_issues]
                     print(f"\n⚠️  Detected stale market data for {len(stale_pairs)} pair(s): {stale_pairs}")
                     print("    Continuing with virtual order creation for non-stale pairs.")
+
+                # Fix7: 构建 stale pair 集合，虚拟单创建时跳过数据陈旧的 pair
+                stale_pairs_set = set(
+                    (i['currency'], i['period']) for i in self._stale_issues
+                ) if self._stale_issues else set()
 
                 # Stratified sampling configuration by period tiers - 均衡采样
                 # 目标是覆盖全期限，各层级数量均衡
@@ -1390,6 +1430,15 @@ class EnsemblePredictor:
                 created_orders = []
                 for pred in selected_preds[:TOP_N]:
                     key = f"{pred['currency']}-{pred['period']}"
+
+                    # Fix7: 跳过数据陈旧的 pair，避免创建基于过期市场数据的虚拟单
+                    if stale_pairs_set and (pred['currency'], pred['period']) in stale_pairs_set:
+                        logger.info(
+                            f"Skipping virtual order for stale pair {pred['currency']}-{pred['period']}d "
+                            f"(market data too old)"
+                        )
+                        continue
+
                     recent_feedback_ok = not self.order_manager.needs_refresh_probe(
                         pred['currency'], pred['period'], lookback_hours, min_validations
                     )

@@ -832,8 +832,11 @@ async def run_full_pipeline():
                 cooldown = timedelta(hours=6) if is_urgent else timedelta(hours=24)
                 cooldown_label = "6h" if is_urgent else "24h"
 
-                if _last_forced_retrain_time and (datetime.now() - _last_forced_retrain_time) < cooldown:
-                    logger.info(f"ℹ️  Retraining triggered but skipped: last retrained {datetime.now() - _last_forced_retrain_time} ago (< {cooldown_label})")
+                # Fix6: 每次从磁盘重新读取，而非依赖内存变量（重启后状态也能正确加载）
+                _disk_state = load_retraining_state()
+                _disk_last_retrain = parse_datetime_safe(_disk_state.get("last_forced_retrain_time"))
+                if _disk_last_retrain and (datetime.now() - _disk_last_retrain) < cooldown:
+                    logger.info(f"ℹ️  Retraining triggered but skipped: last retrained {datetime.now() - _disk_last_retrain} ago (< {cooldown_label})")
                     should_retrain = False
                 else:
                     should_retrain = True
