@@ -67,3 +67,4 @@ rg -n "Step [1-6]|紧急重训练|stale_data|ERROR|✅" log/ml_optimizer.log | t
 
 ## 8) 最近修改记录
 - 2026-03-19: 重算 `market_liquidity.score`（基于实时 funding book 非2天深度+集中度惩罚）；liquidity gate None修复；avg_exec改用原始exec_rate；极端低流动性(<10%)绕过冷却强制重训。详见 MEMORY.md。
+- 2026-03-19: 修复 fUST-2d 异常 rank1 — `calculate_weighted_score` 新增 `low_rate_multiplier`（rate<3%线性惩罚至0.5x）；移除 `forced_top5` 强制置顶逻辑，gated 货币 2d 订单参与正常评分排序。
