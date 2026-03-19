@@ -1033,31 +1033,59 @@ class EnsemblePredictor:
         if not bid_levels:
             return 0.0
 
-        cumulative = 0.0
         sorted_levels = sorted(bid_levels, key=lambda x: x["rate"], reverse=True)
-        for level in sorted_levels:
-            cumulative += level["amount"]
+        total_depth = sum(level["amount"] for level in sorted_levels)
 
-        def coverage_ratio(target: float) -> float:
-            if cumulative <= 0:
+        def target_score(target: float) -> float:
+            if total_depth <= 0:
                 return 0.0
-            return self._clip_unit(cumulative / target)
 
-        coverage_10k = coverage_ratio(10_000.0)
-        coverage_50k = coverage_ratio(50_000.0)
-        coverage_100k = coverage_ratio(100_000.0)
+            cumulative = 0.0
+            levels_needed = len(sorted_levels)
+            for idx, level in enumerate(sorted_levels, start=1):
+                cumulative += level["amount"]
+                if cumulative >= target:
+                    levels_needed = idx
+                    break
 
-        # Penalize books that need too many levels to complete medium tickets.
-        max_levels = max(len(sorted_levels), 1)
-        level_efficiency = self._clip_unit(6.0 / max_levels)
+            coverage = self._clip_unit(cumulative / target)
+            # Require progressively fewer levels to earn a high score.
+            level_efficiency = self._clip_unit(1.0 - min(max(levels_needed - 1, 0), 10) / 12.0)
+            return coverage * level_efficiency
 
         signal = (
-            coverage_10k * 0.25 +
-            coverage_50k * 0.35 +
-            coverage_100k * 0.30 +
-            level_efficiency * 0.10
+            target_score(10_000.0) * 0.25 +
+            target_score(50_000.0) * 0.35 +
+            target_score(100_000.0) * 0.40
         )
         return self._clip_unit(signal)
+
+    def _calc_book_structure_factor(self, bid_levels: list) -> float:
+        """Penalize books whose non-2d depth is overly concentrated in one period."""
+        if not bid_levels:
+            return 0.55
+
+        period_amounts = {}
+        total_depth = 0.0
+        for level in bid_levels:
+            period = int(level["period"])
+            amount = float(level["amount"])
+            total_depth += amount
+            period_amounts[period] = period_amounts.get(period, 0.0) + amount
+
+        if total_depth <= 0:
+            return 0.55
+
+        max_share = max(period_amounts.values()) / total_depth
+        distinct_ratio = self._clip_unit(len(period_amounts) / 8.0)
+        concentration_signal = self._clip_unit(1.0 - max(0.0, max_share - 0.55) / 0.40)
+
+        # Keep some book value, but suppress single-period pileups.
+        return float(np.clip(
+            0.55 + distinct_ratio * 0.25 + concentration_signal * 0.20,
+            0.55,
+            1.0
+        ))
 
     def _get_realtime_non2d_liquidity_signal(self, currency: str) -> dict:
         """
@@ -1105,13 +1133,17 @@ class EnsemblePredictor:
 
         total_depth = sum(level["amount"] for level in bid_levels)
         fillability_signal = self._calc_fillability_signal(bid_levels)
-        # Use log scaling so fUSD/fUST can still separate even when both have >100k depth.
-        depth_signal = self._clip_unit(np.log1p(total_depth) / np.log1p(10_000_000.0))
+        # Use a tighter scaling so sub-million depth no longer looks close to max.
+        depth_signal = self._clip_unit(
+            np.log1p(total_depth / 100_000.0) / np.log1p(50.0)
+        )
+        structure_factor = self._calc_book_structure_factor(bid_levels)
 
         return {
             "available": True,
             "fillability_signal": fillability_signal,
             "depth_signal": float(depth_signal),
+            "structure_factor": structure_factor,
         }
 
     def _get_unified_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
@@ -1194,12 +1226,13 @@ class EnsemblePredictor:
 
             book_signal = self._get_realtime_non2d_liquidity_signal(currency)
             if book_signal["available"]:
-                score = (
-                    book_signal["fillability_signal"] * 0.50 +
-                    book_signal["depth_signal"] * 0.25 +
-                    avg_exec * 0.15 +
-                    freshness_signal * 0.10
-                ) * 100.0
+                base_score = (
+                    avg_exec * 0.40 +
+                    freshness_signal * 0.20 +
+                    book_signal["fillability_signal"] * 0.20 +
+                    book_signal["depth_signal"] * 0.20
+                )
+                score = base_score * book_signal.get("structure_factor", 1.0) * 100.0
             else:
                 score = (
                     avg_exec * 0.70 +

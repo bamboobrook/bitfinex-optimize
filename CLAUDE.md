@@ -70,3 +70,7 @@ rg -n "Step [1-6]|紧急重训练|stale_data|ERROR|✅" log/ml_optimizer.log | t
 - 问题描述: 旧 score 混入 2 天活跃度，容易高估市场整体流动性，无法准确反映非 2 天尤其长周期挂单当前能否成交。
 - 复现路径: `data/optimal_combination.json` 中 `fUSD/fUST` 的 `market_liquidity` 仅基于历史成交率/量比/新鲜度；当 2 天活跃、长周期冷清时，score 与真实长周期盘口可成交性偏离。
 - 修复思路: 保持 `volume_ratio_24h` 与分档阈值不变，改为基于 Bitfinex 实时 funding book 的非 2 天 bid 深度与 1万/5万/10万可成交性，叠加历史执行率和数据新鲜度重算 score；当 `score < 40 && volume_ratio_24h < 0.1` 时，所有非 2 天挂单统一转为 2 天。
+- 2026-03-19: 修正 `market_liquidity.score` 过高
+- 问题描述: 上一版订单薄信号权重过强，且未惩罚非 2 天深度集中在单一期限的情况，导致 `score` 容易冲到 80+，明显高估长周期真实流动性。
+- 复现路径: 对照 `data/optimal_combination.json` 与实时 funding book，可见 `fUSD/fUST` 的非 2 天 bid 深度大多堆在 `120d`，但市场级 `score` 仍被判为 `high`。
+- 修复思路: 收紧 `fillability/depth` 的归一化映射，降低实时盘口信号权重，并加入非 2 天深度的期限集中度惩罚，让 `score` 更贴近旧值区间与真实长周期可成交性。
