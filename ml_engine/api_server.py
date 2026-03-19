@@ -827,20 +827,33 @@ async def run_full_pipeline():
 
             # 检查输出中是否包含"需要重训练"
             if "需要重训练" in stdout:
-                # 紧急重训练(单period异常)冷却6h，普通重训练冷却24h
-                is_urgent = "紧急重训练" in stdout
-                cooldown = timedelta(hours=6) if is_urgent else timedelta(hours=24)
-                cooldown_label = "6h" if is_urgent else "24h"
+                # 极端低流动性（exec_rate < 10%）：绕过冷却强制重训
+                _bypass_cooldown = False
+                if "全局成交率过低" in stdout:
+                    import re as _re
+                    _m = _re.search(r'(\d+(?:\.\d+)?)%\s*<', stdout)
+                    if _m and float(_m.group(1)) < 10.0:
+                        logger.warning(f"极端低流动性 ({_m.group(1)}% < 10%)，绕过冷却强制重训")
+                        _bypass_cooldown = True
 
-                # Fix6: 每次从磁盘重新读取，而非依赖内存变量（重启后状态也能正确加载）
-                _disk_state = load_retraining_state()
-                _disk_last_retrain = parse_datetime_safe(_disk_state.get("last_forced_retrain_time"))
-                if _disk_last_retrain and (datetime.now() - _disk_last_retrain) < cooldown:
-                    logger.info(f"ℹ️  Retraining triggered but skipped: last retrained {datetime.now() - _disk_last_retrain} ago (< {cooldown_label})")
-                    should_retrain = False
-                else:
+                if _bypass_cooldown:
                     should_retrain = True
-                    logger.info(f"✅ Retraining trigger detected (urgent={is_urgent}): {stdout[-300:]}")
+                    logger.info(f"✅ Retraining trigger detected (bypass_cooldown=True): {stdout[-300:]}")
+                else:
+                    # 紧急重训练(单period异常)冷却6h，普通重训练冷却24h
+                    is_urgent = "紧急重训练" in stdout
+                    cooldown = timedelta(hours=6) if is_urgent else timedelta(hours=24)
+                    cooldown_label = "6h" if is_urgent else "24h"
+
+                    # Fix6: 每次从磁盘重新读取，而非依赖内存变量（重启后状态也能正确加载）
+                    _disk_state = load_retraining_state()
+                    _disk_last_retrain = parse_datetime_safe(_disk_state.get("last_forced_retrain_time"))
+                    if _disk_last_retrain and (datetime.now() - _disk_last_retrain) < cooldown:
+                        logger.info(f"ℹ️  Retraining triggered but skipped: last retrained {datetime.now() - _disk_last_retrain} ago (< {cooldown_label})")
+                        should_retrain = False
+                    else:
+                        should_retrain = True
+                        logger.info(f"✅ Retraining trigger detected (urgent={is_urgent}): {stdout[-300:]}")
             else:
                 logger.info(f"ℹ️  No retraining needed: {stdout[-300:]}")
 

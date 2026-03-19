@@ -885,6 +885,7 @@ class EnsemblePredictor:
             "predicted_rate": float(final_rate),
             "execution_probability": prob,
             "calibrated_execution_prob": float(calibrated_prob),  # exec_rate校准后的成交概率（反映真实流动性）
+            "exec_rate_raw": float(exec_rate_fast),  # 原始历史成交率（用于流动性评分，不受模型滞后影响）
             "liquidity_score": liq_score,
             "liquidity_level": liq_level,
             "conservative_rate": p_cons,
@@ -1194,7 +1195,7 @@ class EnsemblePredictor:
         for currency, items in groups.items():
             non2d_items = [x for x in items if int(x.get('period', 0)) != 2]
             ref_items = non2d_items or items
-            avg_exec = sum(x.get('calibrated_execution_prob', 0.5) for x in ref_items) / len(ref_items)
+            avg_exec = sum(x.get('exec_rate_raw', x.get('calibrated_execution_prob', 0.5)) for x in ref_items) / len(ref_items)
             avg_age = sum(float(x.get('data_age_minutes', 0.0) or 0.0) for x in ref_items) / len(ref_items)
             warn_min, hard_min = self._freshness_thresholds_minutes(currency)
             if avg_age <= warn_min:
@@ -1354,8 +1355,7 @@ class EnsemblePredictor:
         gated_currencies = {
             currency for currency, info in market_liquidity.items()
             if info.get("score", 100.0) < 40.0 and
-            info.get("volume_ratio_24h") is not None and
-            info.get("volume_ratio_24h") < 0.1
+            (info.get("volume_ratio_24h") or 0.0) < 0.1
         }
         if gated_currencies:
             logger.warning(
