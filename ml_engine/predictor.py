@@ -9,6 +9,9 @@ from loguru import logger
 from datetime import datetime, timedelta
 import numpy as np
 from typing import Optional, Tuple
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
@@ -52,6 +55,7 @@ class EnsemblePredictor:
             "data", "refresh_probe_state.json"
         )
         self._stale_issues = []
+        self._funding_book_cache = {}
         logger.info(
             f"Predictor parallel config: max_workers={self.max_workers}, "
             f"infer_threads={self.infer_threads}"
@@ -979,6 +983,137 @@ class EnsemblePredictor:
             level = "insufficient"
         return round(score, 1), level
 
+    def _fetch_bitfinex_public_json(self, path: str, params: Optional[dict] = None,
+                                    cache_ttl_seconds: int = 20):
+        """Fetch Bitfinex public JSON with a short in-memory cache."""
+        params = params or {}
+        query = urllib_parse.urlencode(sorted(params.items()))
+        url = f"https://api-pub.bitfinex.com{path}"
+        cache_key = f"{url}?{query}" if query else url
+        now_ts = datetime.now().timestamp()
+
+        cached = self._funding_book_cache.get(cache_key)
+        if cached and (now_ts - cached["ts"]) < cache_ttl_seconds:
+            return cached["data"]
+
+        if query:
+            url = f"{url}?{query}"
+
+        req = urllib_request.Request(
+            url,
+            headers={"User-Agent": "optimize-liquidity-check/1.0"}
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, list) and len(data) >= 2 and data[0] == "error":
+                logger.warning(f"Bitfinex public API returned error payload for {url}: {data}")
+                return None
+            self._funding_book_cache[cache_key] = {"ts": now_ts, "data": data}
+            return data
+        except (urllib_error.URLError, TimeoutError, ValueError) as e:
+            logger.warning(f"Bitfinex public API fetch failed for {url}: {e}")
+            return None
+
+    @staticmethod
+    def _annualize_rate(rate: float) -> float:
+        if rate is None:
+            return 0.0
+        return float(rate) * 365.0 * 100.0
+
+    @staticmethod
+    def _clip_unit(value: float) -> float:
+        return float(np.clip(value, 0.0, 1.0))
+
+    def _calc_fillability_signal(self, bid_levels: list) -> float:
+        """
+        Evaluate whether medium-size non-2d funding offers can be filled quickly.
+        Targets follow the user's current operational range: 10k / 50k / 100k.
+        """
+        if not bid_levels:
+            return 0.0
+
+        cumulative = 0.0
+        sorted_levels = sorted(bid_levels, key=lambda x: x["rate"], reverse=True)
+        for level in sorted_levels:
+            cumulative += level["amount"]
+
+        def coverage_ratio(target: float) -> float:
+            if cumulative <= 0:
+                return 0.0
+            return self._clip_unit(cumulative / target)
+
+        coverage_10k = coverage_ratio(10_000.0)
+        coverage_50k = coverage_ratio(50_000.0)
+        coverage_100k = coverage_ratio(100_000.0)
+
+        # Penalize books that need too many levels to complete medium tickets.
+        max_levels = max(len(sorted_levels), 1)
+        level_efficiency = self._clip_unit(6.0 / max_levels)
+
+        signal = (
+            coverage_10k * 0.25 +
+            coverage_50k * 0.35 +
+            coverage_100k * 0.30 +
+            level_efficiency * 0.10
+        )
+        return self._clip_unit(signal)
+
+    def _get_realtime_non2d_liquidity_signal(self, currency: str) -> dict:
+        """
+        Use realtime Bitfinex funding book to judge whether non-2d orders can be
+        executed now. Internal-only helper; no extra output fields are exposed.
+        """
+        book = self._fetch_bitfinex_public_json(
+            f"/v2/book/{currency}/P0",
+            params={"len": 100},
+            cache_ttl_seconds=20
+        )
+        if not isinstance(book, list):
+            return {
+                "available": False,
+                "fillability_signal": 0.0,
+                "depth_signal": 0.0,
+            }
+
+        bid_levels = []
+        for row in book:
+            if not isinstance(row, list) or len(row) < 4:
+                continue
+            try:
+                rate = float(row[0])
+                period = int(row[1])
+                amount = float(row[3])
+            except (TypeError, ValueError):
+                continue
+
+            # Funding book: amount < 0 means bid. Ignore 2d to avoid short-term masking.
+            if amount >= 0 or period <= 2:
+                continue
+            bid_levels.append({
+                "rate": self._annualize_rate(rate),
+                "period": period,
+                "amount": abs(amount),
+            })
+
+        if not bid_levels:
+            return {
+                "available": True,
+                "fillability_signal": 0.0,
+                "depth_signal": 0.0,
+            }
+
+        total_depth = sum(level["amount"] for level in bid_levels)
+        fillability_signal = self._calc_fillability_signal(bid_levels)
+        # Use log scaling so fUSD/fUST can still separate even when both have >100k depth.
+        depth_signal = self._clip_unit(np.log1p(total_depth) / np.log1p(10_000_000.0))
+
+        return {
+            "available": True,
+            "fillability_signal": fillability_signal,
+            "depth_signal": float(depth_signal),
+        }
+
     def _get_unified_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
                                 avg_gap: float, base_rate: float,
                                 period: int, currency: str,
@@ -1025,8 +1160,17 @@ class EnsemblePredictor:
 
         result = {}
         for currency, items in groups.items():
-            avg_score = sum(x.get('liquidity_score', 50) for x in items) / len(items)
-            avg_exec = sum(x.get('calibrated_execution_prob', 0.5) for x in items) / len(items)
+            non2d_items = [x for x in items if int(x.get('period', 0)) != 2]
+            ref_items = non2d_items or items
+            avg_exec = sum(x.get('calibrated_execution_prob', 0.5) for x in ref_items) / len(ref_items)
+            avg_age = sum(float(x.get('data_age_minutes', 0.0) or 0.0) for x in ref_items) / len(ref_items)
+            warn_min, hard_min = self._freshness_thresholds_minutes(currency)
+            if avg_age <= warn_min:
+                freshness_signal = 1.0
+            else:
+                freshness_signal = max(0.2, 1.0 - 0.8 * min(
+                    (avg_age - warn_min) / max(hard_min - warn_min, 1.0), 1.0
+                ))
 
             # 查 funding_rates 24h vs 30d 平均成交量（用 period=30 作代表性基准）
             try:
@@ -1048,7 +1192,21 @@ class EnsemblePredictor:
             except Exception:
                 volume_ratio_24h = None
 
-            score = round(avg_score, 1)
+            book_signal = self._get_realtime_non2d_liquidity_signal(currency)
+            if book_signal["available"]:
+                score = (
+                    book_signal["fillability_signal"] * 0.50 +
+                    book_signal["depth_signal"] * 0.25 +
+                    avg_exec * 0.15 +
+                    freshness_signal * 0.10
+                ) * 100.0
+            else:
+                score = (
+                    avg_exec * 0.70 +
+                    freshness_signal * 0.30
+                ) * 100.0
+            score = round(float(np.clip(score, 0.0, 100.0)), 1)
+
             if score >= 65:
                 level = "high"
             elif score >= 40:
@@ -1160,6 +1318,17 @@ class EnsemblePredictor:
         valid_preds = [p for p in preds if p['predicted_rate'] > 1.0]
 
         market_liquidity = self._calc_market_liquidity(preds)
+        gated_currencies = {
+            currency for currency, info in market_liquidity.items()
+            if info.get("score", 100.0) < 40.0 and
+            info.get("volume_ratio_24h") is not None and
+            info.get("volume_ratio_24h") < 0.1
+        }
+        if gated_currencies:
+            logger.warning(
+                f"Liquidity gate triggered for {sorted(gated_currencies)}: "
+                f"score < 40 and volume_ratio_24h < 0.1, non-2d orders will downgrade to 2d"
+            )
 
         # Revenue-optimized scoring: 收益率优先,兼顾成交和长周期
         def calculate_weighted_score(pred):
@@ -1233,11 +1402,24 @@ class EnsemblePredictor:
         for pred in valid_preds:
             pred['weighted_score'] = calculate_weighted_score(pred)
 
+        eligible_preds = [
+            p for p in valid_preds
+            if not (p['currency'] in gated_currencies and int(p['period']) != 2)
+        ]
+
         sorted_preds = sorted(
-            valid_preds,
+            eligible_preds,
             key=lambda p: p['weighted_score'],
             reverse=True
         )
+        gated_2d_preds = []
+        for currency in sorted(gated_currencies):
+            pred_2d = next(
+                (p for p in sorted_preds if p['currency'] == currency and int(p['period']) == 2),
+                None
+            )
+            if pred_2d is not None:
+                gated_2d_preds.append(pred_2d)
 
         result = {
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1262,7 +1444,16 @@ class EnsemblePredictor:
                 break
 
         # rank 1-5: top 5 from sorted_preds excluding fUSD-2d
-        top5 = [p for p in sorted_preds if not (p['currency'] == 'fUSD' and p['period'] == 2)][:5]
+        forced_top5 = [
+            p for p in gated_2d_preds
+            if not (p['currency'] == 'fUSD' and int(p['period']) == 2)
+        ]
+        top5_candidates = [
+            p for p in sorted_preds
+            if not (p['currency'] == 'fUSD' and p['period'] == 2)
+            and (p['currency'], p['period']) not in {(x['currency'], x['period']) for x in forced_top5}
+        ]
+        top5 = (forced_top5 + top5_candidates)[:5]
         recommendations_to_add = top5 + ([fusd_2d_pred] if fusd_2d_pred else [])
 
         # Build the recommendations list
@@ -1300,6 +1491,11 @@ class EnsemblePredictor:
                     stale_pairs = [(i['currency'], i['period']) for i in self._stale_issues]
                     print(f"\n⚠️  Detected stale market data for {len(stale_pairs)} pair(s): {stale_pairs}")
                     print("    Continuing with virtual order creation for non-stale pairs.")
+                if gated_currencies:
+                    print(
+                        f"\n⚠️  Liquidity gate active for {sorted(gated_currencies)}: "
+                        "score<40 and volume_ratio_24h<0.1, non-2d orders downgraded to 2d."
+                    )
 
                 # Fix7: 构建 stale pair 集合，虚拟单创建时跳过数据陈旧的 pair
                 stale_pairs_set = set(
@@ -1413,6 +1609,30 @@ class EnsemblePredictor:
                                 selected_preds[min_idx] = candidate
                             else:
                                 selected_preds.append(candidate)
+
+                # If liquidity gate is active, force the downgraded 2d order into execution set.
+                selected_keys = {(p['currency'], p['period']) for p in selected_preds}
+                forced_keys = {(p['currency'], p['period']) for p in gated_2d_preds}
+                for gate_pred in gated_2d_preds:
+                    key = (gate_pred['currency'], gate_pred['period'])
+                    if key in selected_keys:
+                        continue
+                    if len(selected_preds) >= TOP_N:
+                        replace_candidates = [
+                            i for i, pred in enumerate(selected_preds)
+                            if (pred['currency'], pred['period']) not in forced_keys
+                        ]
+                        if replace_candidates:
+                            min_idx = min(
+                                replace_candidates,
+                                key=lambda i: selected_preds[i].get('weighted_score', 0)
+                            )
+                            selected_preds[min_idx] = gate_pred
+                        else:
+                            continue
+                    else:
+                        selected_preds.append(gate_pred)
+                    selected_keys.add(key)
 
                 # Create virtual orders
                 if suspended_pairs:
