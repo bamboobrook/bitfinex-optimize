@@ -1421,13 +1421,22 @@ class EnsemblePredictor:
             else:
                 divergence_multiplier = 1.0
 
-            # 7. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
+            # 7. 绝对利率下限惩罚：predicted_rate 极低时降权
+            # 防止 fUST-2d 在市场崩塌时因高 calib_prob 异常排名靠前
+            # 阈值 3.0%：低于此值线性惩罚，rate=0 时 multiplier=0.5x
+            LOW_RATE_THRESHOLD = 3.0
+            if rate < LOW_RATE_THRESHOLD:
+                low_rate_multiplier = 0.5 + 0.5 * (rate / LOW_RATE_THRESHOLD)
+            else:
+                low_rate_multiplier = 1.0
+
+            # 8. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
             final_score = (
                 effective_rate * 0.40 +
                 normalized_rate * 0.30 +
                 calib_prob * 0.20 +
                 revenue_factor * 0.10
-            ) * exec_floor_multiplier * age_multiplier * divergence_multiplier
+            ) * exec_floor_multiplier * age_multiplier * divergence_multiplier * low_rate_multiplier
 
             return final_score
 
@@ -1477,16 +1486,12 @@ class EnsemblePredictor:
                 break
 
         # rank 1-5: top 5 from sorted_preds excluding fUSD-2d
-        forced_top5 = [
-            p for p in gated_2d_preds
-            if not (p['currency'] == 'fUSD' and int(p['period']) == 2)
-        ]
+        # gated 货币的 2d 订单参与正常评分排序，不再强制置顶（避免低利率 2d 异常 rank1）
         top5_candidates = [
             p for p in sorted_preds
             if not (p['currency'] == 'fUSD' and p['period'] == 2)
-            and (p['currency'], p['period']) not in {(x['currency'], x['period']) for x in forced_top5}
         ]
-        top5 = (forced_top5 + top5_candidates)[:5]
+        top5 = top5_candidates[:5]
         recommendations_to_add = top5 + ([fusd_2d_pred] if fusd_2d_pred else [])
 
         # Build the recommendations list
