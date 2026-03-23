@@ -125,7 +125,7 @@ def get_db_statistics():
                 ROUND(100.0 * SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) / COUNT(*), 1) as exec_rate
             FROM virtual_orders
             WHERE order_timestamp >= datetime('now', '-7 days')
-              AND status IN ('EXECUTED', 'FAILED')
+              AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
             GROUP BY currency, period
             ORDER BY total DESC
             LIMIT 10
@@ -379,7 +379,7 @@ def test_execution_rate_realism(conn):
             SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END) as executed
         FROM virtual_orders
         WHERE order_timestamp >= ?
-          AND status IN ('EXECUTED', 'FAILED')
+          AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
     """, (cutoff_7d,))
 
     row = cursor.fetchone()
@@ -409,7 +409,7 @@ def test_execution_rate_realism(conn):
             SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END) as executed
         FROM virtual_orders
         WHERE order_timestamp >= ?
-          AND status IN ('EXECUTED', 'FAILED')
+          AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
     """, (cutoff_30d,))
 
     row = cursor.fetchone()

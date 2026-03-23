@@ -408,21 +408,24 @@ class DataProcessor:
             )
             df = self._apply_default_exec_features(df)
 
-        # ============ 8. 改进目标定义 (4个目标) - v3 收益率优先版 ============
-        indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=120)
+        # ============ 8. 改进目标定义 (4个目标) — v4 无前向偏差版 ============
+        # 使用 shift(-120) + 后向滚动窗口，消除前向偏差（数据泄露）
+        # 分位数与 model_trainer_v2.py 保持一致: 30%/60%/70%/80%
+        low_shifted = df['low_annual'].shift(-120)
+        close_shifted_60 = df['close_annual'].shift(-60)
 
-        # Target 1: 保守利率 (28%分位数 - 介于原始30%和v2的25%之间)
-        df['future_conservative'] = df['low_annual'].rolling(window=indexer).quantile(0.28)
+        # Target 1: 保守利率 (30%分位数)
+        df['future_conservative'] = low_shifted.rolling(window=60, min_periods=1).quantile(0.3)
 
-        # Target 2: 激进利率 (58%分位数 - 接近原始60%,保留高利率追求)
-        df['future_aggressive'] = df['close_annual'].rolling(window=indexer).quantile(0.58)
+        # Target 2: 激进利率 (60%分位数)
+        df['future_aggressive'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.6)
 
-        # Target 3: 平衡利率 (68%分位数 - 接近原始70%,温和下调)
-        df['future_balanced'] = df['close_annual'].rolling(window=indexer).quantile(0.68)
+        # Target 3: 平衡利率 (70%分位数)
+        df['future_balanced'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.7)
 
-        # Target 4: 成交概率 (78%分位数 - 接近原始80%)
-        future_78pct = df['close_annual'].rolling(window=indexer).quantile(0.78)
-        df['future_execution_prob'] = (df['close_annual'] <= future_78pct).astype(int)
+        # Target 4: 成交概率 (80%分位数二分类)
+        future_80pct = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.8)
+        df['future_execution_prob'] = (df['close_annual'] <= future_80pct).astype(int)
 
         # 清理 NaN
         df = df.dropna()

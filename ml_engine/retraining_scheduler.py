@@ -118,7 +118,7 @@ class RetrainingScheduler:
         query = """
         SELECT COUNT(*) FROM virtual_orders
         WHERE order_timestamp >= ?
-          AND status IN ('EXECUTED', 'FAILED')
+          AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
         """
 
         cursor.execute(query, (since_date.strftime('%Y-%m-%d'),))
@@ -285,7 +285,7 @@ class RetrainingScheduler:
     def _trigger_thresholds(self) -> Dict[str, float]:
         cfg = self.policy.get("retrain_trigger", {})
         return {
-            "score_threshold": float(cfg.get("score_threshold", 1.0)),
+            "score_threshold": float(cfg.get("score_threshold", 0.5)),
             "follow_mae_ratio_threshold": float(cfg.get("follow_mae_ratio_threshold", 0.65)),
             "direction_match_threshold": float(cfg.get("direction_match_threshold", 0.40)),
             "p120_step_p95_threshold": float(cfg.get("p120_step_p95_threshold", 0.05)),
@@ -922,14 +922,15 @@ class RetrainingScheduler:
             df_feat = df.groupby('period', group_keys=False).apply(processor.add_technical_indicators)
             df_feat = df_feat.sort_values(['currency', 'period', 'datetime'])
 
-            # Traditional targets (same definition as trainer).
+            # Traditional targets — 与 model_trainer_v2.py 保持一致，消除前向偏差
             def _compute_targets(group: pd.DataFrame) -> pd.DataFrame:
                 group = group.copy()
-                indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=120)
-                group['future_conservative'] = group['low_annual'].rolling(window=indexer).quantile(0.3)
-                group['future_aggressive'] = group['close_annual'].rolling(window=indexer).quantile(0.6)
-                group['future_balanced'] = group['close_annual'].rolling(window=indexer).quantile(0.7)
-                fut80 = group['close_annual'].rolling(window=indexer).quantile(0.8)
+                low_shifted = group['low_annual'].shift(-120)
+                close_shifted_60 = group['close_annual'].shift(-60)
+                group['future_conservative'] = low_shifted.rolling(window=60, min_periods=1).quantile(0.3)
+                group['future_aggressive'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.6)
+                group['future_balanced'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.7)
+                fut80 = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.8)
                 group['future_execution_prob'] = (group['close_annual'] <= fut80).astype(float)
                 return group
 

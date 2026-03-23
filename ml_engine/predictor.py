@@ -1413,9 +1413,10 @@ class EnsemblePredictor:
             current_rate_val = pred.get('current_rate', rate)
             if follow_err > 0 and current_rate_val > 0:
                 relative_err = follow_err / current_rate_val
-                if relative_err > 0.5:
-                    # relative_err 0.5→4.0 线性映射到 multiplier 1.0→0.5（阈值从1.5降至0.5，覆盖中等偏离）
-                    divergence_multiplier = max(0.5, 1.0 - 0.2 * (relative_err - 0.5))
+                if relative_err > 1.5:
+                    # relative_err > 1.5 (预测 > 市场×2.5) 时线性惩罚，避免历史高利率残留
+                    # 1.5→4.0 映射到 multiplier 1.0→0.5
+                    divergence_multiplier = max(0.5, 1.0 - 0.2 * (relative_err - 1.5))
                 else:
                     divergence_multiplier = 1.0
             else:
