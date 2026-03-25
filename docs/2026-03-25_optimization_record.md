@@ -46,6 +46,15 @@
 
 ## 已完成改动
 
+### 0. Follow-up: 下载阶段不再阻塞 pipeline
+
+文件: `ml_engine/api_server.py`
+
+- 保留下载器对 stale/missing 组合的非 0 返回和日志告警
+- 但 API 编排层不再把这种情况当成下载失败重试/中止
+- 只有真正的超时、异常、网络错误才继续走 retry/backoff
+- freshness 统一继续交给预测阶段的 stale gate 判定
+
 ### 1. 下载器
 
 文件: `funding_history_downloader.py`

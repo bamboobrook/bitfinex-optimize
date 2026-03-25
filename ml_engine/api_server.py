@@ -716,8 +716,26 @@ async def _run_subprocess_with_timeout(cmd, cwd, timeout, step_name):
         await process.wait()
         return "", f"Subprocess timed out after {timeout}s", -1
 
+
+def _is_partial_download_with_stale(stdout: str, stderr: str, rc: int) -> bool:
+    """
+    下载器已执行完成，但仅因为仍有 stale/missing 组合而返回非 0。
+    这种情况不应阻塞后续 pipeline，freshness 交给预测阶段判定。
+    """
+    if rc == 0:
+        return False
+
+    text = f"{stdout}\n{stderr}"
+    markers = [
+        "Download finished with stale/failed combinations",
+        "currency-period combinations have stale or missing data",
+        "stale or missing data",
+    ]
+    return any(marker in text for marker in markers)
+
+
 async def _download_with_retry(cwd, max_retries=3):
-    """Download with exponential backoff retry. Returns True if succeeded or DB data is fresh enough."""
+    """Download with exponential backoff retry. Partial stale refresh should not block pipeline."""
     download_cmd = ["python", "-m", "funding_history_downloader", "--days", "30"]
     for attempt in range(max_retries):
         stdout, stderr, rc = await _run_subprocess_with_timeout(
@@ -729,6 +747,12 @@ async def _download_with_retry(cwd, max_retries=3):
             logger.warning(f"Download stderr:\n{stderr[-500:]}")
         if rc == 0:
             logger.info("✅ Market data download completed")
+            return True
+        if _is_partial_download_with_stale(stdout, stderr, rc):
+            logger.warning(
+                "⚠️  Market data download completed with stale/missing pairs. "
+                "Continuing pipeline; freshness gate will be enforced at prediction stage."
+            )
             return True
         wait_time = 60 * (2 ** attempt)  # 60s, 120s, 240s
         if attempt < max_retries - 1:
