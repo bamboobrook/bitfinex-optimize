@@ -456,6 +456,225 @@ class EnsemblePredictor:
         except Exception as e:
             logger.warning(f"Failed to save refresh probe state: {e}")
 
+    @staticmethod
+    def _get_period_tier(period: int) -> str:
+        if period >= 60:
+            return "long"
+        if period >= 14:
+            return "medium"
+        return "short"
+
+    def _get_probability_calibration_profile(self, currency: str, period: int) -> dict:
+        tier = self._get_period_tier(period)
+        profile = {
+            "tier": tier,
+            "prior": 0.45,
+            "sample_scale": 80.0,
+            "max_evidence_weight": 0.78,
+            "fast_weight": 0.55,
+            "slow_weight": 0.25,
+            "prior_weight": 0.20,
+            "gap_penalty_start": 0.60,
+            "gap_penalty_factor": 0.10,
+            "gap_penalty_cap": 0.18,
+            "collapse_exec_floor": 0.16,
+            "collapse_min_orders": 8,
+            "collapse_prob_cap": 0.42,
+            "days_no_exec_threshold": 14,
+            "days_no_exec_prob_cap": 0.35,
+            "divergence_penalty_start": 1.20,
+            "divergence_penalty_factor": 0.10,
+            "divergence_penalty_cap": 0.22,
+        }
+
+        if currency == "fUSD":
+            if tier == "short":
+                profile.update({
+                    "prior": 0.42,
+                    "sample_scale": 55.0,
+                    "max_evidence_weight": 0.82,
+                    "fast_weight": 0.60,
+                    "slow_weight": 0.25,
+                    "prior_weight": 0.15,
+                    "gap_penalty_factor": 0.14,
+                    "gap_penalty_cap": 0.22,
+                    "collapse_exec_floor": 0.18,
+                    "collapse_prob_cap": 0.45,
+                    "days_no_exec_prob_cap": 0.38,
+                })
+            elif tier == "medium":
+                profile.update({
+                    "prior": 0.36,
+                    "sample_scale": 42.0,
+                    "max_evidence_weight": 0.84,
+                    "fast_weight": 0.62,
+                    "slow_weight": 0.26,
+                    "prior_weight": 0.12,
+                    "gap_penalty_start": 0.45,
+                    "gap_penalty_factor": 0.18,
+                    "gap_penalty_cap": 0.28,
+                    "collapse_exec_floor": 0.16,
+                    "collapse_prob_cap": 0.36,
+                    "days_no_exec_threshold": 10,
+                    "days_no_exec_prob_cap": 0.30,
+                })
+            else:
+                profile.update({
+                    "prior": 0.30,
+                    "sample_scale": 24.0,
+                    "max_evidence_weight": 0.88,
+                    "fast_weight": 0.62,
+                    "slow_weight": 0.28,
+                    "prior_weight": 0.10,
+                    "gap_penalty_start": 0.35,
+                    "gap_penalty_factor": 0.24,
+                    "gap_penalty_cap": 0.38,
+                    "collapse_exec_floor": 0.20,
+                    "collapse_min_orders": 6,
+                    "collapse_prob_cap": 0.28,
+                    "days_no_exec_threshold": 7,
+                    "days_no_exec_prob_cap": 0.22,
+                    "divergence_penalty_start": 0.80,
+                    "divergence_penalty_factor": 0.14,
+                    "divergence_penalty_cap": 0.30,
+                })
+        else:
+            if tier == "short":
+                profile.update({
+                    "prior": 0.50,
+                    "sample_scale": 48.0,
+                    "max_evidence_weight": 0.80,
+                    "fast_weight": 0.58,
+                    "slow_weight": 0.22,
+                    "prior_weight": 0.20,
+                    "collapse_exec_floor": 0.18,
+                    "collapse_prob_cap": 0.48,
+                })
+            elif tier == "medium":
+                profile.update({
+                    "prior": 0.44,
+                    "sample_scale": 40.0,
+                    "max_evidence_weight": 0.82,
+                    "fast_weight": 0.56,
+                    "slow_weight": 0.24,
+                    "prior_weight": 0.20,
+                    "gap_penalty_start": 0.55,
+                    "gap_penalty_factor": 0.12,
+                    "gap_penalty_cap": 0.20,
+                    "collapse_exec_floor": 0.14,
+                    "collapse_prob_cap": 0.42,
+                })
+            else:
+                profile.update({
+                    "prior": 0.36,
+                    "sample_scale": 28.0,
+                    "max_evidence_weight": 0.84,
+                    "fast_weight": 0.58,
+                    "slow_weight": 0.27,
+                    "prior_weight": 0.15,
+                    "gap_penalty_start": 0.45,
+                    "gap_penalty_factor": 0.16,
+                    "gap_penalty_cap": 0.24,
+                    "collapse_exec_floor": 0.12,
+                    "collapse_min_orders": 5,
+                    "collapse_prob_cap": 0.34,
+                    "days_no_exec_threshold": 21,
+                    "days_no_exec_prob_cap": 0.28,
+                })
+
+        total = profile["fast_weight"] + profile["slow_weight"] + profile["prior_weight"]
+        profile["fast_weight"] /= total
+        profile["slow_weight"] /= total
+        profile["prior_weight"] /= total
+        return profile
+
+    def _calibrate_execution_probability(
+        self,
+        currency: str,
+        period: int,
+        model_prob: float,
+        exec_rate_fast: float,
+        exec_rate_slow: float,
+        avg_rate_gap: float,
+        order_count: int,
+        current_rate: float,
+    ) -> tuple[float, dict]:
+        """
+        分币种/分周期执行概率校准。
+        fUSD 中长周期更快信任真实执行反馈，避免 60d/120d 在执行率塌陷时仍给出高概率。
+        """
+        profile = self._get_probability_calibration_profile(currency, period)
+        historical_signal = (
+            exec_rate_fast * profile["fast_weight"] +
+            exec_rate_slow * profile["slow_weight"] +
+            profile["prior"] * profile["prior_weight"]
+        )
+        evidence_weight = min(order_count / profile["sample_scale"], profile["max_evidence_weight"])
+        calibrated_prob = (1.0 - evidence_weight) * model_prob + evidence_weight * historical_signal
+
+        gap_ratio = 0.0
+        if avg_rate_gap > 0 and current_rate > 0:
+            gap_ratio = avg_rate_gap / (current_rate + 1e-8)
+            if gap_ratio > profile["gap_penalty_start"]:
+                penalty = min(
+                    (gap_ratio - profile["gap_penalty_start"]) * profile["gap_penalty_factor"],
+                    profile["gap_penalty_cap"]
+                )
+                calibrated_prob *= (1.0 - penalty)
+
+        if order_count >= profile["collapse_min_orders"] and exec_rate_fast <= profile["collapse_exec_floor"]:
+            collapse_cap = max(
+                exec_rate_fast + 0.08,
+                min(profile["collapse_prob_cap"], exec_rate_slow + 0.06)
+            )
+            calibrated_prob = min(calibrated_prob, collapse_cap)
+
+        days_no_exec = self._get_days_since_last_execution(currency, period)
+        if days_no_exec is not None and days_no_exec >= profile["days_no_exec_threshold"]:
+            calibrated_prob = min(calibrated_prob, profile["days_no_exec_prob_cap"])
+
+        calibrated_prob = float(np.clip(calibrated_prob, 0.0, 1.0))
+        return calibrated_prob, {
+            "tier": profile["tier"],
+            "historical_signal": float(historical_signal),
+            "evidence_weight": float(evidence_weight),
+            "gap_ratio": float(gap_ratio),
+            "days_no_exec": days_no_exec,
+        }
+
+    def _apply_probability_divergence_guard(
+        self,
+        calibrated_prob: float,
+        currency: str,
+        period: int,
+        final_rate: float,
+        current_rate: float,
+        exec_rate_fast: float,
+        avg_rate_gap: float,
+    ) -> tuple[float, dict]:
+        """
+        最终利率出炉后，再按 market divergence 做一次校准。
+        这样推荐排序看到的概率会更贴近“当前这口价”是否可能成交。
+        """
+        profile = self._get_probability_calibration_profile(currency, period)
+        relative_err = 0.0
+        if current_rate > 0 and final_rate > current_rate:
+            relative_err = (final_rate - current_rate) / (current_rate + 1e-8)
+            if relative_err > profile["divergence_penalty_start"]:
+                penalty = min(
+                    (relative_err - profile["divergence_penalty_start"]) * profile["divergence_penalty_factor"],
+                    profile["divergence_penalty_cap"]
+                )
+                calibrated_prob *= (1.0 - penalty)
+
+        if currency == "fUSD" and period >= 60 and exec_rate_fast < 0.20 and avg_rate_gap > 0:
+            calibrated_prob = min(calibrated_prob, max(0.12, exec_rate_fast + 0.06))
+
+        calibrated_prob = float(np.clip(calibrated_prob, 0.0, 1.0))
+        return calibrated_prob, {
+            "relative_err": float(relative_err),
+        }
+
     def predict_single_period(self, row_data: dict, feature_cols: list, currency: str) -> dict:
         """
         对单个period的数据进行预测（用于并行化）- 增强版含执行反馈调整
@@ -636,18 +855,24 @@ class EnsemblePredictor:
         exec_rate_7d = exec_rate_fast
         exec_rate_30d = exec_rate_slow
 
-        # 贝叶斯风格校准: 根据数据充分度动态加权
-        # order_count 少时信任模型,多时信任历史执行率
-        # 线性曲线: 50单→ew=0.50, 100单→ew=0.80(上限), 更快适应市场
-        evidence_weight = min(order_count / 100.0, 0.80)
-        calibrated_prob = (1.0 - evidence_weight) * prob + evidence_weight * exec_rate_fast
-        calibrated_prob = np.clip(calibrated_prob, 0.0, 1.0)
+        calibrated_prob, calibration_meta = self._calibrate_execution_probability(
+            currency=currency,
+            period=period,
+            model_prob=prob,
+            exec_rate_fast=exec_rate_fast,
+            exec_rate_slow=exec_rate_slow,
+            avg_rate_gap=avg_rate_gap,
+            order_count=order_count,
+            current_rate=current_rate,
+        )
 
         # 诊断日志: 记录关键决策变量
         logger.debug(
             f"Strategy decision for {currency}-{period}: "
             f"prob={prob:.4f}, exec_rate_fast={exec_rate_fast:.4f}, "
-            f"calibrated_prob={calibrated_prob:.4f}"
+            f"calibrated_prob={calibrated_prob:.4f}, "
+            f"hist_signal={calibration_meta['historical_signal']:.4f}, "
+            f"evidence={calibration_meta['evidence_weight']:.4f}"
         )
 
         # 连续插值策略选择 (消除硬阈值跳变)
@@ -857,6 +1082,16 @@ class EnsemblePredictor:
             market_signal = float(row_data.get('rate_chg_60', 0.0))
         direction_match = self._compute_direction_match(final_rate - current_rate, market_signal)
 
+        calibrated_prob, post_guard_meta = self._apply_probability_divergence_guard(
+            calibrated_prob=calibrated_prob,
+            currency=currency,
+            period=period,
+            final_rate=final_rate,
+            current_rate=current_rate,
+            exec_rate_fast=exec_rate_fast,
+            avg_rate_gap=avg_rate_gap,
+        )
+
         # ========== 结构化诊断日志 ==========
         logger.info(
             f"PREDICTION_DIAG {currency}-{period}d: "
@@ -888,6 +1123,14 @@ class EnsemblePredictor:
             "exec_rate_raw": float(exec_rate_fast),  # 原始历史成交率（用于流动性评分，不受模型滞后影响）
             "liquidity_score": liq_score,
             "liquidity_level": liq_level,
+            "order_count": int(order_count),
+            "avg_rate_gap_failed": float(avg_rate_gap),
+            "calibration_tier": calibration_meta["tier"],
+            "calibration_historical_signal": float(calibration_meta["historical_signal"]),
+            "calibration_evidence_weight": float(calibration_meta["evidence_weight"]),
+            "calibration_gap_ratio": float(calibration_meta["gap_ratio"]),
+            "calibration_days_no_exec": calibration_meta["days_no_exec"],
+            "probability_relative_err": float(post_guard_meta["relative_err"]),
             "conservative_rate": p_cons,
             "aggressive_rate": p_aggr,
             "balanced_rate": p_bal,
@@ -1258,6 +1501,161 @@ class EnsemblePredictor:
             }
         return result
 
+    def _get_recommendation_regime_multiplier(self, pred: dict) -> float:
+        """
+        推荐排序的二次风控。
+        针对 review 里暴露出的 fUSD 中长周期退化场景，继续压低高 gap / 低执行率组合。
+        """
+        currency = str(pred.get("currency", ""))
+        period = int(pred.get("period", 0) or 0)
+        exec_rate_fast = float(pred.get("execution_rate_7d", 0.0) or 0.0)
+        order_count = int(pred.get("order_count", 0) or 0)
+        avg_gap = float(pred.get("avg_rate_gap_failed", 0.0) or 0.0)
+        current_rate = float(pred.get("current_rate", 0.0) or 0.0)
+        follow_err = float(pred.get("market_follow_error", 0.0) or 0.0)
+
+        multiplier = 1.0
+        gap_ratio = avg_gap / (current_rate + 1e-8) if avg_gap > 0 and current_rate > 0 else 0.0
+        relative_err = follow_err / (current_rate + 1e-8) if follow_err > 0 and current_rate > 0 else 0.0
+
+        if currency == "fUSD":
+            if period >= 60:
+                if exec_rate_fast < 0.25 and order_count >= 6:
+                    multiplier *= max(0.35, 0.55 + 0.45 * (exec_rate_fast / 0.25))
+                if gap_ratio > 0.80:
+                    multiplier *= max(0.40, 1.0 - 0.18 * (gap_ratio - 0.80))
+                if relative_err > 1.00:
+                    multiplier *= max(0.35, 1.0 - 0.16 * (relative_err - 1.00))
+            elif period >= 10:
+                if exec_rate_fast < 0.20 and order_count >= 8:
+                    multiplier *= max(0.50, 0.70 + 0.30 * (exec_rate_fast / 0.20))
+                if gap_ratio > 1.00:
+                    multiplier *= max(0.50, 1.0 - 0.10 * (gap_ratio - 1.00))
+
+        return float(np.clip(multiplier, 0.25, 1.0))
+
+    def _ensure_prediction_history_schema(self):
+        import sqlite3
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prediction_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prediction_timestamp TEXT NOT NULL,
+                    update_cycle_id TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    period INTEGER NOT NULL,
+                    rank INTEGER NOT NULL,
+                    predicted_rate REAL NOT NULL,
+                    execution_probability REAL NOT NULL,
+                    strategy TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    conservative_rate REAL,
+                    balanced_rate REAL,
+                    aggressive_rate REAL,
+                    trend_factor REAL,
+                    current_market_rate REAL NOT NULL,
+                    rate_premium_pct REAL,
+                    ma_60 REAL,
+                    ma_1440 REAL,
+                    volatility_60 REAL,
+                    volume_ma_60 REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute("PRAGMA table_info(prediction_history)")
+            existing = {row[1] for row in cursor.fetchall()}
+            required_columns = {
+                "calibrated_execution_probability": "REAL",
+                "weighted_score": "REAL",
+                "liquidity_score": "REAL",
+                "data_age_minutes": "REAL",
+                "market_follow_error": "REAL",
+                "stale_data": "INTEGER",
+            }
+            for column, col_type in required_columns.items():
+                if column not in existing:
+                    cursor.execute(f"ALTER TABLE prediction_history ADD COLUMN {column} {col_type}")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_prediction_history_cycle "
+                "ON prediction_history(update_cycle_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_prediction_history_created "
+                "ON prediction_history(created_at DESC)"
+            )
+            conn.commit()
+
+    def _persist_prediction_history(self, ranked_predictions: list):
+        if not ranked_predictions:
+            return
+
+        import sqlite3
+
+        self._ensure_prediction_history_schema()
+        update_cycle_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        prediction_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        stale_flag = int(bool(self._stale_issues))
+
+        rows = []
+        for rank, pred in enumerate(ranked_predictions, start=1):
+            current_rate = float(pred.get("current_rate", 0.0) or 0.0)
+            predicted_rate = float(pred.get("predicted_rate", 0.0) or 0.0)
+            rate_premium_pct = None
+            if current_rate > 0:
+                rate_premium_pct = (predicted_rate - current_rate) / current_rate * 100.0
+
+            rows.append((
+                prediction_timestamp,
+                update_cycle_id,
+                pred["currency"],
+                int(pred["period"]),
+                rank,
+                predicted_rate,
+                float(pred.get("execution_probability", 0.0) or 0.0),
+                pred.get("strategy", "Unknown"),
+                pred.get("confidence", "Medium"),
+                float(pred.get("conservative_rate", 0.0) or 0.0),
+                float(pred.get("balanced_rate", 0.0) or 0.0),
+                float(pred.get("aggressive_rate", 0.0) or 0.0),
+                float(pred.get("trend_factor", 0.0) or 0.0),
+                current_rate,
+                rate_premium_pct,
+                None,
+                None,
+                None,
+                None,
+                float(pred.get("calibrated_execution_prob", 0.0) or 0.0),
+                float(pred.get("weighted_score", 0.0) or 0.0),
+                float(pred.get("liquidity_score", 0.0) or 0.0),
+                float(pred.get("data_age_minutes", 0.0) or 0.0),
+                float(pred.get("market_follow_error", 0.0) or 0.0),
+                stale_flag,
+            ))
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO prediction_history (
+                    prediction_timestamp, update_cycle_id, currency, period, rank,
+                    predicted_rate, execution_probability, strategy, confidence,
+                    conservative_rate, balanced_rate, aggressive_rate, trend_factor,
+                    current_market_rate, rate_premium_pct, ma_60, ma_1440,
+                    volatility_60, volume_ma_60, calibrated_execution_probability,
+                    weighted_score, liquidity_score, data_age_minutes,
+                    market_follow_error, stale_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows
+            )
+            conn.commit()
+        logger.info(
+            f"Persisted prediction_history snapshot: cycle={update_cycle_id}, rows={len(rows)}, stale={bool(stale_flag)}"
+        )
+
     def get_latest_predictions(self):
         """获取最新预测结果 - 并行化版本"""
         all_predictions = []
@@ -1431,19 +1829,27 @@ class EnsemblePredictor:
             else:
                 low_rate_multiplier = 1.0
 
+            regime_multiplier = self._get_recommendation_regime_multiplier(pred)
+
             # 8. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
             final_score = (
                 effective_rate * 0.40 +
                 normalized_rate * 0.30 +
                 calib_prob * 0.20 +
                 revenue_factor * 0.10
-            ) * exec_floor_multiplier * age_multiplier * divergence_multiplier * low_rate_multiplier
+            ) * exec_floor_multiplier * age_multiplier * divergence_multiplier * low_rate_multiplier * regime_multiplier
 
             return final_score
 
         # Fix5: 预先计算并写入 weighted_score，供 per-period 覆盖保证逻辑使用
         for pred in valid_preds:
             pred['weighted_score'] = calculate_weighted_score(pred)
+
+        raw_ranked_preds = sorted(
+            valid_preds,
+            key=lambda p: p['weighted_score'],
+            reverse=True
+        )
 
         eligible_preds = [
             p for p in valid_preds
@@ -1516,6 +1922,11 @@ class EnsemblePredictor:
                     "strategy": pred['strategy']
                 }
             })
+
+        try:
+            self._persist_prediction_history(raw_ranked_preds)
+        except Exception as e:
+            logger.warning(f"Failed to persist prediction_history snapshot: {e}")
 
         with open(output_path, 'w') as f:
             json.dump(result, f, indent=4)

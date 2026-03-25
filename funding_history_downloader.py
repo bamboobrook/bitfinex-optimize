@@ -45,6 +45,31 @@ class BitfinexDataDownloader:
         logger.info(f"   Database: {db_path}")
         logger.info(f"   Max retries: {max_retries}")
         logger.info(f"   Request interval: {rate_limit_delay} seconds")
+
+    def get_latest_timestamp(self, currency: str, period: int) -> Optional[int]:
+        """获取库中该组合的最新时间戳(ms)。"""
+        self.cursor.execute(
+            "SELECT MAX(timestamp) FROM funding_rates WHERE currency = ? AND period = ?",
+            (currency, period)
+        )
+        row = self.cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def get_latest_age_minutes(self, currency: str, period: int) -> Optional[float]:
+        """返回该组合最新数据距离当前的分钟数。"""
+        latest_ts = self.get_latest_timestamp(currency, period)
+        if latest_ts is None:
+            return None
+        now_ms = int(datetime.now().timestamp() * 1000)
+        return max(0.0, (now_ms - latest_ts) / 60000.0)
+
+    def freshness_target_minutes(self, currency: str) -> int:
+        """
+        与 predictor 的硬阈值对齐:
+        - fUSD: 300 分钟
+        - fUST: 900 分钟
+        """
+        return 900 if currency == 'fUST' else 300
     
     def init_database(self):
         """初始化数据库和表结构"""
@@ -407,39 +432,91 @@ class BitfinexDataDownloader:
             # 计算时间范围
             end_time = datetime.now()
             start_time = end_time - timedelta(days=days)
-            
+
             start_ts = int(start_time.timestamp() * 1000)
             end_ts = int(end_time.timestamp() * 1000)
-            
+            freshness_target = self.freshness_target_minutes(currency)
+            before_latest_ts = self.get_latest_timestamp(currency, period)
+
             logger.info(f"    Requested time range: {start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')}")
-            
+            if before_latest_ts:
+                before_dt = datetime.fromtimestamp(before_latest_ts / 1000)
+                before_age = self.get_latest_age_minutes(currency, period)
+                logger.info(
+                    f"    Baseline latest: {before_dt.strftime('%Y-%m-%d %H:%M')} "
+                    f"(age: {before_age:.0f} min, target <= {freshness_target} min)"
+                )
+
             # 检查数据库中已有的数据
             missing_ranges = self.check_existing_data(currency, period, start_ts, end_ts)
-            
+
             if missing_ranges is None:
                 logger.info(f"    ✅ All data already exists in database")
                 return True
-            
+
             total_processed = 0
-            for range_start, range_end in missing_ranges:
-                logger.info(f"    Downloading missing range: {datetime.fromtimestamp(range_start/1000)} to {datetime.fromtimestamp(range_end/1000)}")
-                
-                # 下载数据
+            attempted_ranges = set()
+
+            def run_range(range_start: int, range_end: int, reason: str) -> int:
+                if range_start >= range_end:
+                    return 0
+                cache_key = (range_start, range_end)
+                if cache_key in attempted_ranges:
+                    return 0
+                attempted_ranges.add(cache_key)
+                logger.info(
+                    f"    Downloading {reason}: "
+                    f"{datetime.fromtimestamp(range_start/1000)} to {datetime.fromtimestamp(range_end/1000)}"
+                )
                 candles = self.fetch_candles_for_currency(currency, period, range_start, range_end)
-                
                 if not candles:
-                    logger.info(f"    ⚠️ No data retrieved for this range")
-                    continue
-                
-                # 处理并存储数据
-                processed = self.process_and_store_candle_data(candles, currency, period)
+                    logger.info(f"    ⚠️ No data retrieved for {reason}")
+                    return 0
+                return self.process_and_store_candle_data(candles, currency, period)
+
+            for range_start, range_end in missing_ranges:
+                processed = run_range(range_start, range_end, "primary refresh window")
                 total_processed += processed
-            
+
+            def needs_expanded_refresh() -> bool:
+                latest_age = self.get_latest_age_minutes(currency, period)
+                latest_ts = self.get_latest_timestamp(currency, period)
+                if latest_age is None or latest_ts is None:
+                    return True
+                latest_advanced = before_latest_ts is None or latest_ts > before_latest_ts
+                return (latest_age > freshness_target) or (not latest_advanced)
+
+            if needs_expanded_refresh():
+                logger.warning(
+                    f"    ⚠️ Primary refresh did not reach freshness target for {currency}-{period}d; "
+                    f"expanding lookback windows"
+                )
+                expansion_windows = [
+                    ("72h fallback", end_time - timedelta(hours=72)),
+                    ("7d fallback", end_time - timedelta(days=7)),
+                    ("30d fallback", end_time - timedelta(days=30)),
+                ]
+                for label, window_start in expansion_windows:
+                    range_start = max(start_ts, int(window_start.timestamp() * 1000))
+                    processed = run_range(range_start, end_ts, label)
+                    total_processed += processed
+                    if not needs_expanded_refresh():
+                        break
+
+            final_latest_ts = self.get_latest_timestamp(currency, period)
+            final_age = self.get_latest_age_minutes(currency, period)
+            latest_advanced = (
+                final_latest_ts is not None and
+                (before_latest_ts is None or final_latest_ts > before_latest_ts)
+            )
+            freshness_ok = final_age is not None and final_age <= freshness_target
+
             # 统计最终结果
-            if total_processed > 0:
+            if freshness_ok:
                 logger.info(f"    ✅ {currency} period={period} completed")
-                logger.info(f"        New records added: {total_processed:,}")
-                
+                logger.info(f"        Processed records: {total_processed:,}")
+                logger.info(f"        Latest age after refresh: {final_age:.0f} min")
+
                 # 获取总记录数
                 self.cursor.execute(
                     "SELECT COUNT(*) FROM funding_rates WHERE currency = ? AND period = ?",
@@ -448,10 +525,18 @@ class BitfinexDataDownloader:
                 total_count = self.cursor.fetchone()[0]
                 logger.info(f"        Total records in database: {total_count:,}")
                 return True
+
+            if final_latest_ts:
+                final_dt = datetime.fromtimestamp(final_latest_ts / 1000)
+                logger.warning(
+                    f"    ⚠️ Refresh incomplete for {currency}-{period}d: "
+                    f"latest={final_dt.strftime('%Y-%m-%d %H:%M')} age={final_age:.0f} min "
+                    f"(target <= {freshness_target} min, advanced={latest_advanced})"
+                )
             else:
-                logger.info(f"    ⚠️ No new data downloaded")
-                return False
-            
+                logger.warning(f"    ⚠️ Refresh incomplete for {currency}-{period}d: still no data in DB")
+            return False
+
         except Exception as e:
             logger.info(f"    ❌ Processing failed: {e}")
             logger.exception("Unexpected error during download")
@@ -504,6 +589,7 @@ class BitfinexDataDownloader:
         # P7B: 对失败项重试一次
         if failed_items:
             logger.info(f"\n🔄 Retrying {len(failed_items)} failed downloads...")
+            retry_failures = []
             for currency, period in failed_items:
                 logger.info(f"  Retry: {currency} period={period}")
                 success = self.download_data(currency, period, days)
@@ -511,7 +597,9 @@ class BitfinexDataDownloader:
                     successful_tasks += 1
                     logger.info(f"  ✅ Retry succeeded: {currency} period={period}")
                 else:
+                    retry_failures.append((currency, period))
                     logger.warning(f"  ❌ Retry failed: {currency} period={period}")
+            failed_items = retry_failures
         
         # 生成报告
         end_time = datetime.now()
@@ -525,7 +613,7 @@ class BitfinexDataDownloader:
         logger.info(f"Total time: {total_seconds:.1f} seconds ({total_seconds/60:.1f} minutes)")
         logger.info(f"Total tasks: {total_tasks}")
         logger.info(f"Successful tasks: {successful_tasks}")
-        logger.info(f"Failed tasks: {total_tasks - successful_tasks}")
+        logger.info(f"Failed tasks: {len(failed_items)}")
         
         # 数据库统计
         try:
@@ -593,9 +681,10 @@ class BitfinexDataDownloader:
             logger.info(f"  Error checking freshness: {e}")
 
         logger.info("=" * 60)
-        
+
         # 关闭数据库连接
         self.close_database()
+        return len(failed_items) == 0
 
 def main():
     """主函数"""
@@ -618,7 +707,10 @@ def main():
     currencies = ['fUST', 'fUSD']
     periods = [2,3,4,5,6,7,10,14,15,20,30,60,90,120]
 
-    downloader.download_multiple(currencies, periods, args.days)
+    all_ok = downloader.download_multiple(currencies, periods, args.days)
+    if not all_ok:
+        logger.error("❌ Download finished with stale/failed combinations")
+        sys.exit(1)
     
 def check_database():
     try:
