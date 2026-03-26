@@ -388,19 +388,22 @@ class EnsemblePredictor:
             effective_cap = cap_pct
 
         # 零成交加速收敛: 长期无成交时放宽 step_cap，加速价格降至市场水平
+        # 注：即使 pair 被 zero-liquidity suspended（不下单），仍允许 predicted_rate 快速追踪市场
         days_no_exec = self._get_days_since_last_execution(currency, period)
         if days_no_exec is not None:
+            is_suspended = self._is_zero_liquidity_suspended(currency, period)
+            suspend_tag = " [SUSPENDED—rate tracking only]" if is_suspended else ""
             if days_no_exec >= 20:
                 effective_cap = max(effective_cap, 1.0)
                 logger.info(
                     f"Zero-exec cap bypass {currency}-{period}: "
-                    f"{days_no_exec}d since last exec (>=20d), cap fully released"
+                    f"{days_no_exec}d since last exec (>=20d), cap fully released{suspend_tag}"
                 )
             elif days_no_exec >= 10:
                 effective_cap = max(effective_cap, cap_pct * 2.0)
                 logger.info(
                     f"Zero-exec cap relaxed {currency}-{period}: "
-                    f"{days_no_exec}d since last exec (>=10d), cap x2={effective_cap:.3f}"
+                    f"{days_no_exec}d since last exec (>=10d), cap x2={effective_cap:.3f}{suspend_tag}"
                 )
 
         lower = previous_rate * (1.0 - effective_cap)
@@ -413,7 +416,7 @@ class EnsemblePredictor:
     def _policy_value(self, section: str, key: str, default):
         return self.policy.get(section, {}).get(key, default)
 
-    def _freshness_thresholds_minutes(self, currency: str = "") -> Tuple[float, float]:
+    def _freshness_thresholds_minutes(self, currency: str = "", period: int = 0) -> Tuple[float, float]:
         warn_minutes = float(self._policy_value("automation", "stale_data_warn_minutes", 60))
         hard_minutes = float(self._policy_value("automation", "stale_data_hard_minutes", 120))
         # fUST has naturally sparse market data (often 4-24h gaps) - use a per-currency override
@@ -422,6 +425,18 @@ class EnsemblePredictor:
             per_cur_hard = self._policy_value("automation", per_cur_key, None)
             if per_cur_hard is not None:
                 hard_minutes = float(per_cur_hard)
+        # Period-tier override: long periods have sparser data on Bitfinex
+        if period > 0:
+            tier_config = self._policy_value("automation", "stale_data_hard_minutes_by_period_tier", None)
+            if tier_config:
+                if period >= 30:
+                    tier_hard = tier_config.get("long")
+                elif period >= 6:
+                    tier_hard = tier_config.get("medium")
+                else:
+                    tier_hard = tier_config.get("short")
+                if tier_hard is not None:
+                    hard_minutes = max(hard_minutes, float(tier_hard))
         if hard_minutes <= warn_minutes:
             hard_minutes = warn_minutes + 30.0
         return warn_minutes, hard_minutes
@@ -690,7 +705,7 @@ class EnsemblePredictor:
         period = int(row_data['period'])
         current_rate_db, data_timestamp = self.get_latest_rate_from_db(currency, period)
 
-        warn_minutes, hard_minutes = self._freshness_thresholds_minutes(currency)
+        warn_minutes, hard_minutes = self._freshness_thresholds_minutes(currency, period)
 
         # Use DB rate if available, fallback to feature data
         if current_rate_db is not None:
@@ -1797,7 +1812,7 @@ class EnsemblePredictor:
                 exec_floor_multiplier = 0.4 + 0.6 * (calib_prob / 0.35)
 
             # 5. Data-age multiplier: 数据老旧 = 流动性可能枯竭，推荐权重线性衰减
-            warn_min, hard_min = self._freshness_thresholds_minutes(currency)
+            warn_min, hard_min = self._freshness_thresholds_minutes(currency, period)
             if data_age <= warn_min:
                 age_multiplier = 1.0
             else:

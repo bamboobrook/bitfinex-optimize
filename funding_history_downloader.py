@@ -528,10 +528,17 @@ class BitfinexDataDownloader:
 
             if final_latest_ts:
                 final_dt = datetime.fromtimestamp(final_latest_ts / 1000)
+                # 诊断：区分"Bitfinex 无新数据"和"下载代码问题"
+                if not latest_advanced and total_processed == 0:
+                    diag = "Bitfinex API returned no new candles (market liquidity exhausted)"
+                elif not latest_advanced:
+                    diag = f"downloaded {total_processed} records but none newer than existing data"
+                else:
+                    diag = f"timestamp advanced but still exceeds freshness target"
                 logger.warning(
                     f"    ⚠️ Refresh incomplete for {currency}-{period}d: "
                     f"latest={final_dt.strftime('%Y-%m-%d %H:%M')} age={final_age:.0f} min "
-                    f"(target <= {freshness_target} min, advanced={latest_advanced})"
+                    f"(target <= {freshness_target} min) — {diag}"
                 )
             else:
                 logger.warning(f"    ⚠️ Refresh incomplete for {currency}-{period}d: still no data in DB")

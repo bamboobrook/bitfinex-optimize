@@ -4,6 +4,11 @@
     "stale_data_warn_minutes": 120,
     "stale_data_hard_minutes": 300,
     "stale_data_hard_minutes_fUST": 900,
+    "stale_data_hard_minutes_by_period_tier": {
+      "short": 300,
+      "medium": 720,
+      "long": 1440
+    },
     "refresh_probe_lookback_hours": 24,
     "refresh_probe_min_validations": 1,
     "refresh_probe_trigger_cycles": 3,

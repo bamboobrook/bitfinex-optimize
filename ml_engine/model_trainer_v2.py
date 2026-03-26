@@ -68,11 +68,9 @@ class EnhancedModelTrainer:
             'n_jobs': self.cpu_threads,
         }
 
-        # LightGBM GPU 参数配置（编译含 USE_GPU=1 时生效，否则 fallback 到 CPU）
+        # LightGBM 参数配置（默认 CPU，避免 OpenCL 不可用时 fallback 失败）
         self.lgb_params = {
-            'device': 'gpu',
-            'gpu_platform_id': 0,
-            'gpu_device_id': 0,
+            'device': 'cpu',
             'learning_rate': 0.03,
             'max_depth': 7,
             'num_leaves': 31,
@@ -84,10 +82,9 @@ class EnhancedModelTrainer:
             'verbose': -1
         }
 
-        # CatBoost GPU 参数配置
+        # CatBoost 参数配置（默认 CPU）
         self.catboost_params = {
-            'task_type': 'GPU',
-            'devices': '0',
+            'task_type': 'CPU',
             'learning_rate': 0.03,
             'depth': 10,
             'bootstrap_type': 'Bernoulli',
@@ -96,7 +93,7 @@ class EnhancedModelTrainer:
             'verbose': False,
             'allow_writing_files': False
         }
-        print(f"硬件并行配置: CPU threads={self.cpu_threads}, GPU device=0")
+        print(f"硬件并行配置: CPU threads={self.cpu_threads}")
 
     def prepare_training_data(
         self,
@@ -264,7 +261,7 @@ class EnhancedModelTrainer:
         return model, auc
 
     def train_lightgbm_regression(self, X_train, y_train, X_val, y_val, sample_weight=None):
-        """训练LightGBM回归模型（GPU优先，不可用时 fallback 到 CPU）"""
+        """训练LightGBM回归模型"""
         params = self.lgb_params.copy()
         params['objective'] = 'mae'
         params['metric'] = 'mae'
@@ -272,39 +269,21 @@ class EnhancedModelTrainer:
         train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
-        try:
-            model = lgb.train(
-                params,
-                train_data,
-                num_boost_round=500,
-                valid_sets=[train_data, val_data],
-                valid_names=['train', 'val'],
-                callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
-            )
-        except Exception as e:
-            if 'gpu' in str(e).lower() or 'cuda' in str(e).lower():
-                import logging as _lg
-                _lg.getLogger(__name__).warning(f"LightGBM GPU not available ({e}), falling back to CPU")
-                params_cpu = {k: v for k, v in params.items()
-                              if k not in ('device', 'gpu_platform_id', 'gpu_device_id')}
-                params_cpu['device'] = 'cpu'
-                model = lgb.train(
-                    params_cpu,
-                    train_data,
-                    num_boost_round=500,
-                    valid_sets=[train_data, val_data],
-                    valid_names=['train', 'val'],
-                    callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
-                )
-            else:
-                raise
+        model = lgb.train(
+            params,
+            train_data,
+            num_boost_round=500,
+            valid_sets=[train_data, val_data],
+            valid_names=['train', 'val'],
+            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
+        )
 
         pred_val = model.predict(X_val)
         mae = mean_absolute_error(y_val, pred_val)
         return model, mae
 
     def train_lightgbm_classification(self, X_train, y_train, X_val, y_val, sample_weight=None):
-        """训练LightGBM分类模型（GPU优先，不可用时 fallback 到 CPU）"""
+        """训练LightGBM分类模型"""
         params = self.lgb_params.copy()
         params['objective'] = 'binary'
         params['metric'] = 'auc'
@@ -312,32 +291,14 @@ class EnhancedModelTrainer:
         train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
-        try:
-            model = lgb.train(
-                params,
-                train_data,
-                num_boost_round=500,
-                valid_sets=[train_data, val_data],
-                valid_names=['train', 'val'],
-                callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
-            )
-        except Exception as e:
-            if 'gpu' in str(e).lower() or 'cuda' in str(e).lower():
-                import logging as _lg
-                _lg.getLogger(__name__).warning(f"LightGBM GPU not available ({e}), falling back to CPU")
-                params_cpu = {k: v for k, v in params.items()
-                              if k not in ('device', 'gpu_platform_id', 'gpu_device_id')}
-                params_cpu['device'] = 'cpu'
-                model = lgb.train(
-                    params_cpu,
-                    train_data,
-                    num_boost_round=500,
-                    valid_sets=[train_data, val_data],
-                    valid_names=['train', 'val'],
-                    callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
-                )
-            else:
-                raise
+        model = lgb.train(
+            params,
+            train_data,
+            num_boost_round=500,
+            valid_sets=[train_data, val_data],
+            valid_names=['train', 'val'],
+            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
+        )
 
         pred_val = model.predict(X_val)
         auc = roc_auc_score(y_val, pred_val)

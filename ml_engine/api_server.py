@@ -903,12 +903,22 @@ async def run_full_pipeline():
 
                 if rc != 0:
                     logger.error(f"❌ Retraining failed (exit code {rc})")
+                    # 检查 stderr 中是否有具体错误信息
+                    if stderr:
+                        logger.error(f"Retraining error details: {stderr[-300:]}")
                     update_status("error", "4. Retraining Models", "Retraining failed")
                     # 不返回，继续使用现有模型生成预测
                 else:
-                    _last_forced_retrain_time = datetime.now()
-                    save_retraining_state(_last_forced_retrain_time, reason="forced_by_pipeline")
-                    logger.info(f"✅ Retraining completed successfully")
+                    # 额外检查：即使 rc==0，stderr 中含训练框架错误也视为失败
+                    _has_training_error = stderr and any(
+                        kw in stderr for kw in ('LightGBMError', 'CatBoostError', 'XGBoostError', 'OpenCL')
+                    )
+                    if _has_training_error:
+                        logger.error(f"❌ Retraining subprocess returned 0 but stderr contains errors: {stderr[-300:]}")
+                    else:
+                        _last_forced_retrain_time = datetime.now()
+                        save_retraining_state(_last_forced_retrain_time, reason="forced_by_pipeline")
+                        logger.info(f"✅ Retraining completed successfully")
 
             except Exception as e:
                 logger.error(f"❌ Retraining system error: {e}")
