@@ -276,6 +276,69 @@ class EnsemblePredictor:
         finally:
             conn.close()
 
+    def _get_latest_prediction_snapshot(self, currency: str, period: int) -> Optional[dict]:
+        """Load the latest historical prediction snapshot for recommendation fallback."""
+        import sqlite3
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    """
+                    SELECT
+                        predicted_rate,
+                        execution_probability,
+                        strategy,
+                        confidence,
+                        conservative_rate,
+                        balanced_rate,
+                        aggressive_rate,
+                        trend_factor,
+                        current_market_rate,
+                        liquidity_score
+                    FROM prediction_history
+                    WHERE currency = ?
+                      AND period = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (currency, period),
+                ).fetchone()
+        except Exception as e:
+            logger.warning(f"Failed to load prediction_history snapshot for {currency}-{period}d: {e}")
+            return None
+
+        if row is None:
+            return None
+
+        liquidity_score = row["liquidity_score"]
+        if liquidity_score is None:
+            liquidity_level = None
+        elif liquidity_score >= 65.0:
+            liquidity_level = "high"
+        elif liquidity_score >= 40.0:
+            liquidity_level = "medium"
+        elif liquidity_score >= 20.0:
+            liquidity_level = "low"
+        else:
+            liquidity_level = "insufficient"
+
+        return {
+            "currency": currency,
+            "period": int(period),
+            "current_rate": float(row["current_market_rate"] or 0.0),
+            "predicted_rate": float(row["predicted_rate"] or 0.0),
+            "execution_probability": float(row["execution_probability"] or 0.0),
+            "conservative_rate": float(row["conservative_rate"] or 0.0),
+            "aggressive_rate": float(row["aggressive_rate"] or 0.0),
+            "balanced_rate": float(row["balanced_rate"] or 0.0),
+            "trend_factor": float(row["trend_factor"] or 0.0),
+            "strategy": row["strategy"] or "Unknown",
+            "confidence": row["confidence"] or "Medium",
+            "liquidity_score": float(liquidity_score) if liquidity_score is not None else None,
+            "liquidity_level": liquidity_level,
+        }
+
     def _get_days_since_last_execution(self, currency: str, period: int) -> Optional[int]:
         """Returns days since last EXECUTED order for (currency, period), or None if never executed."""
         import sqlite3
@@ -1779,7 +1842,7 @@ class EnsemblePredictor:
         # Revenue-optimized scoring: 收益率优先,兼顾成交和长周期
         def calculate_weighted_score(pred):
             """
-            收益率优先评分 (v6):
+            收益率优先评分 (v7):
             - 40% effective_rate (calibrated_prob * rate - 期望收益)
             - 30% raw_rate (高利率偏好)
             - 20% exec_prob (成交保障，使用校准概率)
@@ -1787,6 +1850,8 @@ class EnsemblePredictor:
             + execution floor: calibrated_prob < 0.35 gets 0.4x penalty
             + data_age multiplier: 数据越老（流动性越低）评分越低，warn~hard 线性衰减到 0.6x
             + divergence multiplier: 预测利率/当前市场 > 2.5x 时线性降权至 0.5x
+            + currency_type_multiplier: fUSD×1.05，fUST×0.92（fUST 市场稀疏、波动大）
+            + volume_penalty: 24h 成交量 < 30d 基线 30% 时线性惩罚到 0.75x
             """
             calib_prob = pred.get('calibrated_execution_prob', pred['execution_probability'])
             rate = pred['predicted_rate']
@@ -1846,13 +1911,26 @@ class EnsemblePredictor:
 
             regime_multiplier = self._get_recommendation_regime_multiplier(pred)
 
+            # 9. Currency type bias: fUSD 历史执行率更高且稳定，略微提权
+            # fUST 市场更稀疏且波动性大，略微降权
+            currency_type_multiplier = 1.05 if currency == "fUSD" else 0.92
+
+            # 10. Volume liquidity soft penalty: 24h 成交量 < 30d 基线 30% 时线性惩罚
+            # 补充门控之外的软性降权，防止 book depth 看起来好但实际成交量已萎缩的情况
+            market_info = market_liquidity.get(currency, {})
+            volume_ratio = market_info.get("volume_ratio_24h") or 1.0
+            if volume_ratio < 0.3:
+                volume_penalty = max(0.75, 0.75 + 0.25 * (volume_ratio / 0.3))
+            else:
+                volume_penalty = 1.0
+
             # 8. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
             final_score = (
                 effective_rate * 0.40 +
                 normalized_rate * 0.30 +
                 calib_prob * 0.20 +
                 revenue_factor * 0.10
-            ) * exec_floor_multiplier * age_multiplier * divergence_multiplier * low_rate_multiplier * regime_multiplier
+            ) * exec_floor_multiplier * age_multiplier * divergence_multiplier * low_rate_multiplier * regime_multiplier * currency_type_multiplier * volume_penalty
 
             return final_score
 
@@ -1906,6 +1984,12 @@ class EnsemblePredictor:
             if pred['currency'] == 'fUSD' and pred['period'] == 2:
                 fusd_2d_pred = pred
                 break
+        if fusd_2d_pred is None:
+            fusd_2d_pred = self._get_latest_prediction_snapshot('fUSD', 2)
+            if fusd_2d_pred is not None:
+                logger.warning(
+                    "Current fUSD-2d prediction unavailable, using latest prediction_history snapshot for fixed rank6."
+                )
 
         # rank 1-5: top 5 from sorted_preds excluding fUSD-2d
         # gated 货币的 2d 订单参与正常评分排序，不再强制置顶（避免低利率 2d 异常 rank1）
