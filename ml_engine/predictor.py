@@ -1534,6 +1534,8 @@ class EnsemblePredictor:
                         SELECT
                             AVG(CASE WHEN datetime >= strftime('%Y-%m-%d %H:%M:%S','now','-1 day')
                                      THEN volume ELSE NULL END) AS vol_24h,
+                            AVG(CASE WHEN datetime >= strftime('%Y-%m-%d %H:%M:%S','now','-7 days')
+                                     THEN volume ELSE NULL END) AS vol_7d,
                             AVG(volume) AS vol_30d
                         FROM funding_rates
                         WHERE currency = ?
@@ -1541,8 +1543,13 @@ class EnsemblePredictor:
                           AND datetime >= strftime('%Y-%m-%d %H:%M:%S','now','-30 days')
                     """, (currency,)).fetchone()
                 vol_24h = row[0] or 0.0
-                vol_30d = row[1] or 1e-8
-                volume_ratio_24h = round(vol_24h / (vol_30d + 1e-8), 3)
+                vol_7d  = row[1] or 1e-8
+                vol_30d = row[2] or 1e-8
+                # 双窗口 min 策略：取 24h/7d 与 24h/30d 的最小值（更悲观的那个）
+                # 7d 基线捕捉突发崩盘，30d 基线捕捉持续萎缩，两者取严
+                ratio_vs_7d  = vol_24h / (vol_7d  + 1e-8)
+                ratio_vs_30d = vol_24h / (vol_30d + 1e-8)
+                volume_ratio_24h = round(min(ratio_vs_7d, ratio_vs_30d), 3)
             except Exception:
                 volume_ratio_24h = None
 
@@ -1919,8 +1926,9 @@ class EnsemblePredictor:
             # 补充门控之外的软性降权，防止 book depth 看起来好但实际成交量已萎缩的情况
             market_info = market_liquidity.get(currency, {})
             volume_ratio = market_info.get("volume_ratio_24h") or 1.0
-            if volume_ratio < 0.3:
-                volume_penalty = max(0.75, 0.75 + 0.25 * (volume_ratio / 0.3))
+            if volume_ratio < 0.4:
+                # 双窗口 min 后比值天然偏低，阈值提高至 0.4 使灵敏度整体上移
+                volume_penalty = max(0.75, 0.75 + 0.25 * (volume_ratio / 0.4))
             else:
                 volume_penalty = 1.0
 
