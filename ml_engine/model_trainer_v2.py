@@ -608,10 +608,11 @@ class EnhancedModelTrainer:
 
             # 6. 训练收益优化模型
             if 'revenue_reward' in curr_df.columns and 'actual_execution_binary' in curr_df.columns:
-                # 创建收益优化目标: predicted_rate × revenue_reward
-                # 注意: 这里需要有 predicted_rate,但 curr_df 可能没有
-                # 改用 close_annual 作为代理
-                curr_df['revenue_optimized_target'] = curr_df['close_annual'] * curr_df['revenue_reward']
+                if 'path_terminal_value' in curr_df.columns:
+                    curr_df['revenue_optimized_target'] = curr_df['path_terminal_value'].fillna(0.0)
+                else:
+                    # 兼容旧训练链路: 没有路径标签时继续沿用原收益代理
+                    curr_df['revenue_optimized_target'] = curr_df['close_annual'] * curr_df['revenue_reward']
                 valid_count = curr_df['revenue_optimized_target'].notna().sum()
 
                 if valid_count >= 100:

@@ -169,6 +169,29 @@ def fetch_prediction_history_status(conn: sqlite3.Connection) -> dict:
     }
 
 
+def fetch_path_metrics(conn: sqlite3.Connection, start: datetime, end: datetime) -> dict:
+    row = conn.execute(
+        """
+        SELECT
+            AVG(path_value_score),
+            AVG(stage1_fill_probability),
+            AVG(CASE WHEN terminal_mode='FRR_PROXY' THEN 1 ELSE 0 END),
+            AVG(CASE WHEN terminal_mode='RANK6_PROXY' THEN 1 ELSE 0 END)
+        FROM virtual_orders
+        WHERE order_timestamp >= ?
+          AND order_timestamp < ?
+          AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
+        """,
+        (start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")),
+    ).fetchone()
+    return {
+        "avg_path_value_score": row[0] or 0.0,
+        "avg_stage1_fill_probability": row[1] or 0.0,
+        "frr_terminal_ratio": row[2] or 0.0,
+        "rank6_terminal_ratio": row[3] or 0.0,
+    }
+
+
 def load_result_file(result_path: Path) -> dict | None:
     if not result_path.exists():
         return None
@@ -237,6 +260,8 @@ def main():
 
         freshness = fetch_freshness(conn)
         history_status = fetch_prediction_history_status(conn)
+        recent_path = fetch_path_metrics(conn, recent_start, now)
+        previous_path = fetch_path_metrics(conn, prev_start, recent_start)
 
     result_file = load_result_file(result_path)
     combo_deltas = build_combo_delta(recent_combo, previous_combo, args.min_combo_orders)
@@ -316,6 +341,25 @@ def main():
                 f"  rank{item.get('rank')}: {item.get('currency')}-{item.get('period')}d "
                 f"rate={item.get('rate')} confidence={item.get('confidence')}"
             )
+    print()
+
+    print("七、路径质量")
+    print(
+        f"- path_value_score: {format_num(previous_path['avg_path_value_score'], 3)} -> "
+        f"{format_num(recent_path['avg_path_value_score'], 3)}"
+    )
+    print(
+        f"- stage1_fill_probability: {format_pct(previous_path['avg_stage1_fill_probability'])} -> "
+        f"{format_pct(recent_path['avg_stage1_fill_probability'])}"
+    )
+    print(
+        f"- terminal FRR ratio: {format_pct(previous_path['frr_terminal_ratio'])} -> "
+        f"{format_pct(recent_path['frr_terminal_ratio'])}"
+    )
+    print(
+        f"- terminal rank6 ratio: {format_pct(previous_path['rank6_terminal_ratio'])} -> "
+        f"{format_pct(recent_path['rank6_terminal_ratio'])}"
+    )
 
 
 if __name__ == "__main__":
