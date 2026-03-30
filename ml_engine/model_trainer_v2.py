@@ -607,7 +607,9 @@ class EnhancedModelTrainer:
                     print(f"\n⚠️  实际执行结果不足 ({valid_count} < 100),跳过 execution_prob_v2")
 
             # 6. 训练收益优化模型
-            if 'revenue_reward' in curr_df.columns and 'actual_execution_binary' in curr_df.columns:
+            if 'actual_execution_binary' in curr_df.columns and (
+                'path_terminal_value' in curr_df.columns or 'revenue_reward' in curr_df.columns
+            ):
                 if 'path_terminal_value' in curr_df.columns:
                     curr_df['revenue_optimized_target'] = curr_df['path_terminal_value'].fillna(0.0)
                 else:
