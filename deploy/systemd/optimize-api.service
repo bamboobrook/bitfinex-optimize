@@ -1,0 +1,16 @@
+[Unit]
+Description=Optimize Bitfinex Lending API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/bumblebee/Project/optimize
+ExecStart=/home/bumblebee/Project/optimize/scripts/run_api_server.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
