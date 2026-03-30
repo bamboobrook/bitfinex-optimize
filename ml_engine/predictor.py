@@ -1694,10 +1694,18 @@ class EnsemblePredictor:
         rank6_fallback_penalty = float(
             np.clip(1.0 - max(rate - fallback_anchor, 0.0) / fallback_anchor * 0.20, 0.30, 1.0)
         )
-        frr_fallback_value = (
-            frr_proxy_rate * 0.72 +
-            rank6_rate * 0.28
-        )
+        if pred.get("currency") == "fUST":
+            # Default guarded fUST scenarios should not inherit the full 120d proxy upside.
+            # Keep burst cases eligible later through the regime multiplier instead.
+            frr_fallback_value = (
+                frr_proxy_rate * 0.52 +
+                rank6_rate * 0.48
+            )
+        else:
+            frr_fallback_value = (
+                frr_proxy_rate * 0.72 +
+                rank6_rate * 0.28
+            )
         residual_path_rate = (
             ladder_decay_rate * 0.35 +
             frr_fallback_value * 0.40 +
@@ -1818,16 +1826,16 @@ class EnsemblePredictor:
                 state = "fust_burst"
             else:
                 multiplier = min(
-                    0.98,
-                    0.86 +
-                    market_fast_score * 0.08 +
-                    stage1_fill_probability * 0.06 +
+                    0.88,
+                    0.74 +
+                    market_fast_score * 0.07 +
+                    stage1_fill_probability * 0.05 +
                     min(volume_ratio, 1.0) * 0.02
                 )
                 state = "fust_guarded"
 
         pred["currency_regime_state"] = state
-        return float(np.clip(multiplier, 0.82, 1.20))
+        return float(np.clip(multiplier, 0.70, 1.20))
 
     def _calculate_safety_multiplier(self, pred: dict, path_meta: dict) -> float:
         """Suppress fake premiums that do not survive the full execution path."""

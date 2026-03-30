@@ -120,6 +120,43 @@ class PredictorPathRankingTest(unittest.TestCase):
         self.assertEqual((burst_ranked[0]["currency"], burst_ranked[0]["period"]), ("fUST", 30))
         self.assertGreaterEqual(burst_ranked[0]["currency_regime_multiplier"], 1.0)
 
+    def test_fust_guarded_high_frr_fallback_still_does_not_beat_fusd_default(self):
+        predictor = self._make_predictor()
+        predictor._estimate_frr_proxy_rate = lambda currency, current_rate: 12.0 if currency == "fUST" else 7.3
+
+        fusd = _make_prediction("fUSD", 60, 9.7908, exec_prob=0.66)
+        fusd["current_rate"] = 17.113
+        fusd["execution_rate_7d"] = 0.28
+        fusd["avg_rate_gap_failed"] = 7.7
+
+        fust = _make_prediction("fUST", 14, 9.6810, exec_prob=0.69)
+        fust["current_rate"] = 9.49
+        fust["execution_rate_7d"] = 0.50
+        fust["avg_rate_gap_failed"] = 2.8
+
+        ranked = predictor._apply_path_ranking(
+            [fusd, fust],
+            market_liquidity={
+                "fUSD": {
+                    "score": 56.8,
+                    "fast_score": 0.59,
+                    "fillability_signal": 0.96,
+                    "volume_ratio_24h": 0.41,
+                },
+                "fUST": {
+                    "score": 55.5,
+                    "fast_score": 0.53,
+                    "fillability_signal": 1.00,
+                    "volume_ratio_24h": 2.44,
+                },
+            },
+            fusd_2d_pred={"currency": "fUSD", "period": 2, "predicted_rate": 3.2574},
+        )
+
+        self.assertEqual((ranked[0]["currency"], ranked[0]["period"]), ("fUSD", 60))
+        self.assertEqual(ranked[1]["currency_regime_state"], "fust_guarded")
+        self.assertLess(ranked[1]["currency_regime_multiplier"], 0.90)
+
 
 if __name__ == "__main__":
     unittest.main()
