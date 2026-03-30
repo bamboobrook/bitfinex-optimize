@@ -87,6 +87,10 @@ class TrainingDataBuilder:
             'step_capped',
             'policy_step_cap_pct',
             'probe_type',
+            'path_value_score',
+            'stage1_fill_probability',
+            'stage2_frr_proxy_rate',
+            'terminal_mode',
         ]
         selected_cols.extend([c for c in optional_cols if c in table_cols])
 
@@ -201,7 +205,9 @@ class TrainingDataBuilder:
             'market_median', 'execution_rate'
         ]
         for c in ['follow_error_at_order', 'gate_reject_reason', 'direction_match',
-                  'step_change_pct', 'step_capped', 'policy_step_cap_pct', 'probe_type']:
+                  'step_change_pct', 'step_capped', 'policy_step_cap_pct', 'probe_type',
+                  'path_value_score', 'stage1_fill_probability', 'stage2_frr_proxy_rate',
+                  'terminal_mode']:
             if c in execution_results.columns:
                 merge_cols.append(c)
 
@@ -271,6 +277,23 @@ class TrainingDataBuilder:
 
         # 标签3: 收益奖励
         df['revenue_reward'] = df.apply(self._compute_revenue_reward, axis=1)
+
+        # 路径标签: 默认值兜底，兼容旧表结构
+        for col in ['path_value_score', 'stage1_fill_probability', 'stage2_frr_proxy_rate', 'terminal_mode']:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        executed_mask = df['status'] == 'EXECUTED'
+        df['path_terminal_value'] = np.where(
+            executed_mask,
+            df['execution_rate'].fillna(df['predicted_rate']),
+            df['stage2_frr_proxy_rate']
+        )
+        df['path_stage1_success'] = np.where(
+            executed_mask & (df['terminal_mode'] == 'FIXED'),
+            1.0,
+            0.0
+        )
 
         # 闭环诊断标签: 跟随误差、方向一致性、单步变化
         if 'follow_error_at_order' in df.columns:
