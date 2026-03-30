@@ -1694,14 +1694,25 @@ class EnsemblePredictor:
         rank6_fallback_penalty = float(
             np.clip(1.0 - max(rate - fallback_anchor, 0.0) / fallback_anchor * 0.20, 0.30, 1.0)
         )
+        frr_fallback_value = (
+            frr_proxy_rate * 0.72 +
+            rank6_rate * 0.28
+        )
         residual_path_rate = (
             ladder_decay_rate * 0.35 +
-            frr_proxy_rate * 0.40 +
+            frr_fallback_value * 0.40 +
             rank6_rate * 0.25
         )
         period_bonus = 1.0 + min(max(period, 0), 120) / 120.0 * 0.05
         if pred.get("currency") == "fUSD" and period == 120 and max(rate, current_rate) >= 12.0:
             period_bonus += 0.10
+
+        if stage1_fill_probability >= 0.67:
+            expected_terminal_mode = "stage1_fixed"
+        elif frr_fallback_value >= rank6_rate:
+            expected_terminal_mode = "stage2_frr"
+        else:
+            expected_terminal_mode = "rank6_fixed"
 
         path_value_score = (
             stage1_fill_probability * rate +
@@ -1710,7 +1721,9 @@ class EnsemblePredictor:
 
         pred["stage1_fill_probability"] = float(stage1_fill_probability)
         pred["frr_proxy_rate"] = float(frr_proxy_rate)
+        pred["frr_fallback_value"] = float(frr_fallback_value)
         pred["rank6_fallback_penalty"] = rank6_fallback_penalty
+        pred["expected_terminal_mode"] = expected_terminal_mode
         pred["_path_meta"] = {
             "follow_gap_ratio": float(follow_gap_ratio),
             "failed_gap_ratio": float(failed_gap_ratio),
@@ -1718,7 +1731,9 @@ class EnsemblePredictor:
             "fallback_anchor": float(fallback_anchor),
             "stage1_fill_probability": float(stage1_fill_probability),
             "period_bonus": float(period_bonus),
+            "frr_fallback_value": float(frr_fallback_value),
             "rank6_fallback_penalty": rank6_fallback_penalty,
+            "expected_terminal_mode": expected_terminal_mode,
         }
         return float(path_value_score)
 
@@ -1855,10 +1870,6 @@ class EnsemblePredictor:
                 pred.get("currency", ""),
                 float(pred.get("current_rate", 0.0) or 0.0),
             )
-            current_rate = float(pred.get("current_rate", 0.0) or 0.0)
-            pred["frr_fallback_value"] = (
-                float(current_rate) if abs(float(pred["frr_proxy_rate"]) - current_rate) < 1e-8 else None
-            )
             pred["fast_liquidity_score"] = self._calculate_fast_liquidity_score(pred, market_liquidity)
             pred["path_value_score"] = self._calculate_path_value_score(pred, rank6_rate)
             path_meta = pred.get("_path_meta", {})
@@ -1867,12 +1878,13 @@ class EnsemblePredictor:
                 pred, path_meta, liquidity_meta
             )
             pred["safety_multiplier"] = self._calculate_safety_multiplier(pred, path_meta)
+            pred["liquidity_multiplier"] = float(0.68 + 0.32 * pred["fast_liquidity_score"])
 
             final_rank_score = (
                 pred["path_value_score"] *
                 pred["currency_regime_multiplier"] *
                 pred["safety_multiplier"] *
-                (0.68 + 0.32 * pred["fast_liquidity_score"])
+                pred["liquidity_multiplier"]
             )
             pred["final_rank_score"] = float(final_rank_score)
             pred["weighted_score"] = float(final_rank_score)
