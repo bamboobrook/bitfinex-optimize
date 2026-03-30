@@ -1555,14 +1555,23 @@ class EnsemblePredictor:
 
             book_signal = self._get_realtime_non2d_liquidity_signal(currency)
             if book_signal["available"]:
+                fillability_signal = float(book_signal.get("fillability_signal", 0.0) or 0.0)
+                fast_score = self._clip_unit(
+                    avg_exec * 0.45 +
+                    fillability_signal * 0.30 +
+                    book_signal.get("depth_signal", 0.0) * 0.15 +
+                    freshness_signal * 0.10
+                ) * book_signal.get("structure_factor", 1.0)
                 base_score = (
                     avg_exec * 0.40 +
                     freshness_signal * 0.20 +
-                    book_signal["fillability_signal"] * 0.20 +
+                    fillability_signal * 0.20 +
                     book_signal["depth_signal"] * 0.20
                 )
                 score = base_score * book_signal.get("structure_factor", 1.0) * 100.0
             else:
+                fillability_signal = self._clip_unit(avg_exec * 0.75 + freshness_signal * 0.25)
+                fast_score = self._clip_unit(avg_exec * 0.70 + freshness_signal * 0.30)
                 score = (
                     avg_exec * 0.70 +
                     freshness_signal * 0.30
@@ -1582,9 +1591,302 @@ class EnsemblePredictor:
                 "level": level,
                 "score": score,
                 "avg_exec_rate": round(avg_exec, 3),
+                "fast_score": round(float(np.clip(fast_score, 0.0, 1.0)), 3),
+                "fillability_signal": round(float(np.clip(fillability_signal, 0.0, 1.0)), 3),
                 "volume_ratio_24h": volume_ratio_24h,
             }
         return result
+
+    def _estimate_rank6_reference_rate(self, preds: list) -> float:
+        """Use fixed fUSD-2d as the terminal fallback reference for path scoring."""
+        best_rate = None
+        for pred in preds or []:
+            if pred.get("currency") == "fUSD" and int(pred.get("period", 0) or 0) == 2:
+                rate = float(pred.get("predicted_rate", 0.0) or 0.0)
+                if rate > 0:
+                    best_rate = rate
+                    break
+
+        if best_rate is None:
+            snapshot = self._get_latest_prediction_snapshot("fUSD", 2)
+            if snapshot is not None:
+                best_rate = float(snapshot.get("predicted_rate", 0.0) or 0.0)
+
+        if best_rate is None or best_rate <= 0:
+            latest_rate, _ = self.get_latest_rate_from_db("fUSD", 2)
+            if latest_rate:
+                best_rate = float(latest_rate)
+
+        return float(best_rate if best_rate and best_rate > 0 else 5.0)
+
+    def _estimate_frr_proxy_rate(self, currency: str, current_rate: float) -> float:
+        """
+        First-pass FRR proxy:
+        use the latest same-currency 120d market rate; if unavailable, fall back to current_rate.
+        """
+        try:
+            proxy_rate, _ = self.get_latest_rate_from_db(currency, 120)
+        except Exception:
+            proxy_rate = None
+        if proxy_rate is None or float(proxy_rate or 0.0) <= 0.0:
+            return float(current_rate or 0.0)
+        return float(proxy_rate)
+
+    def _get_pending_order_pressure(self, currency: str, period: int) -> float:
+        """Estimate how crowded this slot already is in pending virtual orders."""
+        import sqlite3
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT
+                        SUM(CASE WHEN currency = ? AND period = ? AND status = 'PENDING' THEN 1 ELSE 0 END) AS pair_pending,
+                        SUM(CASE WHEN currency = ? AND status = 'PENDING' THEN 1 ELSE 0 END) AS currency_pending
+                    FROM virtual_orders
+                    """,
+                    (currency, period, currency),
+                ).fetchone()
+        except Exception:
+            return 0.0
+
+        pair_pending = float((row[0] if row else 0.0) or 0.0)
+        currency_pending = float((row[1] if row else 0.0) or 0.0)
+        return self._clip_unit(pair_pending / 4.0 * 0.75 + currency_pending / 18.0 * 0.25)
+
+    def _calculate_path_value_score(self, pred: dict, rank6_rate: float) -> float:
+        """
+        Score the external execution path value:
+        fixed-rate hanging window -> FRR proxy window -> fixed rank6 fallback.
+        """
+        rate = float(pred.get("predicted_rate", 0.0) or 0.0)
+        current_rate = float(pred.get("current_rate", 0.0) or 0.0)
+        period = int(pred.get("period", 0) or 0)
+        exec_prob = self._clip_unit(
+            pred.get("calibrated_execution_prob", pred.get("execution_probability", 0.0) or 0.0)
+        )
+        exec_rate_fast = self._clip_unit(pred.get("execution_rate_7d", pred.get("exec_rate_raw", exec_prob)))
+        fast_liquidity_score = self._clip_unit(pred.get("fast_liquidity_score", pred.get("liquidity_score", 0.0) / 100.0))
+        pending_pressure = self._clip_unit(pred.get("pending_order_pressure", 0.0) or 0.0)
+        frr_proxy_rate = float(pred.get("frr_proxy_rate", current_rate) or current_rate or 0.0)
+
+        market_follow_error = float(pred.get("market_follow_error", 0.0) or 0.0)
+        avg_gap_failed = float(pred.get("avg_rate_gap_failed", 0.0) or 0.0)
+        follow_gap_ratio = market_follow_error / (current_rate + 1e-8) if market_follow_error > 0 and current_rate > 0 else 0.0
+        failed_gap_ratio = avg_gap_failed / (current_rate + 1e-8) if avg_gap_failed > 0 and current_rate > 0 else 0.0
+        premium_ratio = (rate - current_rate) / (current_rate + 1e-8) if rate > current_rate and current_rate > 0 else 0.0
+
+        stage1_fill_probability = self._clip_unit(
+            (
+                exec_prob * 0.50 +
+                exec_rate_fast * 0.20 +
+                fast_liquidity_score * 0.20 +
+                (1.0 - pending_pressure) * 0.10
+            ) *
+            max(
+                0.18,
+                1.0 - follow_gap_ratio * 0.22 - failed_gap_ratio * 0.12 - max(premium_ratio - 0.35, 0.0) * 0.10
+            )
+        )
+
+        ladder_decay_rate = rate * (0.99 ** 6)
+        fallback_anchor = max(rank6_rate, frr_proxy_rate, current_rate, 0.01)
+        rank6_fallback_penalty = float(
+            np.clip(1.0 - max(rate - fallback_anchor, 0.0) / fallback_anchor * 0.20, 0.30, 1.0)
+        )
+        residual_path_rate = (
+            ladder_decay_rate * 0.35 +
+            frr_proxy_rate * 0.40 +
+            rank6_rate * 0.25
+        )
+        period_bonus = 1.0 + min(max(period, 0), 120) / 120.0 * 0.05
+        if pred.get("currency") == "fUSD" and period == 120 and max(rate, current_rate) >= 12.0:
+            period_bonus += 0.10
+
+        path_value_score = (
+            stage1_fill_probability * rate +
+            (1.0 - stage1_fill_probability) * residual_path_rate
+        ) * period_bonus
+
+        pred["stage1_fill_probability"] = float(stage1_fill_probability)
+        pred["frr_proxy_rate"] = float(frr_proxy_rate)
+        pred["rank6_fallback_penalty"] = rank6_fallback_penalty
+        pred["_path_meta"] = {
+            "follow_gap_ratio": float(follow_gap_ratio),
+            "failed_gap_ratio": float(failed_gap_ratio),
+            "premium_ratio": float(premium_ratio),
+            "fallback_anchor": float(fallback_anchor),
+            "stage1_fill_probability": float(stage1_fill_probability),
+            "period_bonus": float(period_bonus),
+            "rank6_fallback_penalty": rank6_fallback_penalty,
+        }
+        return float(path_value_score)
+
+    def _calculate_fast_liquidity_score(self, pred: dict, market_liquidity: dict) -> float:
+        """Estimate fast fill odds for the first stage of the external execution path."""
+        currency = pred.get("currency", "")
+        market_meta = market_liquidity.get(currency, {})
+        exec_prob = self._clip_unit(
+            pred.get("calibrated_execution_prob", pred.get("execution_probability", 0.0) or 0.0)
+        )
+        exec_rate_fast = self._clip_unit(pred.get("execution_rate_7d", pred.get("exec_rate_raw", exec_prob)))
+        market_score = float(market_meta.get("score", pred.get("liquidity_score", 0.0)) or 0.0)
+        market_score_signal = self._clip_unit(market_score / 100.0)
+        market_fast_score = self._clip_unit(
+            market_meta.get("fast_score", market_score_signal)
+        )
+        fillability_signal = self._clip_unit(
+            market_meta.get("fillability_signal", market_fast_score)
+        )
+        volume_ratio = market_meta.get("volume_ratio_24h")
+        if volume_ratio is None:
+            volume_signal = 0.60
+        else:
+            volume_signal = self._clip_unit(float(volume_ratio or 0.0) / 1.20)
+
+        pending_pressure = self._get_pending_order_pressure(currency, int(pred.get("period", 0) or 0))
+        fast_score = (
+            exec_prob * 0.34 +
+            exec_rate_fast * 0.22 +
+            market_fast_score * 0.20 +
+            fillability_signal * 0.14 +
+            market_score_signal * 0.10
+        ) * (0.88 + 0.12 * volume_signal) * (1.0 - 0.20 * pending_pressure)
+
+        pred["pending_order_pressure"] = float(pending_pressure)
+        pred["_liquidity_meta"] = {
+            "market_score": float(market_score),
+            "market_score_signal": float(market_score_signal),
+            "market_fast_score": float(market_fast_score),
+            "fillability_signal": float(fillability_signal),
+            "volume_ratio_24h": None if volume_ratio is None else float(volume_ratio),
+            "volume_signal": float(volume_signal),
+            "pending_order_pressure": float(pending_pressure),
+        }
+        return self._clip_unit(fast_score)
+
+    def _calculate_currency_regime_multiplier(self, pred: dict, path_meta: dict, liquidity_meta: dict) -> float:
+        """Bias ranking toward the default fUSD regime unless fUST shows real burst + liquidity."""
+        currency = str(pred.get("currency", ""))
+        period = int(pred.get("period", 0) or 0)
+        rate = float(pred.get("predicted_rate", 0.0) or 0.0)
+        current_rate = float(pred.get("current_rate", 0.0) or 0.0)
+        market_fast_score = float(liquidity_meta.get("market_fast_score", 0.0) or 0.0)
+        fillability_signal = float(liquidity_meta.get("fillability_signal", 0.0) or 0.0)
+        volume_ratio = liquidity_meta.get("volume_ratio_24h")
+        volume_ratio = float(volume_ratio or 0.0) if volume_ratio is not None else 0.0
+        stage1_fill_probability = float(path_meta.get("stage1_fill_probability", 0.0) or 0.0)
+        premium_abs = max(rate - current_rate, 0.0)
+
+        if currency == "fUSD":
+            multiplier = 1.04
+            state = "fusd_preferred"
+            if period == 120 and max(rate, current_rate) >= 12.0:
+                multiplier += 0.14
+                state = "fusd_120d_high_yield"
+            elif period >= 60 and rate >= 10.0:
+                multiplier += 0.05
+                state = "fusd_long_support"
+            if market_fast_score < 0.35:
+                multiplier *= 0.95
+        else:
+            burst_ready = (
+                premium_abs >= 2.5 and
+                rate >= 11.0 and
+                stage1_fill_probability >= 0.72 and
+                market_fast_score >= 0.78 and
+                fillability_signal >= 0.78 and
+                volume_ratio >= 1.10
+            )
+            if burst_ready:
+                multiplier = 1.02 + min((premium_abs - 2.5) / 10.0, 0.08)
+                state = "fust_burst"
+            else:
+                multiplier = min(
+                    0.98,
+                    0.86 +
+                    market_fast_score * 0.08 +
+                    stage1_fill_probability * 0.06 +
+                    min(volume_ratio, 1.0) * 0.02
+                )
+                state = "fust_guarded"
+
+        pred["currency_regime_state"] = state
+        return float(np.clip(multiplier, 0.82, 1.20))
+
+    def _calculate_safety_multiplier(self, pred: dict, path_meta: dict) -> float:
+        """Suppress fake premiums that do not survive the full execution path."""
+        current_rate = float(pred.get("current_rate", 0.0) or 0.0)
+        rate = float(pred.get("predicted_rate", 0.0) or 0.0)
+        period = int(pred.get("period", 0) or 0)
+        exec_rate_fast = self._clip_unit(pred.get("execution_rate_7d", pred.get("exec_rate_raw", 0.0)))
+        follow_gap_ratio = float(path_meta.get("follow_gap_ratio", 0.0) or 0.0)
+        failed_gap_ratio = float(path_meta.get("failed_gap_ratio", 0.0) or 0.0)
+        premium_ratio = float(path_meta.get("premium_ratio", 0.0) or 0.0)
+        rank6_fallback_penalty = float(path_meta.get("rank6_fallback_penalty", 1.0) or 1.0)
+
+        multiplier = rank6_fallback_penalty
+        multiplier *= max(0.25, 1.0 - max(follow_gap_ratio - 0.30, 0.0) * 0.22)
+        multiplier *= max(0.35, 1.0 - max(failed_gap_ratio - 0.20, 0.0) * 0.16)
+        multiplier *= max(0.55, 1.0 - max(premium_ratio - 0.50, 0.0) * 0.10)
+
+        if current_rate > 0 and rate > current_rate * 2.5:
+            multiplier *= 0.85
+        if period >= 60 and exec_rate_fast < 0.22:
+            multiplier *= 0.92
+        if pred.get("currency") == "fUSD" and period == 120 and max(rate, current_rate) >= 12.0:
+            multiplier *= 1.03
+
+        return float(np.clip(multiplier, 0.20, 1.08))
+
+    def _apply_path_ranking(self, preds: list, market_liquidity: dict, fusd_2d_pred: Optional[dict]) -> list:
+        """Rank predictions by external path value instead of static weighted score."""
+        if not preds:
+            return []
+
+        rank6_inputs = list(preds)
+        if fusd_2d_pred is not None:
+            rank6_inputs.append(fusd_2d_pred)
+        rank6_rate = self._estimate_rank6_reference_rate(rank6_inputs)
+
+        ranked_preds = []
+        for pred in preds:
+            pred["frr_proxy_rate"] = self._estimate_frr_proxy_rate(
+                pred.get("currency", ""),
+                float(pred.get("current_rate", 0.0) or 0.0),
+            )
+            current_rate = float(pred.get("current_rate", 0.0) or 0.0)
+            pred["frr_fallback_value"] = (
+                float(current_rate) if abs(float(pred["frr_proxy_rate"]) - current_rate) < 1e-8 else None
+            )
+            pred["fast_liquidity_score"] = self._calculate_fast_liquidity_score(pred, market_liquidity)
+            pred["path_value_score"] = self._calculate_path_value_score(pred, rank6_rate)
+            path_meta = pred.get("_path_meta", {})
+            liquidity_meta = pred.get("_liquidity_meta", {})
+            pred["currency_regime_multiplier"] = self._calculate_currency_regime_multiplier(
+                pred, path_meta, liquidity_meta
+            )
+            pred["safety_multiplier"] = self._calculate_safety_multiplier(pred, path_meta)
+
+            final_rank_score = (
+                pred["path_value_score"] *
+                pred["currency_regime_multiplier"] *
+                pred["safety_multiplier"] *
+                (0.68 + 0.32 * pred["fast_liquidity_score"])
+            )
+            pred["final_rank_score"] = float(final_rank_score)
+            pred["weighted_score"] = float(final_rank_score)
+            ranked_preds.append(pred)
+
+        ranked_preds.sort(
+            key=lambda item: (
+                float(item.get("final_rank_score", 0.0) or 0.0),
+                float(item.get("path_value_score", 0.0) or 0.0),
+                float(item.get("predicted_rate", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        return ranked_preds
 
     def _get_recommendation_regime_multiplier(self, pred: dict) -> float:
         """
@@ -1660,6 +1962,14 @@ class EnsemblePredictor:
                 "data_age_minutes": "REAL",
                 "market_follow_error": "REAL",
                 "stale_data": "INTEGER",
+                "path_value_score": "REAL",
+                "stage1_fill_probability": "REAL",
+                "frr_proxy_rate": "REAL",
+                "frr_fallback_value": "REAL",
+                "rank6_fallback_penalty": "REAL",
+                "fast_liquidity_score": "REAL",
+                "currency_regime_state": "TEXT",
+                "final_rank_score": "REAL",
             }
             for column, col_type in required_columns.items():
                 if column not in existing:
@@ -1719,6 +2029,14 @@ class EnsemblePredictor:
                 float(pred.get("data_age_minutes", 0.0) or 0.0),
                 float(pred.get("market_follow_error", 0.0) or 0.0),
                 stale_flag,
+                float(pred.get("path_value_score", 0.0) or 0.0),
+                float(pred.get("stage1_fill_probability", 0.0) or 0.0),
+                float(pred.get("frr_proxy_rate", current_rate) or current_rate or 0.0),
+                pred.get("frr_fallback_value"),
+                float(pred.get("rank6_fallback_penalty", 0.0) or 0.0),
+                float(pred.get("fast_liquidity_score", 0.0) or 0.0),
+                pred.get("currency_regime_state"),
+                float(pred.get("final_rank_score", pred.get("weighted_score", 0.0)) or 0.0),
             ))
 
         with sqlite3.connect(self.db_path) as conn:
@@ -1731,8 +2049,11 @@ class EnsemblePredictor:
                     current_market_rate, rate_premium_pct, ma_60, ma_1440,
                     volatility_60, volume_ma_60, calibrated_execution_probability,
                     weighted_score, liquidity_score, data_age_minutes,
-                    market_follow_error, stale_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    market_follow_error, stale_data, path_value_score,
+                    stage1_fill_probability, frr_proxy_rate, frr_fallback_value,
+                    rank6_fallback_penalty, fast_liquidity_score,
+                    currency_regime_state, final_rank_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows
             )
@@ -1829,9 +2150,6 @@ class EnsemblePredictor:
             print(json.dumps(stale_result, indent=2))
             return
 
-        # 排序逻辑：
-        # 1. 优先考虑成交概率 >= 0.5 的选项
-        # 2. 在成交概率合格的基础上，按预测利率降序排列
         valid_preds = [p for p in preds if p['predicted_rate'] > 1.0]
 
         market_liquidity = self._calc_market_liquidity(preds)
@@ -1846,122 +2164,23 @@ class EnsemblePredictor:
                 f"score < 40 and volume_ratio_24h < 0.1, non-2d orders will downgrade to 2d"
             )
 
-        # Revenue-optimized scoring: 收益率优先,兼顾成交和长周期
-        def calculate_weighted_score(pred):
-            """
-            收益率优先评分 (v7):
-            - 40% effective_rate (calibrated_prob * rate - 期望收益)
-            - 30% raw_rate (高利率偏好)
-            - 20% exec_prob (成交保障，使用校准概率)
-            - 10% revenue_factor (period_days/120 - 长周期仅作微调)
-            + execution floor: calibrated_prob < 0.35 gets 0.4x penalty
-            + data_age multiplier: 数据越老（流动性越低）评分越低，warn~hard 线性衰减到 0.6x
-            + divergence multiplier: 预测利率/当前市场 > 2.5x 时线性降权至 0.5x
-            + currency_type_multiplier: fUSD×1.05，fUST×0.92（fUST 市场稀疏、波动大）
-            + volume_penalty: 24h 成交量 < 30d 基线 30% 时线性惩罚到 0.75x
-            """
-            calib_prob = pred.get('calibrated_execution_prob', pred['execution_probability'])
-            rate = pred['predicted_rate']
-            period = pred['period']
-            data_age = pred.get('data_age_minutes', 0.0)
-            currency = pred.get('currency', '')
-
-            # 1. 标准化利率到0-1范围 (假设最高利率40%)
-            normalized_rate = min(rate / 40.0, 1.0)
-
-            # 2. Effective rate = rate * calibrated_prob (期望收益，反映真实成交率)
-            effective_rate = normalized_rate * calib_prob
-
-            # 3. Revenue factor based on period (continuous, not tiered)
-            revenue_factor = min(period / 120.0, 1.0)
-
-            # 4. Execution floor: calibrated_prob < 0.35 时线性衰减惩罚（覆盖零流动性场景）
-            # 线性衰减避免 0.35 处硬跳变，确保低流动性周期仍有订单进入市场（闭环不断裂）
-            # calib_prob=0.26 → 0.4 + 0.6×0.74 = 0.844x（而非原来 0.4x）
-            if calib_prob >= 0.35:
-                exec_floor_multiplier = 1.0
-            else:
-                exec_floor_multiplier = 0.4 + 0.6 * (calib_prob / 0.35)
-
-            # 5. Data-age multiplier: 数据老旧 = 流动性可能枯竭，推荐权重线性衰减
-            warn_min, hard_min = self._freshness_thresholds_minutes(currency, period)
-            if data_age <= warn_min:
-                age_multiplier = 1.0
-            else:
-                # warn~hard 区间线性从 1.0 衰减到 0.6
-                age_multiplier = 1.0 - 0.4 * min((data_age - warn_min) / max(hard_min - warn_min, 1.0), 1.0)
-
-            # 6. Market divergence multiplier: 预测利率远高于当前市场时降权
-            # 防止"历史高利率残留exec_rate"掩盖当前市场崩塌（如 fUST-60: 预测13% vs 市场2.9%）
-            # 使用相对偏差而非绝对值，避免对高利率市场误惩罚
-            follow_err = pred.get('market_follow_error', 0.0)
-            current_rate_val = pred.get('current_rate', rate)
-            if follow_err > 0 and current_rate_val > 0:
-                relative_err = follow_err / current_rate_val
-                if relative_err > 1.5:
-                    # relative_err > 1.5 (预测 > 市场×2.5) 时线性惩罚，避免历史高利率残留
-                    # 1.5→4.0 映射到 multiplier 1.0→0.5
-                    divergence_multiplier = max(0.5, 1.0 - 0.2 * (relative_err - 1.5))
-                else:
-                    divergence_multiplier = 1.0
-            else:
-                divergence_multiplier = 1.0
-
-            # 7. 绝对利率下限惩罚：predicted_rate 极低时降权
-            # 防止 fUST-2d 在市场崩塌时因高 calib_prob 异常排名靠前
-            # 阈值 3.0%：低于此值线性惩罚，rate=0 时 multiplier=0.5x
-            LOW_RATE_THRESHOLD = 3.0
-            if rate < LOW_RATE_THRESHOLD:
-                low_rate_multiplier = 0.5 + 0.5 * (rate / LOW_RATE_THRESHOLD)
-            else:
-                low_rate_multiplier = 1.0
-
-            regime_multiplier = self._get_recommendation_regime_multiplier(pred)
-
-            # 9. Currency type bias: fUSD 历史执行率更高且稳定，略微提权
-            # fUST 市场更稀疏且波动性大，略微降权
-            currency_type_multiplier = 1.05 if currency == "fUSD" else 0.92
-
-            # 10. Volume liquidity soft penalty: 24h 成交量 < 30d 基线 30% 时线性惩罚
-            # 补充门控之外的软性降权，防止 book depth 看起来好但实际成交量已萎缩的情况
-            market_info = market_liquidity.get(currency, {})
-            volume_ratio = market_info.get("volume_ratio_24h") or 1.0
-            if volume_ratio < 0.4:
-                # 双窗口 min 后比值天然偏低，阈值提高至 0.4 使灵敏度整体上移
-                volume_penalty = max(0.75, 0.75 + 0.25 * (volume_ratio / 0.4))
-            else:
-                volume_penalty = 1.0
-
-            # 8. 最终分数 = 40%期望收益 + 30%原始利率 + 20%执行概率 + 10%周期
-            final_score = (
-                effective_rate * 0.40 +
-                normalized_rate * 0.30 +
-                calib_prob * 0.20 +
-                revenue_factor * 0.10
-            ) * exec_floor_multiplier * age_multiplier * divergence_multiplier * low_rate_multiplier * regime_multiplier * currency_type_multiplier * volume_penalty
-
-            return final_score
-
-        # Fix5: 预先计算并写入 weighted_score，供 per-period 覆盖保证逻辑使用
-        for pred in valid_preds:
-            pred['weighted_score'] = calculate_weighted_score(pred)
-
-        raw_ranked_preds = sorted(
-            valid_preds,
-            key=lambda p: p['weighted_score'],
-            reverse=True
+        fusd_2d_pred = next(
+            (p for p in valid_preds if p['currency'] == 'fUSD' and int(p['period']) == 2),
+            None
         )
+        if fusd_2d_pred is None:
+            fusd_2d_pred = self._get_latest_prediction_snapshot('fUSD', 2)
+            if fusd_2d_pred is not None:
+                logger.warning(
+                    "Current fUSD-2d prediction unavailable, using latest prediction_history snapshot for fixed rank6."
+                )
 
-        eligible_preds = [
-            p for p in valid_preds
+        raw_ranked_preds = self._apply_path_ranking(valid_preds, market_liquidity, fusd_2d_pred)
+
+        sorted_preds = [
+            p for p in raw_ranked_preds
             if not (p['currency'] in gated_currencies and int(p['period']) != 2)
         ]
-
-        sorted_preds = sorted(
-            eligible_preds,
-            key=lambda p: p['weighted_score'],
-            reverse=True
-        )
         gated_2d_preds = []
         for currency in sorted(gated_currencies):
             pred_2d = next(
@@ -1985,19 +2204,6 @@ class EnsemblePredictor:
             "market_liquidity": market_liquidity,
             "recommendations": []
         }
-
-        # Build recommendations: rank 1-5 = top 5 (excluding fUSD-2d), rank 6 = fUSD-2d (fixed)
-        fusd_2d_pred = None
-        for pred in sorted_preds:
-            if pred['currency'] == 'fUSD' and pred['period'] == 2:
-                fusd_2d_pred = pred
-                break
-        if fusd_2d_pred is None:
-            fusd_2d_pred = self._get_latest_prediction_snapshot('fUSD', 2)
-            if fusd_2d_pred is not None:
-                logger.warning(
-                    "Current fUSD-2d prediction unavailable, using latest prediction_history snapshot for fixed rank6."
-                )
 
         # rank 1-5: top 5 from sorted_preds excluding fUSD-2d
         # gated 货币的 2d 订单参与正常评分排序，不再强制置顶（避免低利率 2d 异常 rank1）
