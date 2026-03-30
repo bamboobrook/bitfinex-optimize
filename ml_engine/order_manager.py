@@ -65,6 +65,18 @@ class OrderManager:
                 "follow_error_at_order": "REAL",
                 "execution_threshold": "REAL",
                 "market_percentile_40": "REAL",
+                "path_value_score": "REAL",
+                "stage1_fill_probability": "REAL",
+                "frr_proxy_rate": "REAL",
+                "frr_fallback_value": "REAL",
+                "rank6_fallback_penalty": "REAL",
+                "fast_liquidity_score": "REAL",
+                "currency_regime_state": "TEXT",
+                "expected_terminal_mode": "TEXT",
+                "path_stage_outcome": "TEXT",
+                "stage1_fill_hours": "INTEGER",
+                "stage2_frr_proxy_rate": "REAL",
+                "terminal_mode": "TEXT",
             }
 
             for column, col_type in required_columns.items():
@@ -135,8 +147,11 @@ class OrderManager:
                 (order_id, currency, period, predicted_rate, order_timestamp,
                  validation_window_hours, prediction_confidence, prediction_strategy,
                  model_version, status, created_at, market_follow_error,
-                 direction_match, step_change_pct, step_capped, policy_step_cap_pct, probe_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)
+                 direction_match, step_change_pct, step_capped, policy_step_cap_pct,
+                 probe_type, path_value_score, stage1_fill_probability,
+                 frr_proxy_rate, frr_fallback_value, rank6_fallback_penalty,
+                 fast_liquidity_score, currency_regime_state, expected_terminal_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 order_id,
                 prediction['currency'],
@@ -154,6 +169,14 @@ class OrderManager:
                 int(bool(prediction.get('step_capped', False))) if prediction.get('step_capped') is not None else None,
                 prediction.get('policy_step_cap_pct'),
                 probe_type,
+                prediction.get('path_value_score'),
+                prediction.get('stage1_fill_probability'),
+                prediction.get('frr_proxy_rate'),
+                prediction.get('frr_fallback_value'),
+                prediction.get('rank6_fallback_penalty'),
+                prediction.get('fast_liquidity_score'),
+                prediction.get('currency_regime_state'),
+                prediction.get('expected_terminal_mode'),
             ))
 
             conn.commit()
@@ -233,6 +256,10 @@ class OrderManager:
                     execution_delay_minutes = ?,
                     max_market_rate = ?,
                     rate_gap = ?,
+                    path_stage_outcome = ?,
+                    stage1_fill_hours = ?,
+                    stage2_frr_proxy_rate = ?,
+                    terminal_mode = ?,
                     validated_at = ?
                 WHERE order_id = ?
             """, (
@@ -242,6 +269,10 @@ class OrderManager:
                 execution_details.get('execution_delay_minutes'),
                 execution_details.get('max_market_rate'),
                 execution_details.get('rate_gap'),
+                execution_details.get('path_stage_outcome'),
+                execution_details.get('stage1_fill_hours'),
+                execution_details.get('stage2_frr_proxy_rate'),
+                execution_details.get('terminal_mode'),
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 order_id
             ))

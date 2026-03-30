@@ -34,10 +34,32 @@ class ExecutionValidator:
             cursor.execute("PRAGMA table_info(virtual_orders)")
             existing = {row[1] for row in cursor.fetchall()}
             required_columns = {
+                "executed_at": "TEXT",
+                "execution_rate": "REAL",
+                "execution_delay_minutes": "INTEGER",
+                "max_market_rate": "REAL",
+                "rate_gap": "REAL",
+                "validated_at": "TEXT",
+                "execution_confidence": "REAL",
+                "percentile_score": "REAL",
+                "gap_score": "REAL",
+                "density_score": "REAL",
+                "total_score": "REAL",
                 "gate_reject_reason": "TEXT",
                 "follow_error_at_order": "REAL",
                 "execution_threshold": "REAL",
+                "market_percentile_25": "REAL",
+                "market_percentile_30": "REAL",
+                "market_percentile_35": "REAL",
                 "market_percentile_40": "REAL",
+                "market_median": "REAL",
+                "market_min": "REAL",
+                "market_max": "REAL",
+                "nearby_rate_count": "INTEGER",
+                "path_stage_outcome": "TEXT",
+                "stage1_fill_hours": "INTEGER",
+                "stage2_frr_proxy_rate": "REAL",
+                "terminal_mode": "TEXT",
             }
             for column, col_type in required_columns.items():
                 if column not in existing:
@@ -45,6 +67,46 @@ class ExecutionValidator:
             conn.commit()
         finally:
             conn.close()
+
+    def _simulate_stage1_fixed_path(self, order_time: datetime, market_rows: List, predicted_rate: float, period: int):
+        """
+        Replay the first 6 hours of the fixed-rate path, reducing the ask by 1% each hour.
+
+        Returns:
+            (filled, fill_hour, effective_rate)
+        """
+        fill_tolerance = self._get_fill_tolerance(period)
+
+        for hour in range(6):
+            hour_start = order_time + timedelta(hours=hour)
+            hour_end = order_time + timedelta(hours=hour + 1)
+            target_rate = predicted_rate * (0.99 ** hour)
+
+            for timestamp_str, close_rate, high_rate in market_rows:
+                row_time = datetime.fromisoformat(timestamp_str)
+                if row_time <= hour_start or row_time > hour_end:
+                    continue
+
+                candidate_rate = float(close_rate or 0.0)
+                if candidate_rate >= target_rate * fill_tolerance:
+                    return True, hour + 1, target_rate
+
+        return False, None, predicted_rate * (0.99 ** 5)
+
+    def _estimate_stage2_frr_proxy(self, currency: str, stage2_start: datetime, stage2_end: datetime) -> float:
+        """
+        Estimate FRR proxy from same-currency 120d close_annual values in the stage2 window.
+        """
+        if stage2_end <= stage2_start:
+            return 0.0
+
+        rows = self.query_market_rates(currency, 120, stage2_start, stage2_end)
+        close_rates = [float(row[2]) for row in rows if row[2] is not None and float(row[2]) > 0.0]
+
+        if not close_rates:
+            return 0.0
+
+        return float(np.percentile(close_rates, 40))
 
     def _get_recent_validation_count(self, period: int, currency: str, hours: int = 4) -> int:
         """
@@ -271,14 +333,7 @@ class ExecutionValidator:
                     'reason': 'No market data available'
                 }
 
-            # Check for execution - FIXED LOGIC (Plan B: Percentile-based)
-            # 在Lending市场中，Lender设置的利率越低，越容易被Borrower选中
-            # 因此只有当预测利率 <= 市场25分位数时，才认为订单成交
             predicted_rate = order['predicted_rate']
-            executed = False
-            execution_details = {}
-
-            # Collect all market rates during validation window
             market_close_rates = []
             market_high_rates = []
             market_data_timestamped = []
@@ -293,76 +348,62 @@ class ExecutionValidator:
                 market_data_timestamped.append((timestamp_str, close_annual, high_annual))
 
             if not market_close_rates:
-                # No valid market data
                 execution_details = {
                     'status': 'FAILED',
                     'gate_reject_reason': 'NO_VALID_MARKET_DATA',
                     'max_market_rate': 0.0,
-                    'rate_gap': predicted_rate
+                    'rate_gap': predicted_rate,
+                    'path_stage_outcome': 'NO_VALID_MARKET_DATA',
+                    'stage1_fill_hours': None,
+                    'stage2_frr_proxy_rate': 0.0,
+                    'terminal_mode': 'RANK6_PROXY',
                 }
             else:
-                # 使用混合判断策略
-                should_execute, confidence, score_details = self._calculate_hybrid_execution_score(
-                    predicted_rate, market_close_rates, int(order['period']), order['currency']
+                market_median = float(np.median(market_close_rates))
+                max_market_rate = max(market_high_rates) if market_high_rates else max(market_close_rates)
+                follow_error_at_order = predicted_rate - market_median
+
+                stage1_ok, stage1_fill_hours, stage1_effective_rate = self._simulate_stage1_fixed_path(
+                    order_time,
+                    market_data_timestamped,
+                    predicted_rate,
+                    int(order['period']),
                 )
-                follow_error_at_order = predicted_rate - score_details['market_median']
 
-                if should_execute:
-                    executed = True
+                stage2_start = order_time + timedelta(hours=6)
+                stage2_end = min(order_time + timedelta(hours=12), actual_window_end)
+                stage2_frr_proxy_rate = self._estimate_stage2_frr_proxy(
+                    order['currency'],
+                    stage2_start,
+                    stage2_end,
+                )
 
-                    # 找到第一个匹配的执行时间点
-                    execution_timestamp = None
-                    execution_rate = None
-
-                    fill_tolerance = self._get_fill_tolerance(int(order['period']))
-                    q40_multiplier = self._get_q40_multiplier(int(order['period']))
-                    q40_gate = predicted_rate <= score_details['market_percentile_40'] * q40_multiplier
-
-                    execution_candidates = []
-                    for timestamp_str, close_rate, high_rate in market_data_timestamped:
-                        if close_rate >= predicted_rate * fill_tolerance:
-                            execution_candidates.append((timestamp_str, close_rate, high_rate))
-
-                    if execution_candidates and q40_gate:
-                        execution_timestamp = execution_candidates[0][0]
-                        execution_rate = execution_candidates[0][1]
-
-                    if execution_timestamp is None:
-                        executed = False
-                        if not q40_gate and not execution_candidates:
-                            reject_reason = 'Q40_AND_FILL_GATE'
-                        elif not q40_gate:
-                            reject_reason = 'Q40_GATE'
-                        else:
-                            reject_reason = 'FILL_GATE'
-                        execution_details = {
-                            'status': 'FAILED',
-                            'gate_reject_reason': reject_reason,
-                            'follow_error_at_order': follow_error_at_order,
-                            'execution_confidence': confidence,
-                            **score_details
-                        }
-                    else:
-                        row_time = datetime.fromisoformat(execution_timestamp)
-                        delay_minutes = int((row_time - order_time).total_seconds() / 60)
-
-                        execution_details = {
-                            'status': 'EXECUTED',
-                            'executed_at': execution_timestamp,
-                            'execution_rate': execution_rate,
-                            'execution_delay_minutes': delay_minutes,
-                            'follow_error_at_order': follow_error_at_order,
-                            'execution_confidence': confidence,
-                            **score_details
-                        }
+                if stage1_ok:
+                    executed_at = (order_time + timedelta(hours=stage1_fill_hours)).strftime('%Y-%m-%d %H:%M:%S')
+                    execution_details = {
+                        'status': 'EXECUTED',
+                        'executed_at': executed_at,
+                        'execution_rate': stage1_effective_rate,
+                        'execution_delay_minutes': int(stage1_fill_hours * 60),
+                        'max_market_rate': max_market_rate,
+                        'rate_gap': predicted_rate - max_market_rate,
+                        'follow_error_at_order': follow_error_at_order,
+                        'path_stage_outcome': 'FIXED_FILLED',
+                        'stage1_fill_hours': stage1_fill_hours,
+                        'stage2_frr_proxy_rate': stage2_frr_proxy_rate,
+                        'terminal_mode': 'FIXED',
+                    }
                 else:
-                    # 订单失败
                     execution_details = {
                         'status': 'FAILED',
-                        'gate_reject_reason': 'SCORE_GATE',
+                        'gate_reject_reason': 'PATH_FIXED_MISS',
+                        'max_market_rate': max_market_rate,
+                        'rate_gap': predicted_rate - max_market_rate,
                         'follow_error_at_order': follow_error_at_order,
-                        'execution_confidence': confidence,
-                        **score_details
+                        'path_stage_outcome': 'FIXED_MISS',
+                        'stage1_fill_hours': None,
+                        'stage2_frr_proxy_rate': stage2_frr_proxy_rate,
+                        'terminal_mode': 'FRR_PROXY' if stage2_frr_proxy_rate > 0 else 'RANK6_PROXY',
                     }
 
             # Update database
@@ -542,7 +583,9 @@ class ExecutionValidator:
                 'market_percentile_35', 'market_percentile_40',
                 'market_median', 'market_min', 'market_max',
                 'nearby_rate_count', 'gate_reject_reason',
-                'follow_error_at_order'
+                'follow_error_at_order', 'path_stage_outcome',
+                'stage1_fill_hours', 'stage2_frr_proxy_rate',
+                'terminal_mode'
             ]:
                 if field in update_data:
                     set_clauses.append(f"{field} = ?")
