@@ -73,7 +73,7 @@ class ExecutionValidator:
         Replay the first 6 hours of the fixed-rate path, reducing the ask by 1% each hour.
 
         Returns:
-            (filled, fill_hour, effective_rate)
+            (filled, fill_hour, effective_rate, fill_timestamp)
         """
         fill_tolerance = self._get_fill_tolerance(period)
 
@@ -89,9 +89,9 @@ class ExecutionValidator:
 
                 candidate_rate = float(close_rate or 0.0)
                 if candidate_rate >= target_rate * fill_tolerance:
-                    return True, hour + 1, target_rate
+                    return True, hour + 1, target_rate, timestamp_str
 
-        return False, None, predicted_rate * (0.99 ** 5)
+        return False, None, predicted_rate * (0.99 ** 5), None
 
     def _estimate_stage2_frr_proxy(self, currency: str, stage2_start: datetime, stage2_end: datetime) -> float:
         """
@@ -357,13 +357,37 @@ class ExecutionValidator:
                     'stage1_fill_hours': None,
                     'stage2_frr_proxy_rate': 0.0,
                     'terminal_mode': 'RANK6_PROXY',
+                    'execution_confidence': 0.0,
+                    'percentile_score': 0.0,
+                    'gap_score': 0.0,
+                    'density_score': 0.0,
+                    'total_score': 0.0,
+                    'execution_threshold': self._get_execution_threshold(int(order['period']), order['currency']),
+                    'market_percentile_25': 0.0,
+                    'market_percentile_30': 0.0,
+                    'market_percentile_35': 0.0,
+                    'market_percentile_40': 0.0,
+                    'market_median': 0.0,
+                    'market_min': 0.0,
+                    'market_max': 0.0,
+                    'nearby_rate_count': 0,
                 }
             else:
-                market_median = float(np.median(market_close_rates))
+                _, confidence, score_details = self._calculate_hybrid_execution_score(
+                    predicted_rate,
+                    market_close_rates,
+                    int(order['period']),
+                    order['currency']
+                )
+                market_median = float(score_details['market_median'])
                 max_market_rate = max(market_high_rates) if market_high_rates else max(market_close_rates)
                 follow_error_at_order = predicted_rate - market_median
+                compatibility_details = {
+                    'execution_confidence': confidence,
+                    **score_details,
+                }
 
-                stage1_ok, stage1_fill_hours, stage1_effective_rate = self._simulate_stage1_fixed_path(
+                stage1_ok, stage1_fill_hours, stage1_effective_rate, stage1_fill_timestamp = self._simulate_stage1_fixed_path(
                     order_time,
                     market_data_timestamped,
                     predicted_rate,
@@ -379,12 +403,12 @@ class ExecutionValidator:
                 )
 
                 if stage1_ok:
-                    executed_at = (order_time + timedelta(hours=stage1_fill_hours)).strftime('%Y-%m-%d %H:%M:%S')
+                    row_time = datetime.fromisoformat(stage1_fill_timestamp)
                     execution_details = {
                         'status': 'EXECUTED',
-                        'executed_at': executed_at,
+                        'executed_at': stage1_fill_timestamp,
                         'execution_rate': stage1_effective_rate,
-                        'execution_delay_minutes': int(stage1_fill_hours * 60),
+                        'execution_delay_minutes': int((row_time - order_time).total_seconds() / 60),
                         'max_market_rate': max_market_rate,
                         'rate_gap': predicted_rate - max_market_rate,
                         'follow_error_at_order': follow_error_at_order,
@@ -392,6 +416,7 @@ class ExecutionValidator:
                         'stage1_fill_hours': stage1_fill_hours,
                         'stage2_frr_proxy_rate': stage2_frr_proxy_rate,
                         'terminal_mode': 'FIXED',
+                        **compatibility_details,
                     }
                 else:
                     execution_details = {
@@ -404,6 +429,7 @@ class ExecutionValidator:
                         'stage1_fill_hours': None,
                         'stage2_frr_proxy_rate': stage2_frr_proxy_rate,
                         'terminal_mode': 'FRR_PROXY' if stage2_frr_proxy_rate > 0 else 'RANK6_PROXY',
+                        **compatibility_details,
                     }
 
             # Update database
