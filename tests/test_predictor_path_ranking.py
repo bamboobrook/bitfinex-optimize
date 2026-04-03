@@ -157,6 +157,56 @@ class PredictorPathRankingTest(unittest.TestCase):
         self.assertEqual(ranked[1]["currency_regime_state"], "fust_guarded")
         self.assertLess(ranked[1]["currency_regime_multiplier"], 0.90)
 
+    def test_live_like_fust_cluster_does_not_fill_rank2_to_rank4_by_default(self):
+        predictor = self._make_predictor()
+        predictor._estimate_frr_proxy_rate = lambda currency, current_rate: 11.972 if currency == "fUST" else 7.3
+
+        live_like_preds = [
+            _make_prediction("fUSD", 60, 9.7908, exec_prob=0.6577),
+            _make_prediction("fUST", 14, 9.6810, exec_prob=0.6936),
+            _make_prediction("fUST", 15, 9.5628, exec_prob=0.6081),
+            _make_prediction("fUST", 30, 9.2152, exec_prob=0.6594),
+            _make_prediction("fUSD", 30, 7.2708, exec_prob=0.5834),
+            _make_prediction("fUSD", 120, 7.6048, exec_prob=0.7275),
+            _make_prediction("fUSD", 2, 3.2574, exec_prob=0.6655),
+        ]
+        overrides = {
+            ("fUSD", 60): {"current_rate": 17.1130, "execution_rate_7d": 0.2911, "avg_rate_gap_failed": 7.7617},
+            ("fUST", 14): {"current_rate": 9.4900, "execution_rate_7d": 0.5000, "avg_rate_gap_failed": 2.8025},
+            ("fUST", 15): {"current_rate": 9.9645, "execution_rate_7d": 0.3750, "avg_rate_gap_failed": 3.8325},
+            ("fUST", 30): {"current_rate": 8.7885, "execution_rate_7d": 0.3659, "avg_rate_gap_failed": 4.4454},
+            ("fUSD", 30): {"current_rate": 5.5564, "execution_rate_7d": 0.5000, "avg_rate_gap_failed": 4.2070},
+            ("fUSD", 120): {"current_rate": 7.3000, "execution_rate_7d": 0.4375, "avg_rate_gap_failed": 7.8342},
+            ("fUSD", 2): {"current_rate": 4.9640, "execution_rate_7d": 0.3431, "avg_rate_gap_failed": 0.0},
+        }
+        for pred in live_like_preds:
+            pred.update(overrides[(pred["currency"], pred["period"])])
+
+        ranked = predictor._apply_path_ranking(
+            live_like_preds,
+            market_liquidity={
+                "fUSD": {
+                    "score": 56.6,
+                    "fast_score": 0.579,
+                    "fillability_signal": 0.967,
+                    "volume_ratio_24h": 0.414,
+                },
+                "fUST": {
+                    "score": 55.4,
+                    "fast_score": 0.534,
+                    "fillability_signal": 1.0,
+                    "volume_ratio_24h": 2.395,
+                },
+            },
+            fusd_2d_pred={"currency": "fUSD", "period": 2, "predicted_rate": 3.2574},
+        )
+
+        top4 = [(pred["currency"], pred["period"]) for pred in ranked[:4]]
+        top4_fusd_count = sum(1 for currency, _ in top4 if currency == "fUSD")
+
+        self.assertEqual(top4[0], ("fUSD", 60))
+        self.assertGreaterEqual(top4_fusd_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

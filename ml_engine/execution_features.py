@@ -226,12 +226,16 @@ class ExecutionFeatures:
                 )
                 total_ever = cursor2.fetchone()[0] or 0
 
-                if total_ever >= cold_start_threshold:
-                    # 保留最低信号下界，维持价格向下驱动力且不断裂闭环
-                    # 短周期: max(0.10, 0.55×0.25)=0.14  中周期: 0.13  长周期: 0.11
-                    exec_rate = max(0.10, default_rate * 0.25)
-                else:
+                # 线性渐进过渡：避免 total_ever 跨过 threshold 时 exec_rate 4x 跳变
+                mature_rate = max(0.10, default_rate * 0.25)
+                if total_ever == 0:
                     exec_rate = default_rate  # 真正冷启动，使用默认值
+                elif total_ever >= cold_start_threshold * 2:
+                    exec_rate = mature_rate   # 完全成熟，使用低值
+                else:
+                    # 在 [0, 2×threshold] 范围内从 default_rate 线性过渡到 mature_rate
+                    blend = total_ever / (cold_start_threshold * 2.0)
+                    exec_rate = default_rate * (1.0 - blend) + mature_rate * blend
             else:
                 calculated_rate = executed / total
                 # 渐进混合: 避免跨过阈值时从默认值瞬间跳到计算值

@@ -1617,19 +1617,53 @@ class EnsemblePredictor:
             if latest_rate:
                 best_rate = float(latest_rate)
 
-        return float(best_rate if best_rate and best_rate > 0 else 5.0)
+        if best_rate and best_rate > 0:
+            return float(best_rate)
+        # 动态兜底：取当前批次所有 current_rate 的中位数
+        all_rates = [
+            float(p.get("current_rate", 0.0) or 0.0)
+            for p in (preds or [])
+            if float(p.get("current_rate", 0.0) or 0.0) > 0
+        ]
+        if all_rates:
+            import numpy as np
+            best_rate = float(np.median(all_rates))
+            logger.warning(f"rank6 reference: 无 fUSD-2d 数据，使用 current_rate 中位数={best_rate:.2f}")
+        else:
+            best_rate = 5.0
+            logger.warning("rank6 reference: 无任何利率数据，使用硬编码兜底 5.0")
+        return float(best_rate)
 
     def _estimate_frr_proxy_rate(self, currency: str, current_rate: float) -> float:
         """
         First-pass FRR proxy:
-        use the latest same-currency 120d market rate; if unavailable, fall back to current_rate.
+        use the latest same-currency 120d market rate; if unavailable or stale (>7d), fall back to current_rate.
         """
         try:
-            proxy_rate, _ = self.get_latest_rate_from_db(currency, 120)
+            proxy_rate, proxy_ts = self.get_latest_rate_from_db(currency, 120)
         except Exception:
-            proxy_rate = None
+            proxy_rate, proxy_ts = None, None
         if proxy_rate is None or float(proxy_rate or 0.0) <= 0.0:
             return float(current_rate or 0.0)
+        # 新鲜度检查：120d 利率 >7 天则降级为 current_rate
+        if proxy_ts:
+            try:
+                from datetime import datetime as _dt
+                if isinstance(proxy_ts, str):
+                    ts_dt = _dt.fromisoformat(proxy_ts)
+                elif isinstance(proxy_ts, (int, float)):
+                    ts_val = proxy_ts / 1000.0 if proxy_ts > 1e10 else proxy_ts
+                    ts_dt = _dt.fromtimestamp(ts_val)
+                else:
+                    ts_dt = proxy_ts
+                age_days = (_dt.now() - ts_dt).total_seconds() / 86400.0
+                if age_days > 7:
+                    logger.debug(
+                        f"FRR proxy {currency}-120d 已 {age_days:.1f} 天未更新(>7d)，降级为 current_rate={current_rate}"
+                    )
+                    return float(current_rate or 0.0)
+            except Exception:
+                pass
         return float(proxy_rate)
 
     def _get_pending_order_pressure(self, currency: str, period: int) -> float:
@@ -1666,6 +1700,7 @@ class EnsemblePredictor:
             pred.get("calibrated_execution_prob", pred.get("execution_probability", 0.0) or 0.0)
         )
         exec_rate_fast = self._clip_unit(pred.get("execution_rate_7d", pred.get("exec_rate_raw", exec_prob)))
+        exec_rate_slow = self._clip_unit(pred.get("execution_rate_slow", exec_rate_fast))
         fast_liquidity_score = self._clip_unit(pred.get("fast_liquidity_score", pred.get("liquidity_score", 0.0) / 100.0))
         pending_pressure = self._clip_unit(pred.get("pending_order_pressure", 0.0) or 0.0)
         frr_proxy_rate = float(pred.get("frr_proxy_rate", current_rate) or current_rate or 0.0)
@@ -1695,12 +1730,27 @@ class EnsemblePredictor:
             np.clip(1.0 - max(rate - fallback_anchor, 0.0) / fallback_anchor * 0.20, 0.30, 1.0)
         )
         if pred.get("currency") == "fUST":
-            # Default guarded fUST scenarios should not inherit the full 120d proxy upside.
-            # Keep burst cases eligible later through the regime multiplier instead.
-            frr_fallback_value = (
-                frr_proxy_rate * 0.52 +
-                rank6_rate * 0.48
+            # Default guarded fUST scenarios should inherit only a limited portion of
+            # the 120d proxy upside; recent fake bursts in illiquid books were still
+            # lifting rank2-rank4 too easily.
+            frr_guard = (
+                0.20 +
+                fast_liquidity_score * 0.16 +
+                stage1_fill_probability * 0.12 +
+                max(min(exec_rate_fast, stage1_fill_probability) - 0.35, 0.0) * 0.10
             )
+            if exec_rate_slow > 0:
+                frr_guard += min(max(exec_rate_fast / (exec_rate_slow + 1e-8) - 1.0, 0.0), 1.0) * 0.04
+            frr_guard -= pending_pressure * 0.12
+            frr_guard -= min(max(failed_gap_ratio - 0.22, 0.0), 1.0) * 0.08
+            if period >= 14:
+                frr_guard -= 0.03
+            if period >= 30:
+                frr_guard -= 0.03
+            if rate >= 11.0 and stage1_fill_probability >= 0.70 and fast_liquidity_score >= 0.72:
+                frr_guard += 0.08
+            frr_guard = float(np.clip(frr_guard, 0.16, 0.52))
+            frr_fallback_value = rank6_rate + max(frr_proxy_rate - rank6_rate, 0.0) * frr_guard
         else:
             frr_fallback_value = (
                 frr_proxy_rate * 0.72 +
@@ -1794,6 +1844,8 @@ class EnsemblePredictor:
         period = int(pred.get("period", 0) or 0)
         rate = float(pred.get("predicted_rate", 0.0) or 0.0)
         current_rate = float(pred.get("current_rate", 0.0) or 0.0)
+        avg_gap = float(pred.get("avg_rate_gap_failed", 0.0) or 0.0)
+        pending_pressure = self._clip_unit(pred.get("pending_order_pressure", 0.0) or 0.0)
         market_fast_score = float(liquidity_meta.get("market_fast_score", 0.0) or 0.0)
         fillability_signal = float(liquidity_meta.get("fillability_signal", 0.0) or 0.0)
         volume_ratio = liquidity_meta.get("volume_ratio_24h")
@@ -1825,13 +1877,22 @@ class EnsemblePredictor:
                 multiplier = 1.02 + min((premium_abs - 2.5) / 10.0, 0.08)
                 state = "fust_burst"
             else:
+                gap_ratio = avg_gap / (current_rate + 1e-8) if avg_gap > 0 and current_rate > 0 else 0.0
                 multiplier = min(
-                    0.88,
-                    0.74 +
-                    market_fast_score * 0.07 +
-                    stage1_fill_probability * 0.05 +
-                    min(volume_ratio, 1.0) * 0.02
+                    0.84,
+                    0.72 +
+                    market_fast_score * 0.05 +
+                    stage1_fill_probability * 0.04 +
+                    min(volume_ratio, 0.8) * 0.01
                 )
+                multiplier -= max(pending_pressure - 0.35, 0.0) * 0.12
+                multiplier -= min(max(gap_ratio - 0.25, 0.0), 1.0) * 0.06
+                if volume_ratio >= 1.20 and market_fast_score < 0.60:
+                    multiplier -= 0.05
+                if period >= 30:
+                    multiplier -= 0.02
+                if period >= 120:
+                    multiplier -= 0.03
                 state = "fust_guarded"
 
         pred["currency_regime_state"] = state

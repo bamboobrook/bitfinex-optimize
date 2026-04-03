@@ -209,9 +209,22 @@ class EnhancedModelTrainer:
             'step_change_pct', 'step_capped', 'policy_step_cap_pct',
             'gate_reject_reason', 'probe_type',
             'revenue_optimized_target',
+            'terminal_mode',          # string 列 — 会导致 XGBoost ValueError
+            '_expired_weight',        # 内部样本权重，非特征
+            'path_stage1_success',    # 来源于 terminal_mode 的标签，泄漏目标信息
+            'path_terminal_value',    # revenue_optimized 目标源，泄漏目标信息
         ]
 
         feature_cols = [c for c in df.columns if c not in exclude_cols]
+
+        # 安全网：剔除残余 object/string 列，防止新增字段导致 XGBoost 崩溃
+        safe_cols = []
+        for col in feature_cols:
+            if df[col].dtype == 'object':
+                print(f"  ⚠️  WARNING: 自动排除非数值列 '{col}' (dtype={df[col].dtype})")
+            else:
+                safe_cols.append(col)
+        feature_cols = safe_cols
 
         print(f"\n特征数量: {len(feature_cols)}")
         return feature_cols

@@ -217,7 +217,7 @@ class TrainingDataBuilder:
             left_on='order_timestamp',
             right_on='datetime',
             by=['currency', 'period'],
-            direction='nearest',   # 找最近时刻的市场快照
+            direction='backward',  # 只匹配过去/当前快照，防止前视偏差
             tolerance=pd.Timedelta('2h')  # 严格限制在2小时内（原24h太宽）
         )
 

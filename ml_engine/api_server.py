@@ -911,7 +911,11 @@ async def run_full_pipeline():
                 else:
                     # 额外检查：即使 rc==0，stderr 中含训练框架错误也视为失败
                     _has_training_error = stderr and any(
-                        kw in stderr for kw in ('LightGBMError', 'CatBoostError', 'XGBoostError', 'OpenCL')
+                        kw in stderr for kw in (
+                            'LightGBMError', 'CatBoostError', 'XGBoostError', 'OpenCL',
+                            'ValueError', 'Invalid columns',
+                            'Traceback (most recent call last)',
+                        )
                     )
                     if _has_training_error:
                         logger.error(f"❌ Retraining subprocess returned 0 but stderr contains errors: {stderr[-300:]}")
