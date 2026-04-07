@@ -1501,6 +1501,17 @@ class EnsemblePredictor:
         trend = exec_rate_7d / (exec_rate_30d + 1e-8)
         trend_signal = self._calc_trend_signal(trend, exec_rate_7d, max_up, max_down)
 
+        # 负信号比例缩放: 防止多信号同时为负时超过 max_down 被 clip 丢失比例信息
+        total_neg = min(exec_signal, 0) + min(gap_signal, 0) + min(trend_signal, 0)
+        if total_neg < -max_down:
+            scale = max_down / (-total_neg)
+            if exec_signal < 0:
+                exec_signal *= scale
+            if gap_signal < 0:
+                gap_signal *= scale
+            if trend_signal < 0:
+                trend_signal *= scale
+
         # 加法叠加，一次性 clip
         adjustment = 1.0 + exec_signal + gap_signal + trend_signal
         return float(np.clip(adjustment, 1.0 - max_down, 1.0 + max_up))

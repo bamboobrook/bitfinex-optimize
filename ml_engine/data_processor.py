@@ -318,10 +318,10 @@ class DataProcessor:
                         # 用最近邻插值对齐到原始数据时间
                         df['exec_rate_fast'] = exec_fast_series.reindex(
                             df['datetime'], method='ffill'
-                        ).fillna(exec_fast_series.iloc[-1]).values
+                        ).fillna(exec_fast_series.iloc[0]).values
                         df['exec_rate_slow'] = exec_slow_series.reindex(
                             df['datetime'], method='ffill'
-                        ).fillna(exec_slow_series.iloc[-1]).values
+                        ).fillna(exec_slow_series.iloc[0]).values
                     else:
                         # 采样点不够,回退到当前快照值
                         exec_features = exec_calc.get_all_features(currency, period)

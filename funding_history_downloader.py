@@ -254,16 +254,19 @@ class BitfinexDataDownloader:
                     continue
                 else:
                     # B6 FIX: Non-429 errors should also retry instead of silently failing
-                    logger.info(f"    Request failed (status {response.status_code}), retry {attempt+1}/{self.max_retries}")
-                    time.sleep(10)
+                    wait_time = min(10 * (2 ** attempt), 120)
+                    logger.info(f"    Request failed (status {response.status_code}), retry {attempt+1}/{self.max_retries}, backoff {wait_time}s")
+                    time.sleep(wait_time)
                     continue
 
             except requests.exceptions.Timeout:
-                logger.info(f"    Request timeout, retry {attempt+1}/{self.max_retries}")
-                time.sleep(10)
+                wait_time = min(10 * (2 ** attempt), 120)
+                logger.info(f"    Request timeout, retry {attempt+1}/{self.max_retries}, backoff {wait_time}s")
+                time.sleep(wait_time)
             except Exception as e:
-                logger.info(f"    Request exception: {e}")
-                time.sleep(5)
+                wait_time = min(5 * (2 ** attempt), 60)
+                logger.info(f"    Request exception: {e}, backoff {wait_time}s")
+                time.sleep(wait_time)
 
         logger.info(f"    Request failed after {self.max_retries} retries")
         return None

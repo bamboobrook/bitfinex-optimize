@@ -497,7 +497,7 @@ class ExecutionValidator:
 
         if median_gap > 0:
             gap_ratio = rate_gap / median_gap
-            gap_score = max(30 - gap_ratio * 30, 0)
+            gap_score = min(max(30 - gap_ratio * 30, 0), 30.0)
         else:
             gap_score = 30 if rate_gap < 0.001 else 0
 

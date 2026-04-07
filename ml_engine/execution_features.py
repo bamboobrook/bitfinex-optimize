@@ -220,7 +220,7 @@ class ExecutionFeatures:
                 cursor2.execute(
                     "SELECT COUNT(*) FROM virtual_orders "
                     "WHERE currency = ? AND period = ? "
-                    "AND status IN ('EXECUTED', 'FAILED') "
+                    "AND status IN ('EXECUTED', 'FAILED', 'EXPIRED') "
                     "AND order_timestamp >= ?",
                     (currency, period, cutoff_90d)
                 )
@@ -239,8 +239,9 @@ class ExecutionFeatures:
             else:
                 calculated_rate = executed / total
                 # 渐进混合: 避免跨过阈值时从默认值瞬间跳到计算值
-                # blend_ceiling = 1.2x阈值, 避免 blend zone 过宽导致 exec_rate 卡在阈值上
-                blend_ceiling = cold_start_threshold * 1.2
+                # blend_ceiling = 2.0x阈值, 提供足够的渐进过渡区间
+                # 原 1.2x 过窄（threshold=10 时仅 2 单过渡），导致阶跃式跳变
+                blend_ceiling = cold_start_threshold * 2.0
                 default_weight = max(0.0, 1.0 - total / blend_ceiling)
                 exec_rate = default_weight * default_rate + (1.0 - default_weight) * calculated_rate
 
@@ -437,18 +438,23 @@ class ExecutionFeatures:
 
         return features
 
-    def is_cold_start(self, currency: str, period: int, threshold: int = 10) -> bool:
+    def is_cold_start(self, currency: str, period: int, threshold: int = None) -> bool:
         """
         Check if a currency-period combination is in cold start phase
 
         Args:
             currency: fUSD/fUST
             period: Lending period
-            threshold: Minimum number of validated orders to exit cold start
+            threshold: Minimum number of validated orders to exit cold start.
+                       None = use dynamic threshold (5 for period>=60, 10 otherwise)
+                       to match calculate_execution_rate behavior.
 
         Returns:
             True if cold start (< threshold orders), False otherwise
         """
+        if threshold is None:
+            threshold = 5 if period >= 60 else 10
+
         cache_key = f"cold_start_{currency}_{period}_{threshold}"
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -462,7 +468,7 @@ class ExecutionFeatures:
             FROM virtual_orders
             WHERE currency = ?
               AND period = ?
-              AND status IN ('EXECUTED', 'FAILED')
+              AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
             """
 
             cursor.execute(query, (currency, period))

@@ -440,6 +440,13 @@ class EnhancedModelTrainer:
             except Exception as e:
                 print(f"⚠️  _expired_weight 降权失败: {e}")
 
+        # 归一化样本权重: probe降权(×0.3) × expired降权(×0.5) 可导致权重过小
+        if sample_weights is not None:
+            w_mean = sample_weights.mean()
+            if w_mean > 0:
+                sample_weights = sample_weights / w_mean
+                print(f"样本权重已归一化: mean=1.0 (原始 mean={w_mean:.4f})")
+
         # 准备特征
         feature_cols = self.prepare_features(valid_df)
         X = valid_df[feature_cols]
