@@ -33,7 +33,7 @@ RETRAIN_STATE_FILE = str(BASE_DIR / "data" / "retraining_state.json")
 def update_status(status: str, step: str = "", details: str = ""):
     """更新服务状态文件"""
     info = {
-        "status": status,         # 'online' (空闲在线), 'processing' (正在运行任务), 'error' (出错)
+        "status": status,         # 'online'/'processing'/'degraded'/'error'
         "current_step": step,     # 当前正在执行的步骤
         "last_update": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "details": details
@@ -92,6 +92,31 @@ def parse_datetime_safe(dt_str: str):
         return datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
     except Exception:
         return None
+
+
+def _load_prediction_result():
+    if not os.path.exists(DATA_FILE):
+        return None
+    try:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to inspect prediction result file: {e}")
+        return None
+
+
+def _extract_prediction_failure(result):
+    if not isinstance(result, dict):
+        return None
+
+    if result.get("fail_closed"):
+        return result.get("error") or result.get("reason") or "Prediction fail-closed"
+
+    status = result.get("status")
+    if status in {"error", "failed"}:
+        return result.get("error") or result.get("details") or "Prediction reported failure"
+
+    return None
 
 # --- 辅助函数: 获取数据库统计 ---
 def get_db_statistics():
@@ -799,6 +824,7 @@ async def run_full_pipeline():
         logger.info(">>> 🔄 Starting CLOSED-LOOP Optimization Pipeline")
         logger.info(f">>> Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("=" * 80)
+        pipeline_degraded_reasons = []
 
         # ========== STEP 1: 下载最新市场数据 (必须！) ⭐ ==========
         update_status("processing", "1. Downloading Data", "Downloading latest market data...")
@@ -906,7 +932,9 @@ async def run_full_pipeline():
                     # 检查 stderr 中是否有具体错误信息
                     if stderr:
                         logger.error(f"Retraining error details: {stderr[-300:]}")
-                    update_status("error", "4. Retraining Models", "Retraining failed")
+                    degraded_msg = "Retraining failed or not deployed"
+                    pipeline_degraded_reasons.append(degraded_msg)
+                    update_status("degraded", "4. Retraining Models", degraded_msg)
                     # 不返回，继续使用现有模型生成预测
                 else:
                     # 额外检查：即使 rc==0，stderr 中含训练框架错误也视为失败
@@ -919,6 +947,9 @@ async def run_full_pipeline():
                     )
                     if _has_training_error:
                         logger.error(f"❌ Retraining subprocess returned 0 but stderr contains errors: {stderr[-300:]}")
+                        degraded_msg = "Retraining emitted framework errors and was not trusted"
+                        pipeline_degraded_reasons.append(degraded_msg)
+                        update_status("degraded", "4. Retraining Models", degraded_msg)
                     else:
                         _last_forced_retrain_time = datetime.now()
                         save_retraining_state(_last_forced_retrain_time, reason="forced_by_pipeline")
@@ -926,6 +957,9 @@ async def run_full_pipeline():
 
             except Exception as e:
                 logger.error(f"❌ Retraining system error: {e}")
+                degraded_msg = f"Retraining system error: {e}"
+                pipeline_degraded_reasons.append(degraded_msg)
+                update_status("degraded", "4. Retraining Models", degraded_msg)
                 # 继续流程，使用现有模型
         else:
             logger.info("Step 4: ⏭️  Skipping retraining (not needed)")
@@ -953,6 +987,12 @@ async def run_full_pipeline():
                 return
 
             logger.info(f"✅ Prediction completed successfully")
+
+            prediction_failure = _extract_prediction_failure(_load_prediction_result())
+            if prediction_failure:
+                logger.error(f"❌ Prediction reported failure result: {prediction_failure}")
+                update_status("error", "5. Generating Predictions", f"Failed: {prediction_failure[-200:]}")
+                return
 
             # Freshness gate may produce stale_data result with empty recommendations.
             try:
@@ -1003,7 +1043,15 @@ async def run_full_pipeline():
 
         logger.info("=" * 80)
 
-        update_status("online", "Idle", f"Last closed-loop update at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if pipeline_degraded_reasons:
+            degraded_summary = "; ".join(dict.fromkeys(pipeline_degraded_reasons))
+            update_status(
+                "degraded",
+                "Idle",
+                f"Last closed-loop update at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}; {degraded_summary}"
+            )
+        else:
+            update_status("online", "Idle", f"Last closed-loop update at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # --- API 接口定义 ---
 
@@ -1364,6 +1412,11 @@ async def trigger_prediction(background_tasks: BackgroundTasks):
                 logger.error(f"Prediction generation failed: {err_msg}")
                 update_status("error", "Generate Predictions", f"Failed: {err_msg[-200:]}")
             else:
+                prediction_failure = _extract_prediction_failure(_load_prediction_result())
+                if prediction_failure:
+                    logger.error(f"Prediction generation reported failure result: {prediction_failure}")
+                    update_status("error", "Generate Predictions", f"Failed: {prediction_failure[-200:]}")
+                    return
                 logger.info("Prediction generation completed successfully")
                 update_status("online", "Idle", f"Prediction completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -1471,13 +1524,24 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
             if rc != 0:
                 err_msg = stderr_text or stdout_text or "Retraining failed"
                 logger.error(f"❌ Closed-loop retraining failed: {err_msg}")
-                update_status("error", "Closed-Loop Retraining", f"Failed: {err_msg[-200:]}")
+                update_status("degraded", "Closed-Loop Retraining", f"Failed or not deployed: {err_msg[-200:]}")
             else:
-                if force:
-                    _last_forced_retrain_time = datetime.now()
-                    save_retraining_state(_last_forced_retrain_time, reason="manual_force")
-                logger.info("✅ Closed-loop retraining completed successfully")
-                update_status("online", "Idle", f"Retraining completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                _has_training_error = stderr_text and any(
+                    kw in stderr_text for kw in (
+                        'LightGBMError', 'CatBoostError', 'XGBoostError', 'OpenCL',
+                        'ValueError', 'Invalid columns',
+                        'Traceback (most recent call last)',
+                    )
+                )
+                if _has_training_error:
+                    logger.error(f"❌ Closed-loop retraining returned 0 but stderr contains errors: {stderr_text[-300:]}")
+                    update_status("degraded", "Closed-Loop Retraining", "Failed or not deployed: stderr indicates training errors")
+                else:
+                    if force:
+                        _last_forced_retrain_time = datetime.now()
+                        save_retraining_state(_last_forced_retrain_time, reason="manual_force")
+                    logger.info("✅ Closed-loop retraining completed successfully")
+                    update_status("online", "Idle", f"Retraining completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         except Exception as e:
             logger.error(f"❌ Retraining task error: {e}")

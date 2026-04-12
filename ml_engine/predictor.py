@@ -2339,15 +2339,18 @@ class EnsemblePredictor:
             base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             output_path = os.path.join(base_dir, "data", "optimal_combination.json")
         self._stale_issues = []
+        combo_policy = self.policy.get("combo_optimizer", {})
+        combo_mode = combo_policy.get("combo_mode", "shadow")
         preds = self.get_latest_predictions()
         if not preds:
             stale_minutes = (
                 max((float(item.get("age_minutes", 0.0)) for item in self._stale_issues), default=0.0)
                 if self._stale_issues else 0.0
             )
+            live_fail_closed = combo_mode == "live" and bool(self._stale_issues)
             stale_result = {
                 "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "status": "stale_data" if self._stale_issues else "failed",
+                "status": "error" if live_fail_closed else ("stale_data" if self._stale_issues else "failed"),
                 "strategy_info": "AI-Optimized Multi-Model Ensemble with Execution Feedback Loop",
                 "policy_version": self.policy_version,
                 "stale_data": bool(self._stale_issues),
@@ -2356,9 +2359,15 @@ class EnsemblePredictor:
                 "stale_issues": self._stale_issues[:20],
                 "recommendations": [],
             }
+            if live_fail_closed:
+                stale_result["fail_closed"] = True
+                stale_result["error"] = "C3 live mode fail-closed: no valid fresh predictions"
             with open(output_path, 'w') as f:
                 json.dump(stale_result, f, indent=4)
-            logger.warning("No valid predictions generated; stale-data result persisted.")
+            if live_fail_closed:
+                logger.error("C3 live mode fail-closed: no valid fresh predictions")
+            else:
+                logger.warning("No valid predictions generated; stale-data result persisted.")
             print(json.dumps(stale_result, indent=2))
             return
 
@@ -2376,22 +2385,37 @@ class EnsemblePredictor:
                 f"score < 40 and volume_ratio_24h < 0.1, non-2d orders will downgrade to 2d"
             )
 
-        fusd_2d_pred = next(
+        stale_pairs_set = set(
+            (item['currency'], item['period']) for item in self._stale_issues
+        ) if self._stale_issues else set()
+
+        live_fusd_2d_pred = next(
             (p for p in valid_preds if p['currency'] == 'fUSD' and int(p['period']) == 2),
             None
         )
-        if fusd_2d_pred is None:
+        fusd_2d_pred = live_fusd_2d_pred
+        if fusd_2d_pred is None and combo_mode != "live":
             fusd_2d_pred = self._get_latest_prediction_snapshot('fUSD', 2)
             if fusd_2d_pred is not None:
                 logger.warning(
                     "Current fUSD-2d prediction unavailable, using latest prediction_history snapshot for fixed rank6."
                 )
 
+        if combo_mode == "live":
+            fail_closed_reasons = []
+            if live_fusd_2d_pred is None:
+                fail_closed_reasons.append("missing fresh fUSD-2d prediction")
+            if stale_pairs_set:
+                stale_pairs = ", ".join(
+                    f"{currency}-{period}d" for currency, period in sorted(stale_pairs_set)
+                )
+                fail_closed_reasons.append(f"stale pairs detected: {stale_pairs}")
+            if fail_closed_reasons:
+                raise ValueError(f"C3 live mode fail-closed: {'; '.join(fail_closed_reasons)}")
+
         raw_ranked_preds = self._apply_path_ranking(valid_preds, market_liquidity, fusd_2d_pred)
         update_cycle_id = datetime.now().strftime('%Y%m%d_%H%M%S')
         self._enrich_prediction_identity(raw_ranked_preds, update_cycle_id=update_cycle_id)
-        combo_policy = self.policy.get("combo_optimizer", {})
-        combo_mode = combo_policy.get("combo_mode", "shadow")
 
         sorted_preds = [
             p for p in raw_ranked_preds
@@ -2489,11 +2513,6 @@ class EnsemblePredictor:
                         f"\n⚠️  Liquidity gate active for {sorted(gated_currencies)}: "
                         "score<40 and volume_ratio_24h<0.1, non-2d orders downgraded to 2d."
                     )
-
-                # Fix7: 构建 stale pair 集合，虚拟单创建时跳过数据陈旧的 pair
-                stale_pairs_set = set(
-                    (i['currency'], i['period']) for i in self._stale_issues
-                ) if self._stale_issues else set()
 
                 # Stratified sampling configuration by period tiers - 均衡采样
                 # 目标是覆盖全期限，各层级数量均衡

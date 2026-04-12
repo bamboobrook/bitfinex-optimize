@@ -1423,7 +1423,8 @@ def main():
             print(f"\n结论: 暂不需要重训练")
     else:
         # 执行完整流程
-        scheduler.run(force=args.force)
+        ok = scheduler.run(force=args.force)
+        raise SystemExit(0 if ok else 1)
 
 
 if __name__ == '__main__':
