@@ -10,6 +10,7 @@ from loguru import logger
 import sys
 from pathlib import Path
 import sqlite3
+import tempfile
 from collections import defaultdict
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -29,6 +30,24 @@ STATUS_FILE = str(BASE_DIR / "data" / "service_status.json")
 DB_FILE = str(BASE_DIR / "data" / "lending_history.db")
 RETRAIN_STATE_FILE = str(BASE_DIR / "data" / "retraining_state.json")
 
+
+def _atomic_write_json(path: str, payload: dict, indent: int = 4):
+    target_dir = os.path.dirname(path) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-json-", suffix=".json", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
 # --- 辅助函数: 状态管理 ---
 def update_status(status: str, step: str = "", details: str = ""):
     """更新服务状态文件"""
@@ -38,8 +57,7 @@ def update_status(status: str, step: str = "", details: str = ""):
         "last_update": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "details": details
     }
-    with open(STATUS_FILE, 'w') as f:
-        json.dump(info, f, indent=4)
+    _atomic_write_json(STATUS_FILE, info, indent=4)
 
 def get_current_status():
     """读取当前状态"""
@@ -79,8 +97,7 @@ def save_retraining_state(last_forced_retrain_time: datetime = None, reason: str
         "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
     try:
-        with open(RETRAIN_STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
+        _atomic_write_json(RETRAIN_STATE_FILE, state, indent=2)
     except Exception as e:
         logger.warning(f"Failed to save retraining state: {e}")
 

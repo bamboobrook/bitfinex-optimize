@@ -68,7 +68,7 @@ class TrainingDataBuilder:
         conn = sqlite3.connect(self.db_path)
         table_cols = set(self._get_virtual_orders_columns())
 
-        selected_cols = [
+        base_cols = [
             'order_timestamp',
             'currency',
             'period',
@@ -78,6 +78,10 @@ class TrainingDataBuilder:
             'total_score',
             'market_median',
             'execution_rate',
+        ]
+        selected_cols = [
+            col if col in table_cols else f"NULL AS {col}"
+            for col in base_cols
         ]
         optional_cols = [
             'follow_error_at_order',
@@ -275,8 +279,6 @@ class TrainingDataBuilder:
 
         if 'decision_mode' in df.columns:
             df = df[df['decision_mode'] == 'exploit'].copy()
-        if 'data_quality_label' in df.columns:
-            df = df[df['data_quality_label'] == 'STRONG'].copy()
 
         # 标签1: 实际成交二元标签
         df['actual_execution_binary'] = (df['status'] == 'EXECUTED').astype(float)
@@ -337,6 +339,13 @@ class TrainingDataBuilder:
             fallback_stage1_success
         )
         df['path_wait_hours'] = df['realized_wait_hours']
+
+        strong_quality_mask = (
+            df['data_quality_label'] == 'STRONG'
+            if 'data_quality_label' in df.columns
+            else pd.Series(True, index=df.index)
+        )
+        df.loc[~strong_quality_mask, ['path_terminal_value', 'path_stage1_success', 'path_wait_hours']] = np.nan
 
         # 闭环诊断标签: 跟随误差、方向一致性、单步变化
         if 'follow_error_at_order' in df.columns:

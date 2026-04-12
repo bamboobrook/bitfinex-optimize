@@ -167,15 +167,20 @@ def test_generate_recommendations_uses_c3_combo_as_live_output_when_enabled():
         )
 
         live_combo = [
-            dict(ranked_preds[2], recommendation_rank=1, decision_mode="exploit", candidate_id="fUST-30-stretch-premium"),
-            dict(ranked_preds[0], recommendation_rank=2, decision_mode="exploit", candidate_id="fUSD-120-premium"),
-            dict(ranked_preds[3], recommendation_rank=3, decision_mode="exploit", candidate_id="fUSD-90-premium"),
-            dict(ranked_preds[1], recommendation_rank=4, decision_mode="exploit", candidate_id="fUSD-30-balanced-mid"),
-            dict(ranked_preds[4], recommendation_rank=5, decision_mode="exploit", candidate_id="fUSD-14-balanced-mid"),
+            dict(ranked_preds[2], recommendation_rank=1, decision_mode="exploit", candidate_id="fUST-30-stretch-premium", anchor_backed=True),
+            dict(ranked_preds[0], recommendation_rank=2, decision_mode="exploit", candidate_id="fUSD-120-premium", anchor_backed=True),
+            dict(ranked_preds[3], recommendation_rank=3, decision_mode="exploit", candidate_id="fUSD-90-premium", anchor_backed=True),
+            dict(ranked_preds[1], recommendation_rank=4, decision_mode="exploit", candidate_id="fUSD-30-balanced-mid", anchor_backed=True),
+            dict(ranked_preds[4], recommendation_rank=5, decision_mode="exploit", candidate_id="fUSD-14-balanced-mid", anchor_backed=True),
         ]
         predictor._build_shadow_combo = lambda sorted_preds, update_cycle_id, beam_width: (
             live_combo,
-            {"beam_width": beam_width, "combo_revenue_ev": 8.0, "combo_fill_quality": 0.6},
+            {
+                "beam_width": beam_width,
+                "combo_revenue_ev": 8.0,
+                "combo_fill_quality": 0.6,
+                "anchor_backed_pair_count": 5,
+            },
         )
 
         predictor.generate_recommendations(str(output_path))
@@ -276,7 +281,12 @@ def test_generate_recommendations_fail_closes_when_live_combo_is_incomplete():
                 dict(ranked_preds[3], recommendation_rank=3, decision_mode="exploit", candidate_id="fUSD-90-balanced-mid"),
                 dict(ranked_preds[1], recommendation_rank=4, decision_mode="exploit", candidate_id="fUSD-30-balanced-mid"),
             ],
-            {"beam_width": 12, "combo_revenue_ev": 7.0, "combo_fill_quality": 0.5},
+            {
+                "beam_width": 12,
+                "combo_revenue_ev": 7.0,
+                "combo_fill_quality": 0.5,
+                "anchor_backed_pair_count": 5,
+            },
         )
 
         predictor.generate_recommendations(str(output_path))
@@ -285,5 +295,240 @@ def test_generate_recommendations_fail_closes_when_live_combo_is_incomplete():
 
         assert result["status"] == "error"
         assert result["fail_closed"] is True
-        assert result["error"] == "C3 live mode fail-closed: incomplete combo"
+    assert result["error"] == "C3 live mode fail-closed: incomplete combo"
+    assert result["recommendations"] == []
+
+
+def test_generate_recommendations_fail_closes_when_live_combo_has_no_anchor_backed_pool():
+    with tempfile.TemporaryDirectory() as tmp:
+        output_path = Path(tmp) / "optimal_combination.json"
+
+        predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+        predictor.policy = {"combo_optimizer": {"combo_mode": "live", "beam_width": 12}}
+        predictor.policy_version = "test-policy"
+        predictor.db_path = str(Path(tmp) / "lending_history.db")
+        predictor.refresh_probe_state_path = str(Path(tmp) / "refresh_probe_state.json")
+        predictor.order_manager = None
+        predictor._funding_book_cache = {}
+        predictor._stale_issues = []
+        predictor._persist_prediction_history = lambda ranked_predictions: None
+        predictor._calc_market_liquidity = lambda preds: {
+            "fUSD": {"level": "medium", "score": 60.0, "volume_ratio_24h": 0.84},
+            "fUST": {"level": "medium", "score": 52.0, "volume_ratio_24h": 0.62},
+        }
+        ranked_preds = [
+            _make_prediction("fUSD", 120, 12.4, exec_prob=0.62),
+            _make_prediction("fUSD", 30, 9.2, exec_prob=0.58),
+            _make_prediction("fUST", 30, 11.4, exec_prob=0.64),
+            _make_prediction("fUSD", 90, 11.8, exec_prob=0.60),
+            _make_prediction("fUSD", 14, 8.8, exec_prob=0.56),
+            _make_prediction("fUSD", 2, 5.2, exec_prob=0.67),
+        ]
+        predictor.get_latest_predictions = lambda: ranked_preds
+        predictor._apply_path_ranking = lambda valid_preds, market_liquidity, fusd_2d_pred: sorted(
+            valid_preds,
+            key=lambda pred: pred["predicted_rate"],
+            reverse=True,
+        )
+        predictor._load_market_anchor_rows = lambda currency, period: []
+
+        predictor.generate_recommendations(str(output_path))
+
+        result = json.loads(output_path.read_text())
+
+        assert result["status"] == "error"
+        assert result["fail_closed"] is True
+    assert result["error"] == "C3 live mode fail-closed: insufficient anchor-backed candidate pool"
+    assert result["recommendations"] == []
+
+
+def test_generate_recommendations_fail_closes_when_live_combo_contains_suspended_pair():
+    with tempfile.TemporaryDirectory() as tmp:
+        output_path = Path(tmp) / "optimal_combination.json"
+
+        predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+        predictor.policy = {"combo_optimizer": {"combo_mode": "live", "beam_width": 12}}
+        predictor.policy_version = "test-policy"
+        predictor.db_path = str(Path(tmp) / "lending_history.db")
+        predictor.refresh_probe_state_path = str(Path(tmp) / "refresh_probe_state.json")
+        predictor.order_manager = None
+        predictor._funding_book_cache = {}
+        predictor._stale_issues = []
+        predictor._persist_prediction_history = lambda ranked_predictions: None
+        predictor._calc_market_liquidity = lambda preds: {
+            "fUSD": {"level": "medium", "score": 60.0, "volume_ratio_24h": 0.84},
+            "fUST": {"level": "medium", "score": 52.0, "volume_ratio_24h": 0.62},
+        }
+        ranked_preds = [
+            _make_prediction("fUSD", 120, 12.4, exec_prob=0.62),
+            _make_prediction("fUSD", 30, 9.2, exec_prob=0.58),
+            _make_prediction("fUST", 30, 11.4, exec_prob=0.64),
+            _make_prediction("fUSD", 90, 11.8, exec_prob=0.60),
+            _make_prediction("fUSD", 14, 8.8, exec_prob=0.56),
+            _make_prediction("fUSD", 2, 5.2, exec_prob=0.67),
+        ]
+        predictor.get_latest_predictions = lambda: ranked_preds
+        predictor._apply_path_ranking = lambda valid_preds, market_liquidity, fusd_2d_pred: sorted(
+            valid_preds,
+            key=lambda pred: pred["predicted_rate"],
+            reverse=True,
+        )
+        predictor._build_shadow_combo = lambda *args, **kwargs: (
+            [
+                dict(ranked_preds[2], recommendation_rank=1, decision_mode="exploit", candidate_id="fUST-30-stretch-premium", anchor_backed=True),
+                dict(ranked_preds[0], recommendation_rank=2, decision_mode="exploit", candidate_id="fUSD-120-premium", anchor_backed=True),
+                dict(ranked_preds[3], recommendation_rank=3, decision_mode="exploit", candidate_id="fUSD-90-premium", anchor_backed=True),
+                dict(ranked_preds[1], recommendation_rank=4, decision_mode="exploit", candidate_id="fUSD-30-balanced-mid", anchor_backed=True),
+                dict(ranked_preds[4], recommendation_rank=5, decision_mode="exploit", candidate_id="fUSD-14-balanced-mid", anchor_backed=True),
+            ],
+            {
+                "beam_width": 12,
+                "combo_revenue_ev": 8.0,
+                "combo_fill_quality": 0.6,
+                "anchor_backed_pair_count": 5,
+            },
+        )
+        predictor._is_zero_liquidity_suspended = lambda currency, period: (currency, period) == ("fUST", 30)
+
+        predictor.generate_recommendations(str(output_path))
+
+        result = json.loads(output_path.read_text())
+
+        assert result["status"] == "error"
+        assert result["fail_closed"] is True
+        assert result["error"] == "C3 live mode fail-closed: suspended live combo pairs: fUST-30d"
         assert result["recommendations"] == []
+
+
+def test_generate_recommendations_fail_closes_when_live_top5_contains_non_anchor_backed_item():
+    with tempfile.TemporaryDirectory() as tmp:
+        output_path = Path(tmp) / "optimal_combination.json"
+
+        predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+        predictor.policy = {"combo_optimizer": {"combo_mode": "live", "beam_width": 12}}
+        predictor.policy_version = "test-policy"
+        predictor.db_path = str(Path(tmp) / "lending_history.db")
+        predictor.refresh_probe_state_path = str(Path(tmp) / "refresh_probe_state.json")
+        predictor.order_manager = None
+        predictor._funding_book_cache = {}
+        predictor._stale_issues = []
+        predictor._persist_prediction_history = lambda ranked_predictions: None
+        predictor._calc_market_liquidity = lambda preds: {
+            "fUSD": {"level": "medium", "score": 60.0, "volume_ratio_24h": 0.84},
+            "fUST": {"level": "medium", "score": 52.0, "volume_ratio_24h": 0.62},
+        }
+        ranked_preds = [
+            _make_prediction("fUSD", 120, 12.4, exec_prob=0.62),
+            _make_prediction("fUSD", 30, 9.2, exec_prob=0.58),
+            _make_prediction("fUST", 30, 11.4, exec_prob=0.64),
+            _make_prediction("fUSD", 90, 11.8, exec_prob=0.60),
+            _make_prediction("fUSD", 14, 8.8, exec_prob=0.56),
+            _make_prediction("fUSD", 2, 5.2, exec_prob=0.67),
+        ]
+        predictor.get_latest_predictions = lambda: ranked_preds
+        predictor._apply_path_ranking = lambda valid_preds, market_liquidity, fusd_2d_pred: sorted(
+            valid_preds,
+            key=lambda pred: pred["predicted_rate"],
+            reverse=True,
+        )
+        predictor._build_shadow_combo = lambda *args, **kwargs: (
+            [
+                dict(ranked_preds[2], recommendation_rank=1, decision_mode="exploit", candidate_id="fUST-30-stretch-premium", anchor_backed=True),
+                dict(ranked_preds[0], recommendation_rank=2, decision_mode="exploit", candidate_id="fUSD-120-premium", anchor_backed=True),
+                dict(ranked_preds[3], recommendation_rank=3, decision_mode="exploit", candidate_id="fUSD-90-premium", anchor_backed=True),
+                dict(ranked_preds[1], recommendation_rank=4, decision_mode="exploit", candidate_id="fUSD-30-balanced-mid", anchor_backed=False),
+                dict(ranked_preds[4], recommendation_rank=5, decision_mode="exploit", candidate_id="fUSD-14-balanced-mid", anchor_backed=True),
+            ],
+            {
+                "beam_width": 12,
+                "combo_revenue_ev": 8.0,
+                "combo_fill_quality": 0.6,
+                "anchor_backed_pair_count": 5,
+            },
+        )
+
+        predictor.generate_recommendations(str(output_path))
+
+        result = json.loads(output_path.read_text())
+
+        assert result["status"] == "error"
+        assert result["fail_closed"] is True
+        assert result["error"] == "C3 live mode fail-closed: combo contains non-anchor-backed candidate"
+        assert result["recommendations"] == []
+
+
+def test_generate_recommendations_fail_closes_when_live_prediction_history_persist_fails():
+    class _OrderManagerStub:
+        def __init__(self):
+            self.created = 0
+
+        def get_order_count(self, currency, period):
+            return 0
+
+        def needs_refresh_probe(self, currency, period, lookback_hours, min_validations):
+            return False
+
+        def create_virtual_order(self, pred):
+            self.created += 1
+            return f"order-{self.created}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        output_path = Path(tmp) / "optimal_combination.json"
+        order_manager = _OrderManagerStub()
+
+        predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+        predictor.policy = {"combo_optimizer": {"combo_mode": "live", "beam_width": 12}}
+        predictor.policy_version = "test-policy"
+        predictor.db_path = str(Path(tmp) / "lending_history.db")
+        predictor.refresh_probe_state_path = str(Path(tmp) / "refresh_probe_state.json")
+        predictor.order_manager = order_manager
+        predictor._funding_book_cache = {}
+        predictor._stale_issues = []
+        predictor._persist_prediction_history = lambda ranked_predictions: (_ for _ in ()).throw(RuntimeError("history boom"))
+        predictor._calc_market_liquidity = lambda preds: {
+            "fUSD": {"level": "medium", "score": 60.0, "volume_ratio_24h": 0.84},
+            "fUST": {"level": "medium", "score": 52.0, "volume_ratio_24h": 0.62},
+        }
+        ranked_preds = [
+            _make_prediction("fUSD", 120, 12.4, exec_prob=0.62),
+            _make_prediction("fUSD", 30, 9.2, exec_prob=0.58),
+            _make_prediction("fUST", 30, 11.4, exec_prob=0.64),
+            _make_prediction("fUSD", 90, 11.8, exec_prob=0.60),
+            _make_prediction("fUSD", 14, 8.8, exec_prob=0.56),
+            _make_prediction("fUSD", 2, 5.2, exec_prob=0.67),
+        ]
+        predictor.get_latest_predictions = lambda: ranked_preds
+        predictor._apply_path_ranking = lambda valid_preds, market_liquidity, fusd_2d_pred: sorted(
+            valid_preds,
+            key=lambda pred: pred["predicted_rate"],
+            reverse=True,
+        )
+        predictor._build_shadow_combo = lambda *args, **kwargs: (
+            [
+                dict(ranked_preds[2], recommendation_rank=1, decision_mode="exploit", candidate_id="fUST-30-stretch-premium", anchor_backed=True),
+                dict(ranked_preds[0], recommendation_rank=2, decision_mode="exploit", candidate_id="fUSD-120-premium", anchor_backed=True),
+                dict(ranked_preds[3], recommendation_rank=3, decision_mode="exploit", candidate_id="fUSD-90-premium", anchor_backed=True),
+                dict(ranked_preds[1], recommendation_rank=4, decision_mode="exploit", candidate_id="fUSD-30-balanced-mid", anchor_backed=True),
+                dict(ranked_preds[4], recommendation_rank=5, decision_mode="exploit", candidate_id="fUSD-14-balanced-mid", anchor_backed=True),
+            ],
+            {
+                "beam_width": 12,
+                "combo_revenue_ev": 8.0,
+                "combo_fill_quality": 0.6,
+                "anchor_backed_pair_count": 5,
+            },
+        )
+        predictor._is_zero_liquidity_suspended = lambda currency, period: False
+        predictor._load_refresh_probe_state = lambda: {}
+        predictor._save_refresh_probe_state = lambda state: None
+        predictor._policy_value = lambda section, key, default=None: default
+
+        predictor.generate_recommendations(str(output_path))
+
+        result = json.loads(output_path.read_text())
+
+        assert result["status"] == "error"
+        assert result["fail_closed"] is True
+        assert result["error"] == "C3 live mode fail-closed: prediction_history persist failed"
+        assert result["recommendations"] == []
+        assert order_manager.created == 0

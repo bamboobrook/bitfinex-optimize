@@ -1,5 +1,6 @@
 import sys
 import json
+import sqlite3
 import tempfile
 from pathlib import Path
 import pytest
@@ -78,7 +79,7 @@ def test_choose_combo_beam_rejects_non_positive_beam_width():
         choose_combo_beam([], {}, 0)
 
 
-def test_generate_recommendations_in_shadow_mode_emits_shadow_combo_without_replacing_main_output():
+def test_generate_recommendations_in_shadow_mode_keeps_result_schema_without_shadow_fields():
     with tempfile.TemporaryDirectory() as tmp:
         output_path = Path(tmp) / "optimal_combination.json"
 
@@ -127,11 +128,8 @@ def test_generate_recommendations_in_shadow_mode_emits_shadow_combo_without_repl
 
         assert result["recommendations"][0]["currency"] == "fUSD"
         assert result["recommendations"][0]["period"] == 120
-        assert "shadow_combo" in result
-        assert len(result["shadow_combo"]) == 5
-        assert [item["recommendation_rank"] for item in result["shadow_combo"]] == [1, 2, 3, 4, 5]
-        assert set(item["decision_mode"] for item in result["shadow_combo"]) == {"exploit"}
-        assert all(item["candidate_id"] for item in result["shadow_combo"])
+        assert "shadow_combo" not in result
+        assert "shadow_combo_metrics" not in result
 
 
 def test_generate_recommendations_ignores_invalid_shadow_beam_width_and_keeps_main_output():
@@ -181,3 +179,91 @@ def test_generate_recommendations_ignores_shadow_builder_failure_and_keeps_main_
         assert result["recommendations"][0]["currency"] == "fUSD"
         assert result["recommendations"][0]["period"] == 120
         assert "shadow_combo" not in result
+
+
+def test_build_shadow_combo_uses_anchor_candidates_with_real_bands():
+    with tempfile.TemporaryDirectory() as tmp:
+        predictor = _make_shadow_predictor(tmp, 12)
+
+        with sqlite3.connect(predictor.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE funding_rates (
+                    currency TEXT,
+                    period INTEGER,
+                    close_annual REAL,
+                    datetime TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO funding_rates(currency, period, close_annual, datetime)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    ("fUSD", 120, 10.0, "2026-04-13 00:00:00"),
+                    ("fUSD", 120, 12.0, "2026-04-13 01:00:00"),
+                    ("fUSD", 120, 14.0, "2026-04-13 02:00:00"),
+                    ("fUST", 30, 8.0, "2026-04-13 00:00:00"),
+                    ("fUST", 30, 9.0, "2026-04-13 01:00:00"),
+                    ("fUST", 30, 10.0, "2026-04-13 02:00:00"),
+                    ("fUSD", 90, 9.5, "2026-04-13 00:00:00"),
+                    ("fUSD", 90, 10.5, "2026-04-13 01:00:00"),
+                    ("fUSD", 90, 11.5, "2026-04-13 02:00:00"),
+                    ("fUSD", 14, 6.0, "2026-04-13 00:00:00"),
+                    ("fUSD", 14, 7.0, "2026-04-13 01:00:00"),
+                    ("fUSD", 14, 8.0, "2026-04-13 02:00:00"),
+                    ("fUST", 14, 5.5, "2026-04-13 00:00:00"),
+                    ("fUST", 14, 6.2, "2026-04-13 01:00:00"),
+                    ("fUST", 14, 6.9, "2026-04-13 02:00:00"),
+                ],
+            )
+            conn.execute(
+                """
+                CREATE TABLE virtual_orders (
+                    currency TEXT,
+                    period INTEGER,
+                    status TEXT,
+                    execution_rate REAL,
+                    executed_at TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO virtual_orders(currency, period, status, execution_rate, executed_at)
+                VALUES (?, ?, 'EXECUTED', ?, ?)
+                """,
+                [
+                    ("fUSD", 120, 11.5, "2026-04-13 03:00:00"),
+                    ("fUST", 30, 9.6, "2026-04-13 03:00:00"),
+                    ("fUSD", 90, 11.0, "2026-04-13 03:00:00"),
+                    ("fUSD", 14, 7.5, "2026-04-13 03:00:00"),
+                    ("fUST", 14, 6.7, "2026-04-13 03:00:00"),
+                ],
+            )
+            conn.commit()
+
+        ranked_predictions = [
+            _make_prediction("fUSD", 120, 12.4, exec_prob=0.62),
+            _make_prediction("fUST", 30, 9.4, exec_prob=0.64),
+            _make_prediction("fUSD", 90, 11.1, exec_prob=0.60),
+            _make_prediction("fUSD", 14, 7.2, exec_prob=0.56),
+            _make_prediction("fUST", 14, 6.4, exec_prob=0.58),
+            _make_prediction("fUSD", 2, 5.2, exec_prob=0.67),
+        ]
+        for pred in ranked_predictions:
+            pred["path_value_score"] = pred["predicted_rate"]
+            pred["final_rank_score"] = pred["predicted_rate"]
+            pred["weighted_score"] = pred["predicted_rate"]
+            pred["stage1_fill_probability"] = pred["execution_probability"]
+            pred["fast_liquidity_score"] = pred["execution_probability"]
+
+        combo, metrics = predictor._build_shadow_combo(ranked_predictions, "cycle-anchor", 12)
+
+        assert len(combo) == 5
+        assert metrics["beam_width"] == 12
+        assert any(item["candidate_band"] != "balanced_mid" for item in combo)
+        assert any(item["candidate_band"] in {"premium", "stretch_premium"} for item in combo)
+        assert any("-premium" in item["candidate_id"] for item in combo)

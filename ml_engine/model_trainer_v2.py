@@ -471,6 +471,15 @@ class EnhancedModelTrainer:
         X = valid_df[feature_cols]
         y = valid_df[target_name]
 
+        if task_type == 'classification':
+            unique_classes = pd.Series(y).dropna().unique()
+            if len(unique_classes) < 2:
+                print(
+                    f"⚠️  分类目标 '{target_name}' 仅包含单类 "
+                    f"{sorted(unique_classes.tolist())}, 跳过训练以避免 AUC/权重为 NaN"
+                )
+                return None
+
         # 时间序列划分 (90/10)
         split_idx = int(len(valid_df) * 0.9)
         X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
@@ -481,6 +490,22 @@ class EnhancedModelTrainer:
         w_val = sample_weights[split_idx:] if sample_weights is not None else None
 
         print(f"训练集: {len(X_train):,}, 验证集: {len(X_val):,}")
+
+        if task_type == 'classification':
+            train_classes = pd.Series(y_train).dropna().unique()
+            val_classes = pd.Series(y_val).dropna().unique()
+            if len(train_classes) < 2:
+                print(
+                    f"⚠️  分类目标 '{target_name}' 时间切分后训练集仅包含单类 "
+                    f"{sorted(train_classes.tolist())}, 跳过训练以避免 AUC/权重为 NaN"
+                )
+                return None
+            if len(val_classes) < 2:
+                print(
+                    f"⚠️  分类目标 '{target_name}' 时间切分后验证集仅包含单类 "
+                    f"{sorted(val_classes.tolist())}, 跳过训练以避免 AUC/权重为 NaN"
+                )
+                return None
 
         models = {}
         scores = {}
@@ -650,7 +675,7 @@ class EnhancedModelTrainer:
                 'path_terminal_value' in curr_df.columns or 'revenue_reward' in curr_df.columns
             ):
                 if 'path_terminal_value' in curr_df.columns:
-                    curr_df['revenue_optimized_target'] = curr_df['path_terminal_value'].fillna(0.0)
+                    curr_df['revenue_optimized_target'] = curr_df['path_terminal_value']
                 else:
                     # 兼容旧训练链路: 没有路径标签时继续沿用原收益代理
                     curr_df['revenue_optimized_target'] = curr_df['close_annual'] * curr_df['revenue_reward']

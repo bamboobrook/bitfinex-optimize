@@ -4,6 +4,9 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -160,6 +163,45 @@ class PredictorRank6FallbackTest(unittest.TestCase):
         self.assertEqual(recommendations[-1]["currency"], "fUSD")
         self.assertEqual(recommendations[-1]["period"], 2)
         self.assertAlmostEqual(recommendations[-1]["rate"], 5.1416, places=4)
+
+    def test_generate_recommendations_writes_strict_json_for_numpy_scalars(self):
+        self.predictor._calc_market_liquidity = lambda preds: {
+            "fUSD": {
+                "level": "medium",
+                "score": np.float64(56.6),
+                "avg_exec_rate": np.float64(0.41),
+                "volume_ratio_24h": np.float64(np.nan),
+                "book_live": np.bool_(True),
+            },
+            "fUST": {
+                "level": "low",
+                "score": np.float64(36.0),
+                "avg_exec_rate": np.float64(0.37),
+                "volume_ratio_24h": np.float64(0.14),
+                "book_live": np.bool_(False),
+            },
+        }
+
+        self.predictor.generate_recommendations(str(self.output_path))
+
+        raw = self.output_path.read_text()
+        result = json.loads(raw)
+
+        self.assertNotIn("NaN", raw)
+        self.assertIs(result["market_liquidity"]["fUSD"]["book_live"], True)
+        self.assertIsNone(result["market_liquidity"]["fUSD"]["volume_ratio_24h"])
+
+    def test_generate_recommendations_keeps_previous_json_when_replace_fails(self):
+        self.output_path.write_text(json.dumps({"status": "old", "recommendations": []}))
+
+        with patch("ml_engine.predictor.os.replace", side_effect=OSError("replace blocked")):
+            with self.assertRaises(OSError):
+                self.predictor.generate_recommendations(str(self.output_path))
+
+        self.assertEqual(
+            json.loads(self.output_path.read_text()),
+            {"status": "old", "recommendations": []},
+        )
 
 
 if __name__ == "__main__":

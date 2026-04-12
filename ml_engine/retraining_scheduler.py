@@ -230,6 +230,10 @@ class RetrainingScheduler:
         市场崩塌后 Blend Zone 和 exec_rate 滞后时的补充保险触发器。
         若 >= 50% 的活跃组合 avg(predicted_rate)/avg(market_median) > 2.0，返回 True。
         """
+        columns = set(self._virtual_orders_columns())
+        if "market_median" not in columns:
+            return False
+
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         try:
@@ -586,6 +590,17 @@ class RetrainingScheduler:
 
         since_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
+        if "market_median" not in columns:
+            conn.close()
+            return {
+                "samples": 0,
+                "follow_mae": 0.0,
+                "follow_mae_ratio": 0.0,
+                "direction_match_rate": 0.0,
+                "p120_samples": 0,
+                "p120_step_p95": 0.0,
+            }
+
         try:
             select_cols = ["predicted_rate", "market_median", "period"]
             if "direction_match" in columns:
@@ -785,12 +800,28 @@ class RetrainingScheduler:
             ]
 
             enhanced_count = 0
+            missing_enhanced_models = []
             for model_prefix in enhanced_models:
-                meta_file = os.path.join(new_model_dir, f"{model_prefix}_meta.json")
-                if os.path.exists(meta_file):
+                old_meta_file = os.path.join(old_model_dir, f"{model_prefix}_meta.json")
+                new_meta_file = os.path.join(new_model_dir, f"{model_prefix}_meta.json")
+
+                if os.path.exists(new_meta_file):
                     enhanced_count += 1
 
+                if os.path.exists(old_meta_file) and not os.path.exists(new_meta_file):
+                    missing_enhanced_models.append(model_prefix)
+
             print(f"  增强模型: {enhanced_count}/{len(enhanced_models)}")
+
+            if missing_enhanced_models:
+                print(f"  ❌ 新模型缺少生产中的增强模型: {', '.join(missing_enhanced_models)}")
+                comparison['checks']['enhanced_models'] = False
+                comparison['checks']['enhanced_model_retention'] = False
+                comparison['missing_enhanced_models'] = missing_enhanced_models
+                comparison['is_better'] = False
+                return False, comparison
+
+            comparison['checks']['enhanced_model_retention'] = True
 
             if enhanced_count > 0:
                 comparison['checks']['enhanced_models'] = True

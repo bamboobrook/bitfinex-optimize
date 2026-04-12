@@ -5,6 +5,7 @@ from catboost import CatBoostRegressor, CatBoostClassifier
 import json
 import os
 import sys
+import tempfile
 from loguru import logger
 from datetime import datetime, timedelta
 import numpy as np
@@ -20,7 +21,12 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # 添加父目录到 path 以便导入
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from ml_engine.data_processor import DataProcessor
-from ml_engine.c3_combo_optimizer import RateCandidate, choose_combo_beam
+from ml_engine.c3_combo_optimizer import (
+    RateCandidate,
+    build_anchor_snapshot,
+    choose_combo_beam,
+    generate_rate_candidates,
+)
 from ml_engine.execution_features import get_period_window_profile
 from ml_engine.system_policy import load_system_policy, get_step_cap_pct, get_policy_version
 
@@ -530,10 +536,53 @@ class EnsemblePredictor:
     def _save_refresh_probe_state(self, state: dict):
         try:
             state["updated_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            with open(self.refresh_probe_state_path, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
+            self._atomic_write_json(self.refresh_probe_state_path, state, indent=2)
         except Exception as e:
             logger.warning(f"Failed to save refresh probe state: {e}")
+
+    def _json_safe_value(self, value):
+        if isinstance(value, np.generic):
+            return self._json_safe_value(value.item())
+        if isinstance(value, dict):
+            return {str(key): self._json_safe_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._json_safe_value(item) for item in value]
+        if isinstance(value, datetime):
+            return value.strftime('%Y-%m-%d %H:%M:%S')
+        if isinstance(value, float):
+            if not np.isfinite(value):
+                return None
+            return value
+        if value is None or isinstance(value, (str, int, bool)):
+            return value
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:
+                pass
+        return str(value)
+
+    def _atomic_write_json(self, path: str, payload: dict, indent: int = 4):
+        safe_payload = self._json_safe_value(payload)
+        target_dir = os.path.dirname(path) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp-json-", suffix=".json", dir=target_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(safe_payload, f, indent=indent, allow_nan=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _emit_json_result(self, output_path: str, payload: dict, indent: int = 4):
+        self._atomic_write_json(output_path, payload, indent=indent)
+        print(json.dumps(self._json_safe_value(payload), indent=2, allow_nan=False))
 
     @staticmethod
     def _get_period_tier(period: int) -> str:
@@ -2106,10 +2155,84 @@ class EnsemblePredictor:
         candidate_band = str(pred.get("candidate_band") or "balanced_mid").replace("_", "-")
         return f"{pred['currency']}-{int(pred['period'])}-{candidate_band}"
 
+    def _load_market_anchor_rows(self, currency: str, period: int) -> list[dict]:
+        import sqlite3
+
+        market_rows = []
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                close_rows = conn.execute(
+                    """
+                    SELECT close_annual
+                    FROM funding_rates
+                    WHERE currency = ?
+                      AND period = ?
+                      AND close_annual IS NOT NULL
+                      AND close_annual > 0
+                    ORDER BY rowid DESC
+                    LIMIT 12
+                    """,
+                    (currency, period),
+                ).fetchall()
+                executed_rows = conn.execute(
+                    """
+                    SELECT execution_rate
+                    FROM virtual_orders
+                    WHERE currency = ?
+                      AND period = ?
+                      AND status = 'EXECUTED'
+                      AND execution_rate IS NOT NULL
+                    ORDER BY rowid DESC
+                    LIMIT 12
+                    """,
+                    (currency, period),
+                ).fetchall()
+        except Exception:
+            return []
+
+        for row in close_rows:
+            market_rows.append({"close": float(row[0]), "executed": None})
+        for row in executed_rows:
+            market_rows.append({"close": None, "executed": float(row[0])})
+        return market_rows
+
+    def _score_shadow_candidate(self, base_pred: dict, candidate: RateCandidate, market_liquidity: dict, rank6_rate: float):
+        candidate_pred = dict(base_pred)
+        candidate_pred["predicted_rate"] = float(candidate.rate)
+        candidate_pred["candidate_band"] = str(candidate.band)
+        candidate_pred["candidate_id"] = self._build_shadow_candidate_id(candidate_pred)
+        candidate_pred["market_follow_error"] = float(
+            candidate_pred["predicted_rate"] - float(candidate_pred.get("current_rate", 0.0) or 0.0)
+        )
+        candidate_pred["frr_proxy_rate"] = self._estimate_frr_proxy_rate(
+            candidate_pred.get("currency", ""),
+            float(candidate_pred.get("current_rate", 0.0) or 0.0),
+        )
+        candidate_pred["fast_liquidity_score"] = self._calculate_fast_liquidity_score(candidate_pred, market_liquidity)
+        candidate_pred["path_value_score"] = self._calculate_path_value_score(candidate_pred, rank6_rate)
+        path_meta = candidate_pred.get("_path_meta", {})
+        liquidity_meta = candidate_pred.get("_liquidity_meta", {})
+        candidate_pred["currency_regime_multiplier"] = self._calculate_currency_regime_multiplier(
+            candidate_pred, path_meta, liquidity_meta
+        )
+        candidate_pred["safety_multiplier"] = self._calculate_safety_multiplier(candidate_pred, path_meta)
+        candidate_pred["liquidity_multiplier"] = float(0.68 + 0.32 * candidate_pred["fast_liquidity_score"])
+        candidate_pred["final_rank_score"] = float(
+            candidate_pred["path_value_score"] *
+            candidate_pred["currency_regime_multiplier"] *
+            candidate_pred["safety_multiplier"] *
+            candidate_pred["liquidity_multiplier"]
+        )
+        candidate_pred["weighted_score"] = float(candidate_pred["final_rank_score"])
+        return candidate_pred
+
     def _build_shadow_combo(self, ranked_predictions: list, update_cycle_id: str, beam_width: int):
         candidates = []
         scored_candidates = {}
         candidate_lookup = {}
+        market_liquidity = self._calc_market_liquidity(ranked_predictions)
+        rank6_rate = self._estimate_rank6_reference_rate(ranked_predictions)
+        anchor_backed_pairs = set()
 
         for pred in ranked_predictions:
             currency = str(pred.get("currency", ""))
@@ -2117,29 +2240,63 @@ class EnsemblePredictor:
             if currency == "fUSD" and period == 2:
                 continue
 
-            rate = float(pred.get("predicted_rate", 0.0) or 0.0)
-            candidate_band = str(pred.get("candidate_band") or "balanced_mid")
-            candidate = RateCandidate(
-                currency=currency,
-                period=period,
-                rate=rate,
-                band=candidate_band,
-                distance_from_mid=float(rate - float(pred.get("current_rate", 0.0) or 0.0)),
-            )
-            key = (candidate.currency, candidate.period, candidate.rate)
-            candidates.append(candidate)
-            candidate_lookup[key] = pred
-            scored_candidates[key] = {
-                "candidate_path_ev": float(
-                    pred.get("path_value_score", pred.get("final_rank_score", pred.get("weighted_score", 0.0))) or 0.0
-                ),
-                "fill_quality": float(
-                    pred.get(
-                        "stage1_fill_probability",
-                        pred.get("fast_liquidity_score", pred.get("execution_probability", 0.0))
-                    ) or 0.0
-                ),
-            }
+            market_rows = self._load_market_anchor_rows(currency, period)
+            pair_candidates = []
+            pair_anchor_backed = False
+            if market_rows:
+                try:
+                    anchor = build_anchor_snapshot(currency=currency, period=period, market_rows=market_rows)
+                    pair_candidates = generate_rate_candidates(
+                        currency=currency,
+                        period=period,
+                        anchor=anchor,
+                        hard_cap_pct=float(get_step_cap_pct(self.policy, period) or 0.05),
+                        max_candidates=5,
+                    )
+                    if pair_candidates:
+                        pair_anchor_backed = True
+                        anchor_backed_pairs.add((currency, period))
+                except Exception as e:
+                    logger.warning(f"Anchor candidate generation failed for {currency}-{period}: {e}")
+
+            if not pair_candidates:
+                rate = float(pred.get("predicted_rate", 0.0) or 0.0)
+                candidate_band = str(pred.get("candidate_band") or "balanced_mid")
+                pair_candidates = [
+                    RateCandidate(
+                        currency=currency,
+                        period=period,
+                        rate=rate,
+                        band=candidate_band,
+                        distance_from_mid=float(rate - float(pred.get("current_rate", 0.0) or 0.0)),
+                    )
+                ]
+
+            seen_keys = set()
+            for candidate in pair_candidates:
+                key = (candidate.currency, candidate.period, float(candidate.rate))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                candidate_pred = self._score_shadow_candidate(pred, candidate, market_liquidity, rank6_rate)
+                candidate_pred["anchor_backed"] = pair_anchor_backed
+                candidates.append(candidate)
+                candidate_lookup[key] = candidate_pred
+                scored_candidates[key] = {
+                    "candidate_path_ev": float(
+                        candidate_pred.get(
+                            "final_rank_score",
+                            candidate_pred.get("path_value_score", candidate_pred.get("weighted_score", 0.0))
+                        ) or 0.0
+                    ),
+                    "fill_quality": float(
+                        candidate_pred.get(
+                            "stage1_fill_probability",
+                            candidate_pred.get("fast_liquidity_score", candidate_pred.get("execution_probability", 0.0))
+                        ) or 0.0
+                    ),
+                    "anchor_backed": pair_anchor_backed,
+                }
 
         if not candidates:
             return [], {}
@@ -2161,6 +2318,7 @@ class EnsemblePredictor:
             shadow_pred["candidate_band"] = shadow_pred.get("candidate_band") or candidate.band
             shadow_pred["candidate_id"] = self._build_shadow_candidate_id(shadow_pred)
             shadow_pred["decision_mode"] = "exploit"
+            shadow_pred["anchor_backed"] = bool(metrics.get("anchor_backed"))
             shadow_combo.append(shadow_pred)
 
             combo_revenue_ev += shadow_pred["rank_weight"] * metrics["candidate_path_ev"]
@@ -2170,6 +2328,7 @@ class EnsemblePredictor:
             "beam_width": int(beam_width),
             "combo_revenue_ev": float(combo_revenue_ev),
             "combo_fill_quality": float(combo_fill_quality),
+            "anchor_backed_pair_count": len(anchor_backed_pairs),
         }
 
     def _enrich_prediction_identity(self, ranked_predictions: list, update_cycle_id: Optional[str] = None):
@@ -2178,16 +2337,94 @@ class EnsemblePredictor:
         for rank, pred in enumerate(ranked_predictions, start=1):
             if not pred.get("update_cycle_id"):
                 pred["update_cycle_id"] = cycle_id
-            if pred.get("recommendation_rank") is None:
+            if pred.get("decision_mode") == "probe":
+                if pred.get("rank_weight") is None:
+                    pred["rank_weight"] = 0.0
+            elif pred.get("recommendation_rank") is None:
                 pred["recommendation_rank"] = rank
-            if pred.get("rank_weight") is None:
+            if pred.get("decision_mode") != "probe" and pred.get("rank_weight") is None:
                 pred["rank_weight"] = self._default_rank_weight(int(pred["recommendation_rank"]))
             if not pred.get("candidate_id"):
-                pred["candidate_id"] = self._build_candidate_id(pred)
+                if pred.get("candidate_band"):
+                    pred["candidate_id"] = self._build_shadow_candidate_id(pred)
+                else:
+                    pred["candidate_id"] = self._build_candidate_id(pred)
             if not pred.get("decision_mode"):
                 pred["decision_mode"] = "exploit"
 
         return ranked_predictions
+
+    def _build_live_execution_predictions(
+        self,
+        sorted_preds: list,
+        combo_top5: list,
+        fusd_2d_pred: Optional[dict],
+        update_cycle_id: str,
+    ) -> list:
+        execution_preds = []
+        seen_pairs = set()
+
+        for rank, pred in enumerate(combo_top5[:5], start=1):
+            exploit_pred = dict(pred)
+            exploit_pred["update_cycle_id"] = update_cycle_id
+            exploit_pred["recommendation_rank"] = rank
+            exploit_pred["rank_weight"] = self._default_rank_weight(rank)
+            exploit_pred["decision_mode"] = "exploit"
+            execution_preds.append(exploit_pred)
+            seen_pairs.add((exploit_pred["currency"], int(exploit_pred["period"])))
+
+        probe_sources = []
+        if fusd_2d_pred is not None:
+            probe_sources.append(fusd_2d_pred)
+        for pred in sorted_preds:
+            probe_sources.append(pred)
+
+        for pred in probe_sources:
+            pair = (pred["currency"], int(pred["period"]))
+            if pair in seen_pairs:
+                continue
+            probe_pred = dict(pred)
+            probe_pred["update_cycle_id"] = update_cycle_id
+            probe_pred["recommendation_rank"] = None
+            probe_pred["rank_weight"] = 0.0
+            probe_pred["decision_mode"] = "probe"
+            execution_preds.append(probe_pred)
+            seen_pairs.add(pair)
+
+        return self._enrich_prediction_identity(execution_preds, update_cycle_id=update_cycle_id)
+
+    def _cleanup_live_cycle_state(self, update_cycle_id: str):
+        import sqlite3
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "DELETE FROM prediction_history WHERE update_cycle_id = ?",
+                    (update_cycle_id,),
+                )
+                conn.execute(
+                    "DELETE FROM virtual_orders WHERE update_cycle_id = ?",
+                    (update_cycle_id,),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to cleanup live cycle state for {update_cycle_id}: {e}")
+
+    def _write_live_fail_closed_result(
+        self,
+        output_path: str,
+        result: dict,
+        error_message: str,
+        update_cycle_id: Optional[str] = None,
+    ):
+        result["status"] = "error"
+        result["fail_closed"] = True
+        result["error"] = error_message
+        result["recommendations"] = []
+        if update_cycle_id:
+            self._cleanup_live_cycle_state(update_cycle_id)
+        self._emit_json_result(output_path, result, indent=4)
+        logger.error(error_message)
 
     def _persist_prediction_history(self, ranked_predictions: list):
         if not ranked_predictions:
@@ -2362,13 +2599,11 @@ class EnsemblePredictor:
             if live_fail_closed:
                 stale_result["fail_closed"] = True
                 stale_result["error"] = "C3 live mode fail-closed: no valid fresh predictions"
-            with open(output_path, 'w') as f:
-                json.dump(stale_result, f, indent=4)
+            self._emit_json_result(output_path, stale_result, indent=4)
             if live_fail_closed:
                 logger.error("C3 live mode fail-closed: no valid fresh predictions")
             else:
                 logger.warning("No valid predictions generated; stale-data result persisted.")
-            print(json.dumps(stale_result, indent=2))
             return
 
         valid_preds = [p for p in preds if p['predicted_rate'] > 1.0]
@@ -2411,7 +2646,26 @@ class EnsemblePredictor:
                 )
                 fail_closed_reasons.append(f"stale pairs detected: {stale_pairs}")
             if fail_closed_reasons:
-                raise ValueError(f"C3 live mode fail-closed: {'; '.join(fail_closed_reasons)}")
+                fail_result = {
+                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "status": "error",
+                    "strategy_info": "AI-Optimized Multi-Model Ensemble with Execution Feedback Loop",
+                    "policy_version": self.policy_version,
+                    "stale_data": bool(self._stale_issues),
+                    "stale_minutes": int(
+                        round(max((float(item.get("age_minutes", 0.0)) for item in self._stale_issues), default=0.0))
+                    ) if self._stale_issues else 0,
+                    "stale_reason": "partial_stale_data_skipped" if self._stale_issues else "",
+                    "stale_issues": self._stale_issues[:20] if self._stale_issues else [],
+                    "market_liquidity": market_liquidity,
+                    "recommendations": [],
+                }
+                self._write_live_fail_closed_result(
+                    output_path,
+                    fail_result,
+                    f"C3 live mode fail-closed: {'; '.join(fail_closed_reasons)}",
+                )
+                return
 
         raw_ranked_preds = self._apply_path_ranking(valid_preds, market_liquidity, fusd_2d_pred)
         update_cycle_id = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -2447,6 +2701,8 @@ class EnsemblePredictor:
 
         combo_top5 = None
         combo_build_failed = False
+        history_preds = raw_ranked_preds
+        order_source_preds = sorted_preds
         if combo_mode in {"shadow", "live"}:
             try:
                 raw_beam_width = combo_policy.get("beam_width", 24)
@@ -2460,20 +2716,38 @@ class EnsemblePredictor:
             else:
                 if shadow_combo:
                     if combo_mode == "shadow":
-                        result["shadow_combo"] = shadow_combo
-                        result["shadow_combo_metrics"] = shadow_metrics
+                        logger.info(
+                            "Shadow combo diagnostics generated internally: "
+                            f"beam_width={shadow_metrics.get('beam_width')} "
+                            f"combo_revenue_ev={shadow_metrics.get('combo_revenue_ev'):.4f} "
+                            f"combo_fill_quality={shadow_metrics.get('combo_fill_quality'):.4f}"
+                        )
                     else:
+                        if int(shadow_metrics.get("anchor_backed_pair_count", 0) or 0) < 5:
+                            result["status"] = "error"
+                            result["fail_closed"] = True
+                            result["error"] = "C3 live mode fail-closed: insufficient anchor-backed candidate pool"
+                            result["recommendations"] = []
+                            self._emit_json_result(output_path, result, indent=4)
+                            logger.error("C3 live mode fail-closed: insufficient anchor-backed candidate pool")
+                            return
                         if len(shadow_combo) >= 5:
                             combo_top5 = shadow_combo[:5]
+                            if any(not bool(item.get("anchor_backed")) for item in combo_top5):
+                                result["status"] = "error"
+                                result["fail_closed"] = True
+                                result["error"] = "C3 live mode fail-closed: combo contains non-anchor-backed candidate"
+                                result["recommendations"] = []
+                                self._emit_json_result(output_path, result, indent=4)
+                                logger.error("C3 live mode fail-closed: combo contains non-anchor-backed candidate")
+                                return
                         else:
                             result["status"] = "error"
                             result["fail_closed"] = True
                             result["error"] = "C3 live mode fail-closed: incomplete combo"
                             result["recommendations"] = []
-                            with open(output_path, 'w') as f:
-                                json.dump(result, f, indent=4)
+                            self._emit_json_result(output_path, result, indent=4)
                             logger.error("C3 live mode fail-closed: incomplete combo")
-                            print(json.dumps(result, indent=2))
                             return
                 elif combo_mode == "live":
                     combo_build_failed = True
@@ -2483,10 +2757,8 @@ class EnsemblePredictor:
             result["fail_closed"] = True
             result["error"] = "C3 live mode fail-closed: combo build failed"
             result["recommendations"] = []
-            with open(output_path, 'w') as f:
-                json.dump(result, f, indent=4)
+            self._emit_json_result(output_path, result, indent=4)
             logger.error("C3 live mode fail-closed: combo build failed")
-            print(json.dumps(result, indent=2))
             return
 
         # rank 1-5: top 5 from sorted_preds excluding fUSD-2d
@@ -2499,6 +2771,26 @@ class EnsemblePredictor:
             top5 = top5_candidates[:5]
         else:
             top5 = combo_top5
+            history_preds = self._build_live_execution_predictions(
+                sorted_preds=sorted_preds,
+                combo_top5=combo_top5,
+                fusd_2d_pred=fusd_2d_pred,
+                update_cycle_id=update_cycle_id,
+            )
+            order_source_preds = history_preds
+            suspended_live_pairs = [
+                f"{pred['currency']}-{int(pred['period'])}d"
+                for pred in combo_top5
+                if self._is_zero_liquidity_suspended(pred['currency'], int(pred['period']))
+            ]
+            if suspended_live_pairs:
+                self._write_live_fail_closed_result(
+                    output_path,
+                    result,
+                    "C3 live mode fail-closed: suspended live combo pairs: "
+                    + ", ".join(suspended_live_pairs),
+                )
+                return
         recommendations_to_add = top5 + ([fusd_2d_pred] if fusd_2d_pred else [])
 
         # Build the recommendations list
@@ -2524,15 +2816,23 @@ class EnsemblePredictor:
             })
 
         try:
-            self._persist_prediction_history(raw_ranked_preds)
+            self._persist_prediction_history(history_preds)
         except Exception as e:
+            if combo_mode == "live":
+                self._write_live_fail_closed_result(
+                    output_path,
+                    result,
+                    "C3 live mode fail-closed: prediction_history persist failed",
+                    update_cycle_id=update_cycle_id,
+                )
+                logger.error(f"prediction_history persist error: {e}")
+                return
             logger.warning(f"Failed to persist prediction_history snapshot: {e}")
 
-        with open(output_path, 'w') as f:
-            json.dump(result, f, indent=4)
-
-        logger.info(f"Recommendations saved to {output_path}")
-        print(json.dumps(result, indent=2))
+        emit_result_after_orders = combo_mode == "live" and self.order_manager is not None
+        if not emit_result_after_orders:
+            logger.info(f"Recommendations saved to {output_path}")
+            self._emit_json_result(output_path, result, indent=4)
 
         # ========== 创建虚拟订单 with Stratified Sampling by Period Tiers ==========
         if self.order_manager is not None:
@@ -2583,7 +2883,7 @@ class EnsemblePredictor:
                 tier_preds = {'short': [], 'medium': [], 'long': []}
                 suspended_pairs = []  # (currency, period) tuples skipped due to zero liquidity
 
-                for pred in sorted_preds:
+                for pred in order_source_preds:
                     tier = get_tier(pred['period'])
                     if tier:
                         # Skip zero-liquidity pairs (exec_rate_21d < 5% for 14+ days)
@@ -2695,6 +2995,14 @@ class EnsemblePredictor:
                 created_orders = []
                 for pred in selected_preds[:TOP_N]:
                     key = f"{pred['currency']}-{pred['period']}"
+                    if (
+                        combo_mode == "live"
+                        and pred.get("decision_mode") == "exploit"
+                        and pred.get("update_cycle_id") == update_cycle_id
+                        and pred.get("recommendation_rank") is not None
+                        and int(pred["recommendation_rank"]) <= 5
+                    ):
+                        pred["force_create"] = True
 
                     # Fix7: 跳过数据陈旧的 pair，避免创建基于过期市场数据的虚拟单
                     if stale_pairs_set and (pred['currency'], pred['period']) in stale_pairs_set:
@@ -2774,12 +3082,25 @@ class EnsemblePredictor:
                           f"{probe_tag}: {status}")
 
             except Exception as e:
+                if combo_mode == "live":
+                    self._write_live_fail_closed_result(
+                        output_path,
+                        result,
+                        "C3 live mode fail-closed: virtual order creation failed",
+                        update_cycle_id=update_cycle_id,
+                    )
+                    logger.error(f"virtual order creation error: {e}")
+                    return
                 print(f"Failed to create virtual orders: {e}")
                 import traceback
                 traceback.print_exc()
         else:
             print("Warning: OrderManager not available, skipping virtual order creation")
         # ============================================================
+
+        if emit_result_after_orders:
+            logger.info(f"Recommendations saved to {output_path}")
+            self._emit_json_result(output_path, result, indent=4)
 
         # ========== 收集并输出系统指标 ==========
         try:
