@@ -30,5 +30,11 @@
     "p120_step_p95_threshold": 0.05,
     "global_exec_low": 0.30,
     "global_exec_high": 0.6
+  },
+  "combo_optimizer": {
+    "combo_mode": "shadow",
+    "beam_width": 24,
+    "candidate_hard_cap_pct_fUSD": 0.20,
+    "candidate_hard_cap_pct_fUST": 0.12
   }
 }
