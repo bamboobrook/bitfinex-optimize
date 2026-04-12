@@ -20,6 +20,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # 添加父目录到 path 以便导入
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from ml_engine.data_processor import DataProcessor
+from ml_engine.c3_combo_optimizer import RateCandidate, choose_combo_beam
 from ml_engine.execution_features import get_period_window_profile
 from ml_engine.system_policy import load_system_policy, get_step_cap_pct, get_policy_version
 
@@ -2101,6 +2102,76 @@ class EnsemblePredictor:
         }.get(liquidity_level, liquidity_level or "unknown")
         return f"{pred['currency']}-{int(pred['period'])}-balanced-{liquidity_alias}"
 
+    def _build_shadow_candidate_id(self, pred: dict) -> str:
+        candidate_band = str(pred.get("candidate_band") or "balanced_mid").replace("_", "-")
+        return f"{pred['currency']}-{int(pred['period'])}-{candidate_band}"
+
+    def _build_shadow_combo(self, ranked_predictions: list, update_cycle_id: str, beam_width: int):
+        candidates = []
+        scored_candidates = {}
+        candidate_lookup = {}
+
+        for pred in ranked_predictions:
+            currency = str(pred.get("currency", ""))
+            period = int(pred.get("period", 0) or 0)
+            if currency == "fUSD" and period == 2:
+                continue
+
+            rate = float(pred.get("predicted_rate", 0.0) or 0.0)
+            candidate_band = str(pred.get("candidate_band") or "balanced_mid")
+            candidate = RateCandidate(
+                currency=currency,
+                period=period,
+                rate=rate,
+                band=candidate_band,
+                distance_from_mid=float(rate - float(pred.get("current_rate", 0.0) or 0.0)),
+            )
+            key = (candidate.currency, candidate.period, candidate.rate)
+            candidates.append(candidate)
+            candidate_lookup[key] = pred
+            scored_candidates[key] = {
+                "candidate_path_ev": float(
+                    pred.get("path_value_score", pred.get("final_rank_score", pred.get("weighted_score", 0.0))) or 0.0
+                ),
+                "fill_quality": float(
+                    pred.get(
+                        "stage1_fill_probability",
+                        pred.get("fast_liquidity_score", pred.get("execution_probability", 0.0))
+                    ) or 0.0
+                ),
+            }
+
+        if not candidates:
+            return [], {}
+
+        shadow_candidates = choose_combo_beam(candidates, scored_candidates, beam_width)
+        if not shadow_candidates:
+            return [], {}
+
+        shadow_combo = []
+        combo_revenue_ev = 0.0
+        combo_fill_quality = 0.0
+        for rank, candidate in enumerate(shadow_candidates, start=1):
+            key = (candidate.currency, candidate.period, candidate.rate)
+            metrics = scored_candidates[key]
+            shadow_pred = dict(candidate_lookup[key])
+            shadow_pred["update_cycle_id"] = update_cycle_id
+            shadow_pred["recommendation_rank"] = rank
+            shadow_pred["rank_weight"] = self._default_rank_weight(rank)
+            shadow_pred["candidate_band"] = shadow_pred.get("candidate_band") or candidate.band
+            shadow_pred["candidate_id"] = self._build_shadow_candidate_id(shadow_pred)
+            shadow_pred["decision_mode"] = "exploit"
+            shadow_combo.append(shadow_pred)
+
+            combo_revenue_ev += shadow_pred["rank_weight"] * metrics["candidate_path_ev"]
+            combo_fill_quality += shadow_pred["rank_weight"] * metrics["fill_quality"]
+
+        return shadow_combo, {
+            "beam_width": int(beam_width),
+            "combo_revenue_ev": float(combo_revenue_ev),
+            "combo_fill_quality": float(combo_fill_quality),
+        }
+
     def _enrich_prediction_identity(self, ranked_predictions: list, update_cycle_id: Optional[str] = None):
         cycle_id = update_cycle_id or datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -2319,6 +2390,8 @@ class EnsemblePredictor:
         raw_ranked_preds = self._apply_path_ranking(valid_preds, market_liquidity, fusd_2d_pred)
         update_cycle_id = datetime.now().strftime('%Y%m%d_%H%M%S')
         self._enrich_prediction_identity(raw_ranked_preds, update_cycle_id=update_cycle_id)
+        combo_policy = self.policy.get("combo_optimizer", {})
+        combo_mode = combo_policy.get("combo_mode", "shadow")
 
         sorted_preds = [
             p for p in raw_ranked_preds
@@ -2347,6 +2420,20 @@ class EnsemblePredictor:
             "market_liquidity": market_liquidity,
             "recommendations": []
         }
+
+        if combo_mode == "shadow":
+            try:
+                raw_beam_width = combo_policy.get("beam_width", 24)
+                beam_width = int(24 if raw_beam_width is None else raw_beam_width)
+                if beam_width <= 0:
+                    raise ValueError("beam_width must be positive")
+                shadow_combo, shadow_metrics = self._build_shadow_combo(sorted_preds, update_cycle_id, beam_width)
+            except Exception as e:
+                logger.warning(f"Shadow combo skipped: {e}")
+            else:
+                if shadow_combo:
+                    result["shadow_combo"] = shadow_combo
+                    result["shadow_combo_metrics"] = shadow_metrics
 
         # rank 1-5: top 5 from sorted_preds excluding fUSD-2d
         # gated 货币的 2d 订单参与正常评分排序，不再强制置顶（避免低利率 2d 异常 rank1）
