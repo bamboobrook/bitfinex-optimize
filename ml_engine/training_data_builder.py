@@ -91,6 +91,16 @@ class TrainingDataBuilder:
             'stage1_fill_probability',
             'stage2_frr_proxy_rate',
             'terminal_mode',
+            'update_cycle_id',
+            'recommendation_rank',
+            'rank_weight',
+            'candidate_id',
+            'decision_mode',
+            'data_quality_label',
+            'validation_label',
+            'realized_terminal_mode',
+            'realized_terminal_value',
+            'realized_wait_hours',
         ]
         selected_cols.extend([c for c in optional_cols if c in table_cols])
 
@@ -207,7 +217,11 @@ class TrainingDataBuilder:
         for c in ['follow_error_at_order', 'gate_reject_reason', 'direction_match',
                   'step_change_pct', 'step_capped', 'policy_step_cap_pct', 'probe_type',
                   'path_value_score', 'stage1_fill_probability', 'stage2_frr_proxy_rate',
-                  'terminal_mode']:
+                  'terminal_mode', 'update_cycle_id', 'recommendation_rank',
+                  'rank_weight', 'candidate_id', 'decision_mode',
+                  'data_quality_label', 'validation_label',
+                  'realized_terminal_mode', 'realized_terminal_value',
+                  'realized_wait_hours']:
             if c in execution_results.columns:
                 merge_cols.append(c)
 
@@ -259,6 +273,11 @@ class TrainingDataBuilder:
         """
         df = merged_df.copy()
 
+        if 'decision_mode' in df.columns:
+            df = df[df['decision_mode'] == 'exploit'].copy()
+        if 'data_quality_label' in df.columns:
+            df = df[df['data_quality_label'] == 'STRONG'].copy()
+
         # 标签1: 实际成交二元标签
         df['actual_execution_binary'] = (df['status'] == 'EXECUTED').astype(float)
         df.loc[df['status'].isna(), 'actual_execution_binary'] = np.nan
@@ -279,21 +298,45 @@ class TrainingDataBuilder:
         df['revenue_reward'] = df.apply(self._compute_revenue_reward, axis=1)
 
         # 路径标签: 默认值兜底，兼容旧表结构
-        for col in ['path_value_score', 'stage1_fill_probability', 'stage2_frr_proxy_rate', 'terminal_mode']:
+        for col in [
+            'path_value_score',
+            'stage1_fill_probability',
+            'stage2_frr_proxy_rate',
+            'terminal_mode',
+            'realized_terminal_mode',
+            'realized_terminal_value',
+            'realized_wait_hours',
+        ]:
             if col not in df.columns:
                 df[col] = np.nan
 
         executed_mask = df['status'] == 'EXECUTED'
-        df['path_terminal_value'] = np.where(
-            executed_mask,
-            df['execution_rate'].fillna(df['predicted_rate']),
-            df['stage2_frr_proxy_rate']
+        fallback_terminal_value = pd.Series(
+            np.where(
+                executed_mask,
+                df['execution_rate'].fillna(df['predicted_rate']),
+                df['stage2_frr_proxy_rate']
+            ),
+            index=df.index,
         )
+        realized_terminal_value_available = (
+            df['realized_terminal_value'].notna()
+        ) & (df['realized_terminal_value'] != '')
+        df['path_terminal_value'] = df['realized_terminal_value'].where(
+            realized_terminal_value_available,
+            fallback_terminal_value
+        )
+
+        fallback_stage1_success = (executed_mask & (df['terminal_mode'] == 'FIXED')).astype(float)
+        realized_terminal_mode_available = (
+            df['realized_terminal_mode'].notna()
+        ) & (df['realized_terminal_mode'] != '')
         df['path_stage1_success'] = np.where(
-            executed_mask & (df['terminal_mode'] == 'FIXED'),
-            1.0,
-            0.0
+            realized_terminal_mode_available,
+            (df['realized_terminal_mode'] == 'FIXED').astype(float),
+            fallback_stage1_success
         )
+        df['path_wait_hours'] = df['realized_wait_hours']
 
         # 闭环诊断标签: 跟随误差、方向一致性、单步变化
         if 'follow_error_at_order' in df.columns:
@@ -436,7 +479,8 @@ class TrainingDataBuilder:
             failed_count = (df['actual_execution_binary'] == 0).sum()
 
             print(f"\n执行结果覆盖:")
-            print(f"  - 包含执行结果: {matched:,} ({100*matched/total:.1f}%)")
+            coverage = 100 * matched / total if total > 0 else 0.0
+            print(f"  - 包含执行结果: {matched:,} ({coverage:.1f}%)")
             print(f"  - 成交样本: {exec_count:,}")
             print(f"  - 失败样本: {failed_count:,}")
 

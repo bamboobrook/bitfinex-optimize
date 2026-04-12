@@ -213,6 +213,25 @@ class EnhancedModelTrainer:
             '_expired_weight',        # 内部样本权重，非特征
             'path_stage1_success',    # 来源于 terminal_mode 的标签，泄漏目标信息
             'path_terminal_value',    # revenue_optimized 目标源，泄漏目标信息
+            'path_wait_hours',
+            'path_value_score',
+            'stage1_fill_probability',
+            'stage2_frr_proxy_rate',
+            'frr_proxy_rate',
+            'frr_fallback_value',
+            'rank6_fallback_penalty',
+            'expected_terminal_mode',
+            'path_stage_outcome',
+            'decision_mode',
+            'data_quality_label',
+            'validation_label',
+            'realized_terminal_mode',
+            'realized_terminal_value',
+            'realized_wait_hours',
+            'candidate_id',
+            'update_cycle_id',
+            'recommendation_rank',
+            'rank_weight',
         ]
 
         feature_cols = [c for c in df.columns if c not in exclude_cols]
