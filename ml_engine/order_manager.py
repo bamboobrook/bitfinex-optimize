@@ -51,10 +51,37 @@ class OrderManager:
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS virtual_orders (
+                    order_id TEXT PRIMARY KEY,
+                    currency TEXT NOT NULL,
+                    period INTEGER NOT NULL,
+                    predicted_rate REAL NOT NULL,
+                    order_timestamp TEXT NOT NULL,
+                    validation_window_hours INTEGER NOT NULL,
+                    status TEXT DEFAULT 'PENDING',
+                    executed_at TEXT,
+                    execution_rate REAL,
+                    execution_delay_minutes INTEGER,
+                    max_market_rate REAL,
+                    rate_gap REAL,
+                    model_version TEXT,
+                    prediction_confidence TEXT,
+                    prediction_strategy TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    validated_at TIMESTAMP,
+                    CHECK(status IN ('PENDING', 'EXECUTED', 'FAILED', 'EXPIRED'))
+                )
+            """)
             cursor.execute("PRAGMA table_info(virtual_orders)")
             existing = {row[1] for row in cursor.fetchall()}
 
             required_columns = {
+                "update_cycle_id": "TEXT",
+                "recommendation_rank": "INTEGER",
+                "rank_weight": "REAL",
+                "candidate_id": "TEXT",
+                "decision_mode": "TEXT",
                 "market_follow_error": "REAL",
                 "direction_match": "INTEGER",
                 "step_change_pct": "REAL",
@@ -73,6 +100,11 @@ class OrderManager:
                 "fast_liquidity_score": "REAL",
                 "currency_regime_state": "TEXT",
                 "expected_terminal_mode": "TEXT",
+                "data_quality_label": "TEXT",
+                "validation_label": "TEXT",
+                "realized_terminal_mode": "TEXT",
+                "realized_terminal_value": "REAL",
+                "realized_wait_hours": "REAL",
                 "path_stage_outcome": "TEXT",
                 "stage1_fill_hours": "INTEGER",
                 "stage2_frr_proxy_rate": "REAL",
@@ -146,12 +178,14 @@ class OrderManager:
                 INSERT INTO virtual_orders
                 (order_id, currency, period, predicted_rate, order_timestamp,
                  validation_window_hours, prediction_confidence, prediction_strategy,
-                 model_version, status, created_at, market_follow_error,
+                 model_version, status, created_at, update_cycle_id,
+                 recommendation_rank, rank_weight, candidate_id, decision_mode,
+                 market_follow_error,
                  direction_match, step_change_pct, step_capped, policy_step_cap_pct,
                  probe_type, path_value_score, stage1_fill_probability,
                  frr_proxy_rate, frr_fallback_value, rank6_fallback_penalty,
                  fast_liquidity_score, currency_regime_state, expected_terminal_mode)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 order_id,
                 prediction['currency'],
@@ -163,6 +197,11 @@ class OrderManager:
                 prediction.get('strategy', 'Unknown'),
                 'v1.0',  # Model version
                 current_time,  # created_at is when order was inserted
+                prediction.get('update_cycle_id'),
+                prediction.get('recommendation_rank'),
+                prediction.get('rank_weight'),
+                prediction.get('candidate_id'),
+                prediction.get('decision_mode', 'exploit'),
                 prediction.get('market_follow_error'),
                 prediction.get('direction_match'),
                 prediction.get('step_change_pct'),

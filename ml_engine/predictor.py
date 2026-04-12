@@ -2027,6 +2027,10 @@ class EnsemblePredictor:
                     currency TEXT NOT NULL,
                     period INTEGER NOT NULL,
                     rank INTEGER NOT NULL,
+                    recommendation_rank INTEGER,
+                    rank_weight REAL,
+                    candidate_id TEXT,
+                    decision_mode TEXT,
                     predicted_rate REAL NOT NULL,
                     execution_probability REAL NOT NULL,
                     strategy TEXT NOT NULL,
@@ -2062,6 +2066,11 @@ class EnsemblePredictor:
                 "fast_liquidity_score": "REAL",
                 "currency_regime_state": "TEXT",
                 "final_rank_score": "REAL",
+                "recommendation_rank": "INTEGER",
+                "rank_weight": "REAL",
+                "candidate_id": "TEXT",
+                "decision_mode": "TEXT",
+                "expected_terminal_mode": "TEXT",
             }
             for column, col_type in required_columns.items():
                 if column not in existing:
@@ -2076,6 +2085,39 @@ class EnsemblePredictor:
             )
             conn.commit()
 
+    def _default_rank_weight(self, recommendation_rank: int) -> float:
+        if recommendation_rank == 1:
+            return 0.60
+        if recommendation_rank <= 6:
+            return 0.10
+        return 0.0
+
+    def _build_candidate_id(self, pred: dict) -> str:
+        liquidity_level = str(pred.get("liquidity_level") or "unknown").lower()
+        liquidity_alias = {
+            "medium": "mid",
+            "high": "high",
+            "low": "low",
+        }.get(liquidity_level, liquidity_level or "unknown")
+        return f"{pred['currency']}-{int(pred['period'])}-balanced-{liquidity_alias}"
+
+    def _enrich_prediction_identity(self, ranked_predictions: list, update_cycle_id: Optional[str] = None):
+        cycle_id = update_cycle_id or datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        for rank, pred in enumerate(ranked_predictions, start=1):
+            if not pred.get("update_cycle_id"):
+                pred["update_cycle_id"] = cycle_id
+            if pred.get("recommendation_rank") is None:
+                pred["recommendation_rank"] = rank
+            if pred.get("rank_weight") is None:
+                pred["rank_weight"] = self._default_rank_weight(int(pred["recommendation_rank"]))
+            if not pred.get("candidate_id"):
+                pred["candidate_id"] = self._build_candidate_id(pred)
+            if not pred.get("decision_mode"):
+                pred["decision_mode"] = "exploit"
+
+        return ranked_predictions
+
     def _persist_prediction_history(self, ranked_predictions: list):
         if not ranked_predictions:
             return
@@ -2083,7 +2125,8 @@ class EnsemblePredictor:
         import sqlite3
 
         self._ensure_prediction_history_schema()
-        update_cycle_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        update_cycle_id = ranked_predictions[0].get("update_cycle_id") or datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._enrich_prediction_identity(ranked_predictions, update_cycle_id=update_cycle_id)
         prediction_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         stale_flag = int(bool(self._stale_issues))
 
@@ -2097,10 +2140,14 @@ class EnsemblePredictor:
 
             rows.append((
                 prediction_timestamp,
-                update_cycle_id,
+                pred["update_cycle_id"],
                 pred["currency"],
                 int(pred["period"]),
                 rank,
+                pred["recommendation_rank"],
+                pred["rank_weight"],
+                pred["candidate_id"],
+                pred.get("decision_mode", "exploit"),
                 predicted_rate,
                 float(pred.get("execution_probability", 0.0) or 0.0),
                 pred.get("strategy", "Unknown"),
@@ -2129,6 +2176,7 @@ class EnsemblePredictor:
                 float(pred.get("fast_liquidity_score", 0.0) or 0.0),
                 pred.get("currency_regime_state"),
                 float(pred.get("final_rank_score", pred.get("weighted_score", 0.0)) or 0.0),
+                pred.get("expected_terminal_mode"),
             ))
 
         with sqlite3.connect(self.db_path) as conn:
@@ -2136,6 +2184,7 @@ class EnsemblePredictor:
                 """
                 INSERT INTO prediction_history (
                     prediction_timestamp, update_cycle_id, currency, period, rank,
+                    recommendation_rank, rank_weight, candidate_id, decision_mode,
                     predicted_rate, execution_probability, strategy, confidence,
                     conservative_rate, balanced_rate, aggressive_rate, trend_factor,
                     current_market_rate, rate_premium_pct, ma_60, ma_1440,
@@ -2144,8 +2193,8 @@ class EnsemblePredictor:
                     market_follow_error, stale_data, path_value_score,
                     stage1_fill_probability, frr_proxy_rate, frr_fallback_value,
                     rank6_fallback_penalty, fast_liquidity_score,
-                    currency_regime_state, final_rank_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    currency_regime_state, final_rank_score, expected_terminal_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows
             )
@@ -2268,6 +2317,8 @@ class EnsemblePredictor:
                 )
 
         raw_ranked_preds = self._apply_path_ranking(valid_preds, market_liquidity, fusd_2d_pred)
+        update_cycle_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._enrich_prediction_identity(raw_ranked_preds, update_cycle_id=update_cycle_id)
 
         sorted_preds = [
             p for p in raw_ranked_preds
