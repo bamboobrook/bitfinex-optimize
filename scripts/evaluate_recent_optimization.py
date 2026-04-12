@@ -169,26 +169,72 @@ def fetch_prediction_history_status(conn: sqlite3.Connection) -> dict:
     }
 
 
+def _get_virtual_order_columns(conn: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in conn.execute("PRAGMA table_info(virtual_orders)").fetchall()}
+
+
 def fetch_path_metrics(conn: sqlite3.Connection, start: datetime, end: datetime) -> dict:
+    columns = _get_virtual_order_columns(conn)
+    path_value_expr = "AVG(path_value_score)" if "path_value_score" in columns else "NULL"
+    stage1_fill_expr = "AVG(stage1_fill_probability)" if "stage1_fill_probability" in columns else "NULL"
+    realized_mode_col = (
+        "realized_terminal_mode"
+        if "realized_terminal_mode" in columns
+        else ("terminal_mode" if "terminal_mode" in columns else None)
+    )
+    expected_mode_col = "expected_terminal_mode" if "expected_terminal_mode" in columns else None
+    realized_value_col = "realized_terminal_value" if "realized_terminal_value" in columns else None
+    params = (start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"))
+
     row = conn.execute(
-        """
+        f"""
         SELECT
-            AVG(path_value_score),
-            AVG(stage1_fill_probability),
-            AVG(CASE WHEN terminal_mode='FRR_PROXY' THEN 1 ELSE 0 END),
-            AVG(CASE WHEN terminal_mode='RANK6_PROXY' THEN 1 ELSE 0 END)
+            {path_value_expr},
+            {stage1_fill_expr},
+            {"AVG(CASE WHEN " + realized_mode_col + "='FRR_PROXY' THEN 1 ELSE 0 END)" if realized_mode_col else "0.0"},
+            {"AVG(CASE WHEN " + realized_mode_col + "='RANK6_PROXY' THEN 1 ELSE 0 END)" if realized_mode_col else "0.0"},
+            {"AVG(CASE WHEN " + realized_mode_col + " IS NOT NULL THEN 1 ELSE 0 END)" if realized_mode_col else "0.0"},
+            {f"AVG({realized_value_col})" if realized_value_col else "NULL"}
         FROM virtual_orders
         WHERE order_timestamp >= ?
           AND order_timestamp < ?
           AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
         """,
-        (start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")),
+        params,
     ).fetchone()
+
+    terminal_mode_matrix = {}
+    if expected_mode_col and realized_mode_col:
+        matrix_rows = conn.execute(
+            f"""
+            SELECT
+                {expected_mode_col} AS expected_mode,
+                {realized_mode_col} AS realized_mode,
+                COUNT(*) AS total
+            FROM virtual_orders
+            WHERE order_timestamp >= ?
+              AND order_timestamp < ?
+              AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
+              AND {expected_mode_col} IS NOT NULL
+              AND {realized_mode_col} IS NOT NULL
+            GROUP BY {expected_mode_col}, {realized_mode_col}
+            ORDER BY {expected_mode_col}, {realized_mode_col}
+            """,
+            params,
+        ).fetchall()
+        terminal_mode_matrix = {
+            f"{expected_mode}->{realized_mode}": total
+            for expected_mode, realized_mode, total in matrix_rows
+        }
+
     return {
         "avg_path_value_score": row[0] or 0.0,
         "avg_stage1_fill_probability": row[1] or 0.0,
         "frr_terminal_ratio": row[2] or 0.0,
         "rank6_terminal_ratio": row[3] or 0.0,
+        "path_label_coverage": row[4] or 0.0,
+        "avg_realized_terminal_value": row[5],
+        "terminal_mode_matrix": terminal_mode_matrix,
     }
 
 
@@ -359,6 +405,22 @@ def main():
     print(
         f"- terminal rank6 ratio: {format_pct(previous_path['rank6_terminal_ratio'])} -> "
         f"{format_pct(recent_path['rank6_terminal_ratio'])}"
+    )
+    print(
+        f"- path_label_coverage: {format_pct(previous_path['path_label_coverage'])} -> "
+        f"{format_pct(recent_path['path_label_coverage'])}"
+    )
+    print(
+        f"- avg_realized_terminal_value: {format_num(previous_path['avg_realized_terminal_value'], 3)} -> "
+        f"{format_num(recent_path['avg_realized_terminal_value'], 3)}"
+    )
+    print(
+        f"- terminal_mode_matrix(prev): "
+        f"{json.dumps(previous_path['terminal_mode_matrix'], ensure_ascii=False, sort_keys=True)}"
+    )
+    print(
+        f"- terminal_mode_matrix(recent): "
+        f"{json.dumps(recent_path['terminal_mode_matrix'], ensure_ascii=False, sort_keys=True)}"
     )
 
 

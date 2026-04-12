@@ -2445,7 +2445,9 @@ class EnsemblePredictor:
             "recommendations": []
         }
 
-        if combo_mode == "shadow":
+        combo_top5 = None
+        combo_build_failed = False
+        if combo_mode in {"shadow", "live"}:
             try:
                 raw_beam_width = combo_policy.get("beam_width", 24)
                 beam_width = int(24 if raw_beam_width is None else raw_beam_width)
@@ -2453,19 +2455,50 @@ class EnsemblePredictor:
                     raise ValueError("beam_width must be positive")
                 shadow_combo, shadow_metrics = self._build_shadow_combo(sorted_preds, update_cycle_id, beam_width)
             except Exception as e:
-                logger.warning(f"Shadow combo skipped: {e}")
+                logger.warning(f"{combo_mode} combo skipped: {e}")
+                combo_build_failed = combo_mode == "live"
             else:
                 if shadow_combo:
-                    result["shadow_combo"] = shadow_combo
-                    result["shadow_combo_metrics"] = shadow_metrics
+                    if combo_mode == "shadow":
+                        result["shadow_combo"] = shadow_combo
+                        result["shadow_combo_metrics"] = shadow_metrics
+                    else:
+                        if len(shadow_combo) >= 5:
+                            combo_top5 = shadow_combo[:5]
+                        else:
+                            result["status"] = "error"
+                            result["fail_closed"] = True
+                            result["error"] = "C3 live mode fail-closed: incomplete combo"
+                            result["recommendations"] = []
+                            with open(output_path, 'w') as f:
+                                json.dump(result, f, indent=4)
+                            logger.error("C3 live mode fail-closed: incomplete combo")
+                            print(json.dumps(result, indent=2))
+                            return
+                elif combo_mode == "live":
+                    combo_build_failed = True
+
+        if combo_mode == "live" and (combo_build_failed or combo_top5 is None):
+            result["status"] = "error"
+            result["fail_closed"] = True
+            result["error"] = "C3 live mode fail-closed: combo build failed"
+            result["recommendations"] = []
+            with open(output_path, 'w') as f:
+                json.dump(result, f, indent=4)
+            logger.error("C3 live mode fail-closed: combo build failed")
+            print(json.dumps(result, indent=2))
+            return
 
         # rank 1-5: top 5 from sorted_preds excluding fUSD-2d
         # gated 货币的 2d 订单参与正常评分排序，不再强制置顶（避免低利率 2d 异常 rank1）
-        top5_candidates = [
-            p for p in sorted_preds
-            if not (p['currency'] == 'fUSD' and p['period'] == 2)
-        ]
-        top5 = top5_candidates[:5]
+        if combo_top5 is None:
+            top5_candidates = [
+                p for p in sorted_preds
+                if not (p['currency'] == 'fUSD' and p['period'] == 2)
+            ]
+            top5 = top5_candidates[:5]
+        else:
+            top5 = combo_top5
         recommendations_to_add = top5 + ([fusd_2d_pred] if fusd_2d_pred else [])
 
         # Build the recommendations list
