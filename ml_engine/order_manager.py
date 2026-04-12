@@ -299,6 +299,11 @@ class OrderManager:
                     stage1_fill_hours = ?,
                     stage2_frr_proxy_rate = ?,
                     terminal_mode = ?,
+                    data_quality_label = ?,
+                    validation_label = ?,
+                    realized_terminal_mode = ?,
+                    realized_terminal_value = ?,
+                    realized_wait_hours = ?,
                     validated_at = ?
                 WHERE order_id = ?
             """, (
@@ -312,6 +317,11 @@ class OrderManager:
                 execution_details.get('stage1_fill_hours'),
                 execution_details.get('stage2_frr_proxy_rate'),
                 execution_details.get('terminal_mode'),
+                execution_details.get('data_quality_label'),
+                execution_details.get('validation_label'),
+                execution_details.get('realized_terminal_mode'),
+                execution_details.get('realized_terminal_value'),
+                execution_details.get('realized_wait_hours'),
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 order_id
             ))

@@ -60,6 +60,11 @@ class ExecutionValidator:
                 "stage1_fill_hours": "INTEGER",
                 "stage2_frr_proxy_rate": "REAL",
                 "terminal_mode": "TEXT",
+                "data_quality_label": "TEXT",
+                "validation_label": "TEXT",
+                "realized_terminal_mode": "TEXT",
+                "realized_terminal_value": "REAL",
+                "realized_wait_hours": "REAL",
             }
             for column, col_type in required_columns.items():
                 if column not in existing:
@@ -324,13 +329,23 @@ class ExecutionValidator:
                 # Mark as EXPIRED if no market data
                 update_data = {
                     'status': 'EXPIRED',
-                    'gate_reject_reason': 'NO_MARKET_DATA'
+                    'gate_reject_reason': 'NO_MARKET_DATA',
+                    'data_quality_label': 'CENSORED',
+                    'validation_label': 'UNKNOWN',
+                    'realized_terminal_mode': 'UNKNOWN',
+                    'realized_terminal_value': None,
+                    'realized_wait_hours': None,
                 }
                 self.update_order_status(order['order_id'], update_data)
                 return {
                     'order_id': order['order_id'],
                     'status': 'EXPIRED',
-                    'reason': 'No market data available'
+                    'reason': 'No market data available',
+                    'data_quality_label': 'CENSORED',
+                    'validation_label': 'UNKNOWN',
+                    'realized_terminal_mode': 'UNKNOWN',
+                    'realized_terminal_value': None,
+                    'realized_wait_hours': None,
                 }
 
             predicted_rate = order['predicted_rate']
@@ -404,6 +419,7 @@ class ExecutionValidator:
 
                 if stage1_ok:
                     row_time = datetime.fromisoformat(stage1_fill_timestamp)
+                    realized_wait_hours = (row_time - order_time).total_seconds() / 3600
                     execution_details = {
                         'status': 'EXECUTED',
                         'executed_at': stage1_fill_timestamp,
@@ -416,9 +432,17 @@ class ExecutionValidator:
                         'stage1_fill_hours': stage1_fill_hours,
                         'stage2_frr_proxy_rate': stage2_frr_proxy_rate,
                         'terminal_mode': 'FIXED',
+                        'data_quality_label': 'STRONG',
+                        'validation_label': 'PATH_STAGE1_FILLED',
+                        'realized_terminal_mode': 'FIXED',
+                        'realized_terminal_value': stage1_effective_rate,
+                        'realized_wait_hours': realized_wait_hours,
                         **compatibility_details,
                     }
                 else:
+                    realized_terminal_mode = 'FRR_PROXY' if stage2_frr_proxy_rate > 0 else 'RANK6_PROXY'
+                    data_quality_label = 'WEAK_PROXY'
+                    validation_label = 'PATH_STAGE2_PROXY' if stage2_frr_proxy_rate > 0 else 'PATH_STAGE3_RANK6_PROXY'
                     execution_details = {
                         'status': 'FAILED',
                         'gate_reject_reason': 'PATH_FIXED_MISS',
@@ -428,7 +452,12 @@ class ExecutionValidator:
                         'path_stage_outcome': 'FIXED_MISS',
                         'stage1_fill_hours': None,
                         'stage2_frr_proxy_rate': stage2_frr_proxy_rate,
-                        'terminal_mode': 'FRR_PROXY' if stage2_frr_proxy_rate > 0 else 'RANK6_PROXY',
+                        'terminal_mode': realized_terminal_mode,
+                        'data_quality_label': data_quality_label,
+                        'validation_label': validation_label,
+                        'realized_terminal_mode': realized_terminal_mode,
+                        'realized_terminal_value': stage2_frr_proxy_rate if stage2_frr_proxy_rate > 0 else None,
+                        'realized_wait_hours': 12.0,
                         **compatibility_details,
                     }
 
@@ -611,7 +640,9 @@ class ExecutionValidator:
                 'nearby_rate_count', 'gate_reject_reason',
                 'follow_error_at_order', 'path_stage_outcome',
                 'stage1_fill_hours', 'stage2_frr_proxy_rate',
-                'terminal_mode'
+                'terminal_mode', 'data_quality_label',
+                'validation_label', 'realized_terminal_mode',
+                'realized_terminal_value', 'realized_wait_hours'
             ]:
                 if field in update_data:
                     set_clauses.append(f"{field} = ?")
