@@ -322,6 +322,50 @@ def test_compare_models_allows_complete_enhanced_models_without_false_positive(
     assert comparison["checks"]["enhanced_models"] is True
 
 
+def test_compare_models_requires_enhanced_models_even_when_production_is_missing_them(
+    tmp_path, scheduler_module, monkeypatch
+):
+    old_model_dir = tmp_path / "old_models"
+    new_model_dir = tmp_path / "new_models"
+    old_model_dir.mkdir()
+    new_model_dir.mkdir()
+
+    base_models = [
+        "fUSD_model_execution_prob",
+        "fUSD_model_conservative",
+        "fUSD_model_aggressive",
+        "fUSD_model_balanced",
+        "fUST_model_execution_prob",
+        "fUST_model_conservative",
+        "fUST_model_aggressive",
+        "fUST_model_balanced",
+    ]
+
+    _write_model_meta_files(old_model_dir, base_models)
+    _write_model_meta_files(new_model_dir, base_models)
+
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(old_model_dir),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    monkeypatch.setattr(scheduler, "_compare_model_performance", lambda *args: True)
+
+    is_better, comparison = scheduler.compare_models(
+        str(old_model_dir), str(new_model_dir)
+    )
+
+    assert is_better is False
+    assert comparison["checks"]["enhanced_models"] is False
+    assert comparison["checks"]["enhanced_model_retention"] is False
+    assert comparison["missing_enhanced_models"] == [
+        "fUSD_model_execution_prob_v2",
+        "fUSD_model_revenue_optimized",
+        "fUST_model_execution_prob_v2",
+        "fUST_model_revenue_optimized",
+    ]
+
+
 def test_follow_stability_and_divergence_checks_handle_missing_market_median_column(
     tmp_path, scheduler_module
 ):

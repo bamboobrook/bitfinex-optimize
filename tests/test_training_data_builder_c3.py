@@ -1,6 +1,7 @@
 import sqlite3
 import sys
 import types
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -463,10 +464,13 @@ def test_build_training_data_does_not_mark_failed_fixed_row_as_stage1_success(tm
     )
     builder = TrainingDataBuilder(str(db_path))
 
-    df = builder.build_training_data("2026-04-01", "2026-04-02", include_execution_results=True)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FutureWarning)
+        df = builder.build_training_data("2026-04-01", "2026-04-02", include_execution_results=True)
 
     assert len(df) == 1
     assert df.iloc[0]["path_stage1_success"] == 0.0
+    assert not [warning for warning in caught if issubclass(warning.category, FutureWarning)]
 
 
 def test_build_training_data_falls_back_when_realized_values_are_empty_strings(tmp_path):

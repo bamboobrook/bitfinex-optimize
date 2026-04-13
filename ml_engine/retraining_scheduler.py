@@ -808,13 +808,13 @@ class RetrainingScheduler:
                 if os.path.exists(new_meta_file):
                     enhanced_count += 1
 
-                if os.path.exists(old_meta_file) and not os.path.exists(new_meta_file):
+                if not os.path.exists(new_meta_file):
                     missing_enhanced_models.append(model_prefix)
 
             print(f"  增强模型: {enhanced_count}/{len(enhanced_models)}")
 
             if missing_enhanced_models:
-                print(f"  ❌ 新模型缺少生产中的增强模型: {', '.join(missing_enhanced_models)}")
+                print(f"  ❌ 新模型缺少必需增强模型: {', '.join(missing_enhanced_models)}")
                 comparison['checks']['enhanced_models'] = False
                 comparison['checks']['enhanced_model_retention'] = False
                 comparison['missing_enhanced_models'] = missing_enhanced_models
@@ -822,13 +822,8 @@ class RetrainingScheduler:
                 return False, comparison
 
             comparison['checks']['enhanced_model_retention'] = True
-
-            if enhanced_count > 0:
-                comparison['checks']['enhanced_models'] = True
-                print(f"  ✅ 包含增强模型")
-            else:
-                comparison['checks']['enhanced_models'] = False
-                print(f"  ⚠️  未包含增强模型")
+            comparison['checks']['enhanced_models'] = True
+            print(f"  ✅ 增强模型完整")
 
             # 检查3: 实际性能对比 (S2 核心修复)
             print("\n检查3: 模型性能对比 (验证集)")

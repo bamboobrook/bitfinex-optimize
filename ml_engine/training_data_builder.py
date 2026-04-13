@@ -312,6 +312,18 @@ class TrainingDataBuilder:
             if col not in df.columns:
                 df[col] = np.nan
 
+        # SQLite 在整列皆为 NULL 时会把数值列读成 object，后续 fillna 会触发 pandas FutureWarning。
+        for col in [
+            'predicted_rate',
+            'market_median',
+            'execution_rate',
+            'stage2_frr_proxy_rate',
+            'realized_terminal_value',
+            'realized_wait_hours',
+        ]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
         executed_mask = df['status'] == 'EXECUTED'
         fallback_terminal_value = pd.Series(
             np.where(
