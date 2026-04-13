@@ -207,6 +207,56 @@ class PredictorPathRankingTest(unittest.TestCase):
         self.assertEqual(top4[0], ("fUSD", 60))
         self.assertGreaterEqual(top4_fusd_count, 2)
 
+    def test_path_ranking_uses_hard_priority_of_revenue_fill_period_then_fusd(self):
+        predictor = self._make_predictor()
+        predictor.policy = {"combo_optimizer": {"hard_sort_revenue_step": 0.10, "hard_sort_fill_step": 0.02}}
+        predictor._calculate_fast_liquidity_score = lambda pred, market_liquidity: pred["_test_fast_liquidity"]
+
+        def _fake_path_value(pred, rank6_rate):
+            pred["stage1_fill_probability"] = pred["_test_fill_quality"]
+            pred["_path_meta"] = {"stage1_fill_probability": pred["_test_fill_quality"]}
+            return pred["_test_path_value"]
+
+        predictor._calculate_path_value_score = _fake_path_value
+        predictor._calculate_currency_regime_multiplier = lambda pred, path_meta, liquidity_meta: 1.0
+        predictor._calculate_safety_multiplier = lambda pred, path_meta: 1.0
+
+        def _decorate(currency, period, path_value, fill_quality):
+            pred = _make_prediction(currency, period, predicted_rate=max(path_value, 1.0), exec_prob=fill_quality)
+            pred["current_rate"] = max(path_value - 1.0, 0.1)
+            pred["_test_path_value"] = path_value
+            pred["_test_fill_quality"] = fill_quality
+            pred["_test_fast_liquidity"] = 0.60
+            return pred
+
+        preds = [
+            _decorate("fUSD", 30, 8.09, 0.60),
+            _decorate("fUST", 30, 8.08, 0.62),
+            _decorate("fUSD", 30, 8.08, 0.62),
+            _decorate("fUSD", 90, 8.04, 0.62),
+            _decorate("fUST", 30, 8.21, 0.40),
+        ]
+
+        ranked = predictor._apply_path_ranking(
+            preds,
+            market_liquidity={
+                "fUSD": {"score": 60.0, "fast_score": 0.60, "fillability_signal": 0.60, "volume_ratio_24h": 0.80},
+                "fUST": {"score": 52.0, "fast_score": 0.60, "fillability_signal": 0.60, "volume_ratio_24h": 0.80},
+            },
+            fusd_2d_pred=None,
+        )
+
+        self.assertEqual(
+            [(pred["currency"], pred["period"]) for pred in ranked],
+            [
+                ("fUST", 30),
+                ("fUSD", 90),
+                ("fUSD", 30),
+                ("fUST", 30),
+                ("fUSD", 30),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

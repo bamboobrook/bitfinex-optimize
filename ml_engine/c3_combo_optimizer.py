@@ -79,16 +79,25 @@ def _candidate_field(candidate, field: str):
     return getattr(candidate, field)
 
 
+def _priority_bucket(value: float, step: float) -> int:
+    value = float(value or 0.0)
+    step = float(step or 0.0)
+    if step <= 0:
+        return int(round(value * 1000))
+    return int(math.floor((value + 1e-12) / step))
+
+
 def choose_combo_beam(candidates, scored, beam_width: int):
     if beam_width <= 0:
         raise ValueError("beam_width must be positive")
 
-    rank_weights = [0.60, 0.10, 0.10, 0.10, 0.10]
-    beams = [([], 0.0, 0.0, 0.0)]
+    revenue_step = 0.50
+    fill_step = 0.02
+    beams = [([], ())]
 
-    for rank_weight in rank_weights:
+    for _rank in range(5):
         next_beams = []
-        for partial, revenue_ev, fill_quality, fusd_bias in beams:
+        for partial, hard_key in beams:
             used_pairs = {
                 (_candidate_field(item, "currency"), int(_candidate_field(item, "period")))
                 for item in partial
@@ -103,23 +112,27 @@ def choose_combo_beam(candidates, scored, beam_width: int):
                     int(_candidate_field(candidate, "period")),
                     float(_candidate_field(candidate, "rate")),
                 )]
+                candidate_key = (
+                    _priority_bucket(float(metrics.get("candidate_path_ev", 0.0) or 0.0), revenue_step),
+                    _priority_bucket(float(metrics.get("fill_quality", 0.0) or 0.0), fill_step),
+                    float(metrics.get("tenor_value", _candidate_field(candidate, "period")) or 0.0),
+                    float(metrics.get(
+                        "currency_priority",
+                        1.0 if _candidate_field(candidate, "currency") == "fUSD" else 0.0,
+                    ) or 0.0),
+                    float(metrics.get("candidate_path_ev", 0.0) or 0.0),
+                    float(metrics.get("fill_quality", 0.0) or 0.0),
+                )
                 next_beams.append((
                     partial + [candidate],
-                    revenue_ev + rank_weight * float(metrics.get("candidate_path_ev", 0.0) or 0.0),
-                    fill_quality + rank_weight * float(metrics.get("fill_quality", 0.0) or 0.0),
-                    fusd_bias + (rank_weight if _candidate_field(candidate, "currency") == "fUSD" else 0.0),
+                    hard_key + candidate_key,
                 ))
 
         if not next_beams:
             break
 
         next_beams.sort(
-            key=lambda item: (
-                math.floor(item[1] / 0.05 + 0.5 + 1e-9),
-                item[2],
-                item[3],
-                item[1],
-            ),
+            key=lambda item: item[1],
             reverse=True,
         )
         beams = next_beams[:beam_width]

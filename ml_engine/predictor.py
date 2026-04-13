@@ -1984,6 +1984,50 @@ class EnsemblePredictor:
 
         return float(np.clip(multiplier, 0.20, 1.08))
 
+    def _priority_bucket(self, value: float, step: float) -> int:
+        value = float(value or 0.0)
+        step = float(step or 0.0)
+        if not np.isfinite(value):
+            return 0
+        if step <= 0:
+            return int(round(value * 1000))
+        return int(np.floor((value + 1e-12) / step))
+
+    def _priority_revenue_score(self, pred: dict) -> float:
+        path_value_score = float(pred.get("path_value_score", 0.0) or 0.0)
+        currency_regime_multiplier = float(pred.get("currency_regime_multiplier", 1.0) or 1.0)
+        safety_multiplier = float(pred.get("safety_multiplier", 1.0) or 1.0)
+        revenue_score = path_value_score * currency_regime_multiplier * safety_multiplier
+        return float(revenue_score) if np.isfinite(revenue_score) else 0.0
+
+    def _prediction_hard_rank_key(self, pred: dict) -> tuple:
+        combo_cfg = self.policy.get("combo_optimizer", {})
+        revenue_step = float(combo_cfg.get("hard_sort_revenue_step", 0.10) or 0.10)
+        fill_step = float(combo_cfg.get("hard_sort_fill_step", 0.02) or 0.02)
+        revenue_score = self._priority_revenue_score(pred)
+        fill_score = float(
+            pred.get(
+                "stage1_fill_probability",
+                pred.get("fast_liquidity_score", pred.get("execution_probability", 0.0)),
+            ) or 0.0
+        )
+        period = int(pred.get("period", 0) or 0)
+        currency_priority = 1 if str(pred.get("currency", "")) == "fUSD" else 0
+
+        pred["revenue_priority_bucket"] = self._priority_bucket(revenue_score, revenue_step)
+        pred["fill_priority_bucket"] = self._priority_bucket(fill_score, fill_step)
+
+        return (
+            int(pred["revenue_priority_bucket"]),
+            int(pred["fill_priority_bucket"]),
+            period,
+            currency_priority,
+            revenue_score,
+            fill_score,
+            float(pred.get("final_rank_score", pred.get("weighted_score", 0.0)) or 0.0),
+            float(pred.get("predicted_rate", 0.0) or 0.0),
+        )
+
     def _apply_path_ranking(self, preds: list, market_liquidity: dict, fusd_2d_pred: Optional[dict]) -> list:
         """Rank predictions by external path value instead of static weighted score."""
         if not preds:
@@ -2021,11 +2065,7 @@ class EnsemblePredictor:
             ranked_preds.append(pred)
 
         ranked_preds.sort(
-            key=lambda item: (
-                float(item.get("final_rank_score", 0.0) or 0.0),
-                float(item.get("path_value_score", 0.0) or 0.0),
-                float(item.get("predicted_rate", 0.0) or 0.0),
-            ),
+            key=self._prediction_hard_rank_key,
             reverse=True,
         )
         return ranked_preds
@@ -2283,18 +2323,15 @@ class EnsemblePredictor:
                 candidates.append(candidate)
                 candidate_lookup[key] = candidate_pred
                 scored_candidates[key] = {
-                    "candidate_path_ev": float(
-                        candidate_pred.get(
-                            "final_rank_score",
-                            candidate_pred.get("path_value_score", candidate_pred.get("weighted_score", 0.0))
-                        ) or 0.0
-                    ),
+                    "candidate_path_ev": self._priority_revenue_score(candidate_pred),
                     "fill_quality": float(
                         candidate_pred.get(
                             "stage1_fill_probability",
                             candidate_pred.get("fast_liquidity_score", candidate_pred.get("execution_probability", 0.0))
                         ) or 0.0
                     ),
+                    "tenor_value": float(int(candidate_pred.get("period", 0) or 0)),
+                    "currency_priority": float(1.0 if candidate_pred.get("currency") == "fUSD" else 0.0),
                     "anchor_backed": pair_anchor_backed,
                 }
 

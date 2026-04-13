@@ -70,6 +70,31 @@ def test_choose_combo_beam_rejects_duplicate_pairs_and_prefers_fusd_unless_fust_
     assert ("fUST", 30, 11.4) not in [(c.currency, c.period, c.rate) for c in combo]
 
 
+def test_choose_combo_beam_prefers_longer_tenor_when_revenue_and_fill_share_same_tier():
+    candidates = [
+        RateCandidate("fUSD", 120, 12.4, "premium", 0.4),
+        RateCandidate("fUSD", 60, 10.9, "premium", 0.3),
+        RateCandidate("fUST", 14, 8.6, "balanced_mid", 0.2),
+        RateCandidate("fUSD", 14, 8.1, "balanced_mid", 0.1),
+        RateCandidate("fUSD", 30, 7.5, "balanced_mid", 0.1),
+        RateCandidate("fUSD", 90, 7.5, "balanced_mid", 0.1),
+    ]
+    scored = {
+        ("fUSD", 120, 12.4): {"candidate_path_ev": 12.8, "fill_quality": 0.58},
+        ("fUSD", 60, 10.9): {"candidate_path_ev": 11.7, "fill_quality": 0.57},
+        ("fUST", 14, 8.6): {"candidate_path_ev": 10.9, "fill_quality": 0.61},
+        ("fUSD", 14, 8.1): {"candidate_path_ev": 10.3, "fill_quality": 0.63},
+        ("fUSD", 30, 7.5): {"candidate_path_ev": 6.02, "fill_quality": 0.60},
+        ("fUSD", 90, 7.5): {"candidate_path_ev": 6.01, "fill_quality": 0.60},
+    }
+
+    combo = choose_combo_beam(candidates, scored, beam_width=12)
+
+    combo_keys = [(item.currency, item.period, item.rate) for item in combo]
+    assert ("fUSD", 90, 7.5) in combo_keys
+    assert ("fUSD", 30, 7.5) not in combo_keys
+
+
 def test_choose_combo_beam_returns_empty_for_empty_candidates():
     assert choose_combo_beam([], {}, 4) == []
 
@@ -267,3 +292,55 @@ def test_build_shadow_combo_uses_anchor_candidates_with_real_bands():
         assert any(item["candidate_band"] != "balanced_mid" for item in combo)
         assert any(item["candidate_band"] in {"premium", "stretch_premium"} for item in combo)
         assert any("-premium" in item["candidate_id"] for item in combo)
+
+
+def test_build_shadow_combo_uses_path_value_as_primary_revenue_metric(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        predictor = _make_shadow_predictor(tmp, 12)
+        predictor._load_market_anchor_rows = lambda currency, period: []
+
+        ranked_predictions = [
+            _make_prediction("fUSD", 120, 12.4, exec_prob=0.62),
+            _make_prediction("fUSD", 90, 11.8, exec_prob=0.60),
+            _make_prediction("fUSD", 30, 9.2, exec_prob=0.58),
+            _make_prediction("fUST", 30, 11.4, exec_prob=0.64),
+            _make_prediction("fUSD", 14, 8.8, exec_prob=0.56),
+            _make_prediction("fUSD", 2, 5.2, exec_prob=0.67),
+        ]
+        for idx, pred in enumerate(ranked_predictions, start=1):
+            pred["path_value_score"] = 9.0 - idx * 0.2
+            pred["final_rank_score"] = 2.0 + idx * 0.1
+            pred["weighted_score"] = pred["final_rank_score"]
+            pred["stage1_fill_probability"] = 0.55 + idx * 0.01
+            pred["fast_liquidity_score"] = 0.60
+            pred["candidate_band"] = "balanced_mid"
+
+        def _fake_score_shadow_candidate(base_pred, candidate, market_liquidity, rank6_rate):
+            return {
+                **base_pred,
+                "currency": candidate.currency,
+                "period": candidate.period,
+                "predicted_rate": candidate.rate,
+                "candidate_band": candidate.band,
+                "candidate_id": f"{candidate.currency}-{candidate.period}-{candidate.band}",
+                "path_value_score": base_pred["path_value_score"],
+                "final_rank_score": base_pred["final_rank_score"],
+                "weighted_score": base_pred["weighted_score"],
+                "stage1_fill_probability": base_pred["stage1_fill_probability"],
+                "fast_liquidity_score": base_pred["fast_liquidity_score"],
+            }
+
+        predictor._score_shadow_candidate = _fake_score_shadow_candidate
+        captured = {}
+
+        def _capture_choose_combo_beam(candidates, scored, beam_width):
+            captured["scored"] = scored
+            return candidates[:5]
+
+        monkeypatch.setattr("ml_engine.predictor.choose_combo_beam", _capture_choose_combo_beam)
+
+        predictor._build_shadow_combo(ranked_predictions, "cycle-path-primary", 12)
+
+        key = ("fUSD", 120, 12.4)
+        assert captured["scored"][key]["candidate_path_ev"] == ranked_predictions[0]["path_value_score"]
+        assert captured["scored"][key]["candidate_path_ev"] != ranked_predictions[0]["final_rank_score"]
