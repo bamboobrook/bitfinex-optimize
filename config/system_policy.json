@@ -35,6 +35,8 @@
     "combo_mode": "shadow",
     "beam_width": 24,
     "candidate_hard_cap_pct_fUSD": 0.20,
-    "candidate_hard_cap_pct_fUST": 0.12
+    "candidate_hard_cap_pct_fUST": 0.12,
+    "hard_sort_revenue_step": 0.10,
+    "hard_sort_fill_step": 0.02
   }
 }

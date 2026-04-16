@@ -1875,8 +1875,15 @@ class EnsemblePredictor:
         volume_ratio = market_meta.get("volume_ratio_24h")
         if volume_ratio is None:
             volume_signal = 0.60
+            volume_penalty = 1.0
         else:
-            volume_signal = self._clip_unit(float(volume_ratio or 0.0) / 1.20)
+            vr = float(volume_ratio or 0.0)
+            volume_signal = self._clip_unit(vr / 1.20)
+            # volume_penalty: 当 volume_ratio < 0.4 时线性惩罚至 0.75x
+            if vr >= 0.4:
+                volume_penalty = 1.0
+            else:
+                volume_penalty = 0.75 + 0.625 * (vr / 0.4)  # vr=0.4时=1.0, vr=0时=0.75
 
         pending_pressure = self._get_pending_order_pressure(currency, int(pred.get("period", 0) or 0))
         fast_score = (
@@ -1885,7 +1892,7 @@ class EnsemblePredictor:
             market_fast_score * 0.20 +
             fillability_signal * 0.14 +
             market_score_signal * 0.10
-        ) * (0.88 + 0.12 * volume_signal) * (1.0 - 0.20 * pending_pressure)
+        ) * (0.88 + 0.12 * volume_signal) * (1.0 - 0.20 * pending_pressure) * volume_penalty
 
         pred["pending_order_pressure"] = float(pending_pressure)
         pred["_liquidity_meta"] = {
@@ -1895,6 +1902,7 @@ class EnsemblePredictor:
             "fillability_signal": float(fillability_signal),
             "volume_ratio_24h": None if volume_ratio is None else float(volume_ratio),
             "volume_signal": float(volume_signal),
+            "volume_penalty": float(volume_penalty),
             "pending_order_pressure": float(pending_pressure),
         }
         return self._clip_unit(fast_score)
