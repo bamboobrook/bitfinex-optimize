@@ -232,6 +232,9 @@ class EnhancedModelTrainer:
             'update_cycle_id',
             'recommendation_rank',
             'rank_weight',
+            '_order_match_minutes',
+            '_execution_label_eligible',
+            '_exploit_quality',
         ]
 
         feature_cols = [c for c in df.columns if c not in exclude_cols]
@@ -609,7 +612,8 @@ class EnhancedModelTrainer:
         流程:
         1. 准备训练数据 (融合市场数据 + 执行结果)
         2. 按币种分别训练
-        3. 训练6个目标模型 (传统4个 + 新增2个)
+        3. 传统4模型使用 dense market frame（全部行）
+        4. v2模型仅使用 _exploit_quality=True 且执行标签非空的行
 
         Args:
             start_date: 开始日期
@@ -622,6 +626,17 @@ class EnhancedModelTrainer:
 
         # 准备训练数据
         df = self.prepare_training_data(start_date, end_date, use_execution_feedback)
+
+        # 训练前断言：确保数据非空
+        if len(df) == 0:
+            print("❌ 训练数据为空！无法训练任何模型。")
+            print("   请检查 training_data_builder 的 merge 方向和过滤逻辑。")
+            return
+
+        for target in ['future_conservative', 'future_aggressive',
+                       'future_balanced', 'future_execution_prob']:
+            non_nan = df[target].notna().sum()
+            print(f"  {target}: {non_nan:,} / {len(df):,} 非NaN")
 
         # 按币种训练
         for currency in ['fUSD', 'fUST']:
@@ -636,59 +651,60 @@ class EnhancedModelTrainer:
                 print(f"⚠️  {currency} 数据不足,跳过")
                 continue
 
-            # 1. 训练成交概率模型 (传统)
+            # 1-4. 传统模型：使用全部 dense market frame
             self.train_single_target(
                 currency, curr_df, 'future_execution_prob', 'classification', 'model_execution_prob'
             )
-
-            # 2. 训练保守模型
             self.train_single_target(
                 currency, curr_df, 'future_conservative', 'regression', 'model_conservative'
             )
-
-            # 3. 训练激进模型
             self.train_single_target(
                 currency, curr_df, 'future_aggressive', 'regression', 'model_aggressive'
             )
-
-            # 4. 训练平衡模型
             self.train_single_target(
                 currency, curr_df, 'future_balanced', 'regression', 'model_balanced'
             )
 
-            # === 新增模型 (基于执行反馈) ===
+            # === v2 模型 (基于执行反馈) — 仅使用 _exploit_quality=True 的行 ===
+            v2_df = curr_df
+            if '_exploit_quality' in curr_df.columns:
+                v2_df = curr_df[curr_df['_exploit_quality'] == True].copy()
+                print(f"\n  v2 训练子集: {len(v2_df):,} 行 (_exploit_quality=True)")
+            else:
+                print(f"\n  ⚠️  无 _exploit_quality 列，v2 模型使用全部数据")
 
-            # 5. 训练执行概率v2模型 (基于实际执行结果)
-            if 'actual_execution_binary' in curr_df.columns:
-                valid_count = curr_df['actual_execution_binary'].notna().sum()
+            # 5. 训练执行概率v2模型
+            if 'actual_execution_binary' in v2_df.columns:
+                valid_count = v2_df['actual_execution_binary'].notna().sum()
                 if valid_count >= 100:
-                    print(f"\n✨ 包含 {valid_count:,} 条实际执行结果,训练 execution_prob_v2")
+                    print(f"  ✨ 包含 {valid_count:,} 条高质量执行结果,训练 execution_prob_v2")
                     self.train_single_target(
-                        currency, curr_df, 'actual_execution_binary', 'classification',
+                        currency, v2_df, 'actual_execution_binary', 'classification',
                         'model_execution_prob_v2'
                     )
                 else:
-                    print(f"\n⚠️  实际执行结果不足 ({valid_count} < 100),跳过 execution_prob_v2")
+                    print(f"  ⚠️  高质量执行结果不足 ({valid_count} < 100),跳过 execution_prob_v2")
 
             # 6. 训练收益优化模型
-            if 'actual_execution_binary' in curr_df.columns and (
-                'path_terminal_value' in curr_df.columns or 'revenue_reward' in curr_df.columns
+            if 'actual_execution_binary' in v2_df.columns and (
+                'path_terminal_value' in v2_df.columns or 'revenue_reward' in v2_df.columns
             ):
-                if 'path_terminal_value' in curr_df.columns:
-                    curr_df['revenue_optimized_target'] = curr_df['path_terminal_value']
+                if 'path_terminal_value' in v2_df.columns:
+                    v2_df = v2_df.copy()
+                    v2_df['revenue_optimized_target'] = v2_df['path_terminal_value']
                 else:
-                    # 兼容旧训练链路: 没有路径标签时继续沿用原收益代理
-                    curr_df['revenue_optimized_target'] = curr_df['close_annual'] * curr_df['revenue_reward']
-                valid_count = curr_df['revenue_optimized_target'].notna().sum()
+                    v2_df = v2_df.copy()
+                    v2_df['revenue_optimized_target'] = v2_df['close_annual'] * v2_df['revenue_reward']
+                valid_count = v2_df['revenue_optimized_target'].notna().sum()
 
                 if valid_count >= 100:
-                    print(f"\n✨ 训练收益优化模型 (有效样本: {valid_count:,})")
+                    print(f"  ✨ 训练收益优化模型 (有效样本: {valid_count:,})")
                     self.train_single_target(
-                        currency, curr_df, 'revenue_optimized_target', 'regression',
+                        currency, v2_df, 'revenue_optimized_target', 'regression',
                         'model_revenue_optimized'
                     )
                 else:
-                    print(f"\n⚠️  收益优化样本不足 ({valid_count} < 100),跳过")
+                    print(f"  ⚠️  收益优化样本不足 ({valid_count} < 100),跳过")
 
             print(f"\n✅ {currency} 模型训练完成")
 

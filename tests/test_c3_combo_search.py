@@ -63,7 +63,9 @@ def test_choose_combo_beam_rejects_duplicate_pairs_and_prefers_fusd_unless_fust_
         ("fUSD", 14, 8.8): {"candidate_path_ev": 6.8, "fill_quality": 0.66},
     }
 
-    combo = choose_combo_beam(candidates, scored, beam_width=12)
+    combo = choose_combo_beam(candidates, scored, beam_width=12, policy={
+        "combo_optimizer": {"hard_sort_revenue_step": 0.50, "hard_sort_fill_step": 0.02}
+    })
 
     assert len({(item.currency, item.period) for item in combo}) == 5
     assert combo[0].currency == "fUSD"
@@ -333,7 +335,7 @@ def test_build_shadow_combo_uses_path_value_as_primary_revenue_metric(monkeypatc
         predictor._score_shadow_candidate = _fake_score_shadow_candidate
         captured = {}
 
-        def _capture_choose_combo_beam(candidates, scored, beam_width):
+        def _capture_choose_combo_beam(candidates, scored, beam_width, policy=None):
             captured["scored"] = scored
             return candidates[:5]
 

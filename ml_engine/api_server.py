@@ -1078,9 +1078,25 @@ def check_status():
     """
     返回 API 在线状态及当前后台任务进度
     """
+    status_info = get_current_status()
+
+    # 添加模型年龄监控
+    model_dir = os.path.join(BASE_DIR, "data", "models")
+    if os.path.exists(model_dir):
+        meta_files = [f for f in os.listdir(model_dir) if f.endswith('_meta.json')]
+        if meta_files:
+            newest_mtime = max(os.path.getmtime(os.path.join(model_dir, f)) for f in meta_files)
+            model_age_days = (datetime.now() - datetime.fromtimestamp(newest_mtime)).days
+            status_info["model_age_days"] = model_age_days
+            if model_age_days > 7:
+                logger.warning(f"Production models are {model_age_days} days old!")
+                if model_age_days > 14:
+                    status_info["status"] = "degraded"
+                    status_info["details"] = f"Models {model_age_days} days stale"
+
     return {
         "api_online": True,
-        "service_info": get_current_status()
+        "service_info": status_info
     }
 
 # 2. 获取预测结果 JSON (Get Results)

@@ -374,6 +374,7 @@ class RetrainingScheduler:
         判断是否需要重训练
 
         触发条件:
+        0. 生产模型过期 >14天（最高优先级）
         1. 距离上次训练 >= 7天 且 新增执行结果 >= 500条
         2. 全局近期成交率异常 (< 40% or > 60%)
         3. 单个 currency+period 成交率异常:
@@ -386,6 +387,14 @@ class RetrainingScheduler:
         print("\n" + "="*60)
         print("🔍 检查是否需要重训练")
         print("="*60)
+
+        # 条件0（最高优先级）: 生产模型过期
+        model_age = self._get_production_model_age_days()
+        print(f"生产模型年龄: {model_age} 天")
+        if model_age > 14:
+            reason = f"生产模型已{model_age}天未更新，强制重训"
+            print(f"⚠️  需要重训练: {reason}")
+            return True, reason
 
         # 条件1: 时间和数据量
         last_train_date = self.get_last_training_date()
@@ -814,16 +823,14 @@ class RetrainingScheduler:
             print(f"  增强模型: {enhanced_count}/{len(enhanced_models)}")
 
             if missing_enhanced_models:
-                print(f"  ❌ 新模型缺少必需增强模型: {', '.join(missing_enhanced_models)}")
+                print(f"  ⚠️  增强模型缺失: {', '.join(missing_enhanced_models)}（核心模型完整，允许部署）")
                 comparison['checks']['enhanced_models'] = False
                 comparison['checks']['enhanced_model_retention'] = False
                 comparison['missing_enhanced_models'] = missing_enhanced_models
-                comparison['is_better'] = False
-                return False, comparison
-
-            comparison['checks']['enhanced_model_retention'] = True
-            comparison['checks']['enhanced_models'] = True
-            print(f"  ✅ 增强模型完整")
+            else:
+                comparison['checks']['enhanced_model_retention'] = True
+                comparison['checks']['enhanced_models'] = True
+                print(f"  ✅ 增强模型完整")
 
             # 检查3: 实际性能对比 (S2 核心修复)
             print("\n检查3: 模型性能对比 (验证集)")
@@ -1134,6 +1141,9 @@ class RetrainingScheduler:
                     return False
 
                 feature_cols = meta['feature_cols']
+                # Filter out internal training columns that don't exist in market data
+                internal_cols = {'_order_match_minutes', '_execution_label_eligible', '_exploit_quality'}
+                feature_cols = [c for c in feature_cols if c not in internal_cols]
                 df = test_predictor.processor.load_data(currency)
                 if df.empty:
                     print(f"  ⚠️  sanity check: {currency} 无数据,跳过预测验证")

@@ -186,9 +186,28 @@ class BitfinexDataDownloader:
                     # 范围外有新数据，但范围内没有
                     return [(start_ts, end_ts)]
             else:
-                # 数据过期或不存在 - 修复3: 优先尝试最近24小时窗口，避免长周期无效全量扫描
-                logger.warning(f"    ⚠️ Data is stale (age > 2h), trying last 24h window first")
-                recent_start = int((datetime.now() - timedelta(hours=24)).timestamp() * 1000)
+                # 数据过期或不存在 - 按 currency+period 分层决定回补窗口
+                # 短周期(≤14d): 24h, 中周期(15-60d): 7d, 长周期(>60d): 30d
+                # fUST 中长周期额外放宽
+                if currency == 'fUST' and period > 14:
+                    if period > 60:
+                        backfill_hours = 720  # 30天
+                    else:
+                        backfill_hours = 168  # 7天
+                    # 如果 gap 已经超过窗口，升级
+                    gap_hours = (now_ms - latest_existing_ts) / 3600000 if latest_existing_ts else 999
+                    if gap_hours > backfill_hours:
+                        backfill_hours = min(backfill_hours * 2, 2160)  # 最多90天
+                elif period > 60:
+                    backfill_hours = 168  # 长周期7天
+                else:
+                    backfill_hours = 24  # 短周期24h
+
+                logger.warning(
+                    f"    ⚠️ Data is stale (age > 2h), using {backfill_hours}h backfill window "
+                    f"for {currency}-{period}d"
+                )
+                recent_start = int((datetime.now() - timedelta(hours=backfill_hours)).timestamp() * 1000)
                 adjusted_start = max(start_ts, recent_start)
                 return [(adjusted_start, end_ts)]
 

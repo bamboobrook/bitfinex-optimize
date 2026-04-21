@@ -2346,7 +2346,7 @@ class EnsemblePredictor:
         if not candidates:
             return [], {}
 
-        shadow_candidates = choose_combo_beam(candidates, scored_candidates, beam_width)
+        shadow_candidates = choose_combo_beam(candidates, scored_candidates, beam_width, policy=self.policy)
         if not shadow_candidates:
             return [], {}
 

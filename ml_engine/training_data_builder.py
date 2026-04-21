@@ -176,25 +176,33 @@ class TrainingDataBuilder:
         execution_results: pd.DataFrame
     ) -> pd.DataFrame:
         """
-        时间对齐: 为每个 market_data 行匹配最近的执行结果
+        时间对齐: 以 dense market_data 为主表，匹配最近的执行结果
 
         策略:
-        - 使用 merge_asof 进行时间向前匹配 (backward)
-        - 匹配容忍度: 24小时
+        - 使用 merge_asof 以 market_data 为 LEFT（密集 ~887K 行）
+        - execution_results 为 RIGHT（稀疏 ~12K 行），无匹配时订单列为 NaN
+        - direction='backward': 只匹配过去/当前订单，防止前视偏差
+        - 匹配容忍度: 2小时
         - 按 currency + period 分组匹配
 
+        新增内部字段:
+        - _order_match_minutes: 订单与市场行的时间差（分钟），NaN 表示无匹配
+        - _execution_label_eligible: 订单紧邻且非前视的资格标记
+        - _exploit_quality: exploit + STRONG + _execution_label_eligible
+
         Args:
-            market_data: 市场数据
-            execution_results: 执行结果
+            market_data: 市场数据（主表）
+            execution_results: 执行结果（右表）
 
         Returns:
             融合后的DataFrame,包含增强标签
         """
         if len(execution_results) == 0:
             print("⚠️  无执行结果数据,返回原始市场数据")
-            market_data['actual_execution_binary'] = np.nan
-            market_data['revenue_reward'] = np.nan
-            market_data['rate_competitiveness'] = np.nan
+            market_data = market_data.copy()
+            for col in ['actual_execution_binary', 'revenue_reward', 'rate_competitiveness',
+                        '_order_match_minutes', '_execution_label_eligible', '_exploit_quality']:
+                market_data[col] = np.nan
             return market_data
 
         # 确保时间字段格式正确
@@ -212,7 +220,7 @@ class TrainingDataBuilder:
         market_data = market_data.sort_values('datetime')
         execution_results = execution_results.sort_values('order_timestamp')
 
-        # 时间对齐合并
+        # 时间对齐合并：market_data 为 LEFT（密集），execution_results 为 RIGHT（稀疏）
         merge_cols = [
             'order_timestamp', 'currency', 'period', 'status',
             'predicted_rate', 'execution_confidence', 'total_score',
@@ -230,33 +238,48 @@ class TrainingDataBuilder:
                 merge_cols.append(c)
 
         merged = pd.merge_asof(
-            execution_results[merge_cols].sort_values('order_timestamp'),  # 主表：订单
-            market_data.sort_values('datetime'),                            # 右表：市场快照
-            left_on='order_timestamp',
-            right_on='datetime',
+            market_data.sort_values('datetime'),                            # 主表：市场数据（密集）
+            execution_results[merge_cols].sort_values('order_timestamp'),  # 右表：订单（稀疏）
+            left_on='datetime',
+            right_on='order_timestamp',
             by=['currency', 'period'],
-            direction='backward',  # 只匹配过去/当前快照，防止前视偏差
-            tolerance=pd.Timedelta('2h')  # 严格限制在2小时内（原24h太宽）
+            direction='backward',  # 只匹配过去/当前订单，防止前视偏差
+            tolerance=pd.Timedelta('2h')  # 严格限制在2小时内
         )
 
-        # 生成增强标签
+        # 计算 _order_match_minutes: 订单与市场行的时间差
+        if 'order_timestamp' in merged.columns:
+            time_diff = merged['datetime'] - merged['order_timestamp']
+            merged['_order_match_minutes'] = time_diff.dt.total_seconds() / 60.0
+            # 无订单匹配时 order_timestamp 为 NaT → _order_match_minutes 为 NaN
+        else:
+            merged['_order_match_minutes'] = np.nan
+
+        # _execution_label_eligible: 订单紧邻（≤30min）且非前视
+        # backward merge 保证 order_timestamp <= datetime，只需检查时间差
+        merged['_execution_label_eligible'] = (
+            merged['_order_match_minutes'].notna() &
+            (merged['_order_match_minutes'] >= 0) &
+            (merged['_order_match_minutes'] <= 30) &
+            merged.get('status', pd.Series(dtype=str)).notna()
+        )
+
+        # 生成增强标签（不再 blanket 过滤 decision_mode）
         merged = self._generate_enhanced_labels(merged)
 
         # 统计
-        matched_count = merged['actual_execution_binary'].notna().sum()
+        has_order = merged['_order_match_minutes'].notna()
+        eligible_count = merged['_execution_label_eligible'].sum()
+        exploit_quality_count = merged.get('_exploit_quality', pd.Series(dtype=bool)).sum()
+        exec_label_count = merged['actual_execution_binary'].notna().sum()
         exec_count = (merged['actual_execution_binary'] == 1).sum()
         failed_count = (merged['actual_execution_binary'] == 0).sum()
 
-        # merge_asof 覆盖率监控（market snapshot 匹配率，低于80%说明市场数据不足）
-        if 'close_annual' in merged.columns:
-            market_matched = merged['close_annual'].notna().sum()
-            coverage = market_matched / len(merged) if len(merged) > 0 else 0
-            if coverage < 0.80:
-                print(f"⚠️  merge_asof market coverage low: {market_matched}/{len(merged)} ({coverage:.1%}) — 市场快照匹配不足")
-            else:
-                print(f"✓ merge_asof market coverage: {market_matched}/{len(merged)} ({coverage:.1%})")
-
-        print(f"✓ 数据融合完成: 总样本 {len(merged)}, 匹配执行结果 {matched_count} (成交 {exec_count}, 失败 {failed_count})")
+        print(f"✓ 数据融合完成: 总样本 {len(merged):,}, "
+              f"有订单匹配 {has_order.sum():,}, "
+              f"eligible {eligible_count:,}, "
+              f"exploit_quality {exploit_quality_count:,}")
+        print(f"  执行标签覆盖: {exec_label_count:,} (成交 {exec_count:,}, 失败 {failed_count:,})")
 
         return merged
 
@@ -277,16 +300,35 @@ class TrainingDataBuilder:
         """
         df = merged_df.copy()
 
-        if 'decision_mode' in df.columns:
-            df = df[df['decision_mode'] == 'exploit'].copy()
+        # 不再 blanket 过滤 decision_mode=='exploit'（那会把 dense market frame 压成稀疏订单级）
+        # 改为标记 _exploit_quality 供 v2 模型训练时使用
+        has_decision_mode = 'decision_mode' in df.columns
+        has_data_quality = 'data_quality_label' in df.columns
+        has_eligible = '_execution_label_eligible' in df.columns
 
-        # 标签1: 实际成交二元标签
-        df['actual_execution_binary'] = (df['status'] == 'EXECUTED').astype(float)
-        df.loc[df['status'].isna(), 'actual_execution_binary'] = np.nan
-        # EXPIRED: 出价太高、市场无机会成交 → 负样本，但降低权重避免过拟合
-        expired_mask = df['status'] == 'EXPIRED'
-        df.loc[expired_mask, 'actual_execution_binary'] = 0.0
-        df['_expired_weight'] = np.where(expired_mask, 0.5, 1.0)
+        if has_decision_mode and has_data_quality and has_eligible:
+            df['_exploit_quality'] = (
+                (df['decision_mode'] == 'exploit') &
+                (df['data_quality_label'] == 'STRONG') &
+                df['_execution_label_eligible']
+            )
+        elif has_eligible:
+            df['_exploit_quality'] = df['_execution_label_eligible']
+        else:
+            df['_exploit_quality'] = False
+
+        # 标签1: 实际成交二元标签（仅在有订单匹配的行上设置）
+        has_order = df.get('status', pd.Series(dtype=str)).notna()
+        df['actual_execution_binary'] = np.nan
+        if 'status' in df.columns:
+            df.loc[has_order & (df['status'] == 'EXECUTED'), 'actual_execution_binary'] = 1.0
+            df.loc[has_order & (df['status'] == 'FAILED'), 'actual_execution_binary'] = 0.0
+            # EXPIRED: 出价太高、市场无机会成交 → 负样本，但降低权重避免过拟合
+            expired_mask = has_order & (df['status'] == 'EXPIRED')
+            df.loc[expired_mask, 'actual_execution_binary'] = 0.0
+            df['_expired_weight'] = np.where(expired_mask, 0.5, 1.0)
+        else:
+            df['_expired_weight'] = 1.0
 
         # 标签2: 利率竞争力 (predicted_rate / market_median)
         df['rate_competitiveness'] = df.apply(
@@ -324,12 +366,12 @@ class TrainingDataBuilder:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        executed_mask = df['status'] == 'EXECUTED'
+        executed_mask = (df.get('status', pd.Series(dtype=str)) == 'EXECUTED') if 'status' in df.columns else pd.Series(False, index=df.index)
         fallback_terminal_value = pd.Series(
             np.where(
                 executed_mask,
-                df['execution_rate'].fillna(df['predicted_rate']),
-                df['stage2_frr_proxy_rate']
+                df.get('execution_rate', np.nan).fillna(df.get('predicted_rate', np.nan)),
+                df.get('stage2_frr_proxy_rate', np.nan)
             ),
             index=df.index,
         )
@@ -341,7 +383,7 @@ class TrainingDataBuilder:
             fallback_terminal_value
         )
 
-        fallback_stage1_success = (executed_mask & (df['terminal_mode'] == 'FIXED')).astype(float)
+        fallback_stage1_success = (executed_mask & (df.get('terminal_mode', pd.Series(dtype=str)) == 'FIXED')).astype(float)
         realized_terminal_mode_available = (
             df['realized_terminal_mode'].notna()
         ) & (df['realized_terminal_mode'] != '')
@@ -364,7 +406,7 @@ class TrainingDataBuilder:
             df['follow_error'] = df['follow_error_at_order']
         else:
             df['follow_error'] = df.apply(
-                lambda row: row['predicted_rate'] - row['market_median']
+                lambda row: row.get('predicted_rate', np.nan) - row.get('market_median', np.nan)
                 if pd.notna(row.get('predicted_rate')) and pd.notna(row.get('market_median'))
                 else np.nan,
                 axis=1

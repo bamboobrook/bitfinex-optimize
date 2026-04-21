@@ -87,12 +87,13 @@ def _priority_bucket(value: float, step: float) -> int:
     return int(math.floor((value + 1e-12) / step))
 
 
-def choose_combo_beam(candidates, scored, beam_width: int):
+def choose_combo_beam(candidates, scored, beam_width: int, policy: dict = None):
     if beam_width <= 0:
         raise ValueError("beam_width must be positive")
 
-    revenue_step = 0.50
-    fill_step = 0.02
+    combo_cfg = (policy or {}).get("combo_optimizer", {})
+    revenue_step = float(combo_cfg.get("hard_sort_revenue_step", 0.10) or 0.10)
+    fill_step = float(combo_cfg.get("hard_sort_fill_step", 0.02) or 0.02)
     beams = [([], ())]
 
     for _rank in range(5):
