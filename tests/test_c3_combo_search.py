@@ -346,3 +346,60 @@ def test_build_shadow_combo_uses_path_value_as_primary_revenue_metric(monkeypatc
         key = ("fUSD", 120, 12.4)
         assert captured["scored"][key]["candidate_path_ev"] == ranked_predictions[0]["path_value_score"]
         assert captured["scored"][key]["candidate_path_ev"] != ranked_predictions[0]["final_rank_score"]
+
+
+def test_choose_combo_beam_prefers_anchor_backed_candidates_within_same_priority_tier():
+    """Beam should prefer anchor-backed candidates only after core C3 priority ties."""
+    candidates = [
+        RateCandidate("fUSD", 120, 12.4, "premium", 0.4),
+        RateCandidate("fUSD", 30, 9.2, "balanced_mid", 0.1),
+        RateCandidate("fUSD", 90, 11.8, "premium", 0.3),
+        RateCandidate("fUST", 30, 9.8, "premium", 0.6),
+        RateCandidate("fUST", 14, 7.5, "balanced_mid", 0.1),
+        RateCandidate("fUST", 14, 7.6, "balanced_mid", 0.2),
+    ]
+    scored = {
+        ("fUSD", 120, 12.4): {"candidate_path_ev": 8.8, "fill_quality": 0.58, "anchor_backed": 1},
+        ("fUSD", 30, 9.2): {"candidate_path_ev": 7.0, "fill_quality": 0.72, "anchor_backed": 1},
+        ("fUSD", 90, 11.8): {"candidate_path_ev": 8.1, "fill_quality": 0.52, "anchor_backed": 1},
+        ("fUST", 30, 9.8): {"candidate_path_ev": 7.1, "fill_quality": 0.55, "anchor_backed": 0},
+        ("fUST", 14, 7.5): {"candidate_path_ev": 6.8, "fill_quality": 0.66, "anchor_backed": 0},
+        ("fUST", 14, 7.6): {"candidate_path_ev": 6.8, "fill_quality": 0.66, "anchor_backed": 1},
+    }
+
+    combo = choose_combo_beam(candidates, scored, beam_width=12, policy={
+        "combo_optimizer": {"hard_sort_revenue_step": 0.50, "hard_sort_fill_step": 0.02}
+    })
+
+    assert len(combo) == 5
+    combo_keys = [(item.currency, item.period, item.rate) for item in combo]
+    assert ("fUSD", 120, 12.4) in combo_keys
+    assert ("fUST", 14, 7.6) in combo_keys
+    assert ("fUST", 14, 7.5) not in combo_keys
+
+
+def test_choose_combo_beam_keeps_revenue_bucket_ahead_of_anchor_backed_status():
+    candidates = [
+        RateCandidate("fUSD", 120, 12.4, "premium", 0.4),
+        RateCandidate("fUSD", 90, 11.8, "premium", 0.3),
+        RateCandidate("fUSD", 60, 10.5, "premium", 0.2),
+        RateCandidate("fUSD", 30, 9.2, "balanced_mid", 0.1),
+        RateCandidate("fUSD", 14, 8.8, "balanced_mid", 0.2),
+        RateCandidate("fUST", 14, 10.2, "premium", 0.6),
+    ]
+    scored = {
+        ("fUSD", 120, 12.4): {"candidate_path_ev": 9.0, "fill_quality": 0.62, "anchor_backed": 1},
+        ("fUSD", 90, 11.8): {"candidate_path_ev": 8.8, "fill_quality": 0.61, "anchor_backed": 1},
+        ("fUSD", 60, 10.5): {"candidate_path_ev": 8.6, "fill_quality": 0.60, "anchor_backed": 1},
+        ("fUSD", 30, 9.2): {"candidate_path_ev": 8.4, "fill_quality": 0.59, "anchor_backed": 1},
+        ("fUSD", 14, 8.8): {"candidate_path_ev": 6.8, "fill_quality": 0.80, "anchor_backed": 1},
+        ("fUST", 14, 10.2): {"candidate_path_ev": 8.2, "fill_quality": 0.58, "anchor_backed": 0},
+    }
+
+    combo = choose_combo_beam(candidates, scored, beam_width=12, policy={
+        "combo_optimizer": {"hard_sort_revenue_step": 0.50, "hard_sort_fill_step": 0.02}
+    })
+
+    combo_keys = [(item.currency, item.period) for item in combo]
+    assert ("fUST", 14) in combo_keys
+    assert ("fUSD", 14) not in combo_keys

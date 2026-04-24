@@ -121,6 +121,7 @@ def choose_combo_beam(candidates, scored, beam_width: int, policy: dict = None):
                         "currency_priority",
                         1.0 if _candidate_field(candidate, "currency") == "fUSD" else 0.0,
                     ) or 0.0),
+                    int(metrics.get("anchor_backed", 1)),
                     float(metrics.get("candidate_path_ev", 0.0) or 0.0),
                     float(metrics.get("fill_quality", 0.0) or 0.0),
                 )

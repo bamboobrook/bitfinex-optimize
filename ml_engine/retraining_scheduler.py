@@ -73,25 +73,140 @@ class RetrainingScheduler:
         self.history_log_path = os.path.join(self.log_dir, 'retraining_history.json')
         self.policy = load_system_policy()
 
+    def _get_production_model_deployed_at(self) -> Optional[datetime]:
+        """
+        获取当前生产模型部署时间（以最新 meta 文件的 mtime 近似）。
+
+        Returns:
+            最新 meta 文件时间；若生产模型不存在或无 meta 文件则返回 None。
+        """
+        if not os.path.exists(self.production_model_dir):
+            return None
+
+        try:
+            meta_files = [
+                os.path.join(self.production_model_dir, name)
+                for name in os.listdir(self.production_model_dir)
+                if name.endswith('_meta.json')
+            ]
+        except Exception:
+            return None
+
+        if not meta_files:
+            return None
+
+        newest_mtime = max(os.path.getmtime(path) for path in meta_files)
+        return datetime.fromtimestamp(newest_mtime)
+
+    def _get_production_model_age_days(self) -> int:
+        """
+        获取当前生产模型年龄（以最新 meta 文件为准）。
+
+        Returns:
+            距今的天数；若生产模型不存在或无 meta 文件，返回一个很大的值以触发重训。
+        """
+        deployed_at = self._get_production_model_deployed_at()
+        if deployed_at is None:
+            return 999
+
+        return max(0, (datetime.now() - deployed_at).days)
+
+    def _load_retraining_history_entries(self) -> List[Dict]:
+        """
+        兼容读取旧(dict keyed by date)与新(list append-only)格式的重训练历史。
+        """
+        if not os.path.exists(self.history_log_path):
+            return []
+
+        try:
+            with open(self.history_log_path, 'r') as f:
+                raw = json.load(f)
+        except Exception as e:
+            print(f"⚠️  读取训练历史失败: {e}")
+            return []
+
+        entries: List[Dict] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    entries.append(item)
+        elif isinstance(raw, dict):
+            for key, value in raw.items():
+                if not isinstance(value, dict):
+                    continue
+                item = dict(value)
+                item.setdefault('history_date', key)
+                entries.append(item)
+
+        def _entry_ts(entry: Dict) -> datetime:
+            ts_text = entry.get('timestamp')
+            if ts_text:
+                try:
+                    return datetime.strptime(ts_text, '%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    pass
+            date_text = entry.get('history_date')
+            if date_text:
+                try:
+                    return datetime.strptime(date_text, '%Y-%m-%d')
+                except Exception:
+                    pass
+            return datetime.min
+
+        entries.sort(key=_entry_ts)
+        return entries
+
     def get_last_training_date(self) -> datetime:
         """
         获取上次训练日期
 
         从重训练历史日志中读取,如果不存在则返回7天前
         """
-        if os.path.exists(self.history_log_path):
-            try:
-                with open(self.history_log_path, 'r') as f:
-                    history = json.load(f)
-                if history:
-                    # 获取最新的训练日期
-                    latest_date = max(history.keys())
-                    return datetime.strptime(latest_date, '%Y-%m-%d')
-            except Exception as e:
-                print(f"⚠️  读取训练历史失败: {e}")
+        history = self._load_retraining_history_entries()
+        if history:
+            latest = history[-1]
+            ts_text = latest.get('timestamp')
+            if ts_text:
+                try:
+                    return datetime.strptime(ts_text, '%Y-%m-%d %H:%M:%S')
+                except Exception as e:
+                    print(f"⚠️  解析训练时间失败: {e}")
+            date_text = latest.get('history_date')
+            if date_text:
+                try:
+                    return datetime.strptime(date_text, '%Y-%m-%d')
+                except Exception as e:
+                    print(f"⚠️  解析训练日期失败: {e}")
 
         # 默认返回7天前
         return datetime.now() - timedelta(days=7)
+
+    @staticmethod
+    def _effective_since_dt(days: int, since_dt: Optional[datetime] = None) -> datetime:
+        base_since = datetime.now() - timedelta(days=days)
+        if since_dt is None:
+            return base_since
+        return max(base_since, since_dt)
+
+    def _count_orders_since(self, since_dt: datetime) -> int:
+        """
+        统计某个时间点之后的订单结果数量，用于判断新模型观察样本是否足够。
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM virtual_orders
+                WHERE order_timestamp >= ?
+                  AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
+                """,
+                (since_dt.strftime('%Y-%m-%d %H:%M:%S'),)
+            )
+            row = cursor.fetchone()
+            return int(row[0] or 0) if row else 0
+        finally:
+            conn.close()
 
     def _virtual_orders_columns(self) -> List[str]:
         conn = sqlite3.connect(self.db_path)
@@ -127,12 +242,13 @@ class RetrainingScheduler:
 
         return count
 
-    def get_recent_execution_rate(self, days: int = 7) -> float:
+    def get_recent_execution_rate(self, days: int = 7, since_dt: Optional[datetime] = None) -> float:
         """
         获取近期全局成交率
 
         Args:
             days: 天数
+            since_dt: 可选起始时间；若提供，则取 max(now-days, since_dt)
 
         Returns:
             成交率 (0-1)
@@ -140,7 +256,7 @@ class RetrainingScheduler:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        since_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        since_date = self._effective_since_dt(days=days, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
 
         query = """
         SELECT
@@ -157,11 +273,15 @@ class RetrainingScheduler:
 
         total, executed = result
         if total == 0:
-            return 0.5  # 默认值
+            return 0.0  # 零订单表示无成交，不应伪装健康
 
         return executed / total
 
-    def get_per_period_execution_anomalies(self, days: int = 7) -> list:
+    def get_per_period_execution_anomalies(
+        self,
+        days: int = 7,
+        since_dt: Optional[datetime] = None
+    ) -> list:
         """
         按 currency+period 分组检查成交率异常
 
@@ -178,7 +298,7 @@ class RetrainingScheduler:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        since_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        since_date = self._effective_since_dt(days=days, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
 
         query = """
         SELECT
@@ -224,7 +344,7 @@ class RetrainingScheduler:
 
         return anomalies
 
-    def _check_market_divergence_trigger(self) -> bool:
+    def _check_market_divergence_trigger(self, since_dt: Optional[datetime] = None) -> bool:
         """
         检测多数活跃 (currency, period) 的预测利率是否系统性高于市场 2 倍以上。
         市场崩塌后 Blend Zone 和 exec_rate 滞后时的补充保险触发器。
@@ -237,7 +357,7 @@ class RetrainingScheduler:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         try:
-            since_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            since_date = self._effective_since_dt(days=7, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute("""
                 SELECT currency, period,
                        AVG(predicted_rate) as avg_pred,
@@ -270,18 +390,19 @@ class RetrainingScheduler:
             return True
         return False
 
-    def _check_zero_liquidity_anomaly(self) -> list:
+    def _check_zero_liquidity_anomaly(self, since_dt: Optional[datetime] = None) -> list:
         """检测某(currency, period)组合7天内虚拟订单极少(<2条)的情况。"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         try:
+            since_date = self._effective_since_dt(days=7, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute("""
                 SELECT currency, period, MAX(order_timestamp) as last_order, COUNT(*) as cnt
                 FROM virtual_orders
-                WHERE order_timestamp >= datetime('now', '-7 days')
+                WHERE order_timestamp >= ?
                 GROUP BY currency, period
                 HAVING cnt < 2
-            """)
+            """, (since_date,))
             return cursor.fetchall()
         finally:
             conn.close()
@@ -295,6 +416,9 @@ class RetrainingScheduler:
             "p120_step_p95_threshold": float(cfg.get("p120_step_p95_threshold", 0.05)),
             "global_exec_low": float(cfg.get("global_exec_low", 0.30)),
             "global_exec_high": float(cfg.get("global_exec_high", 0.60)),
+            "post_deploy_grace_hours": float(cfg.get("post_deploy_grace_hours", 12.0)),
+            "post_deploy_min_orders": int(cfg.get("post_deploy_min_orders", 40)),
+            "post_deploy_zero_liq_min_hours": float(cfg.get("post_deploy_zero_liq_min_hours", 24.0)),
         }
 
     def _compute_retrain_trigger_score(
@@ -407,12 +531,55 @@ class RetrainingScheduler:
         new_orders = self.count_new_execution_results(last_train_date)
         print(f"新增执行结果: {new_orders} 条")
 
-        # 条件2: 全局近期成交率
-        exec_rate_7d = self.get_recent_execution_rate(days=7)
+        th = self._trigger_thresholds()
+
+        # 定期重训练 — 双路径: 超时强制 或 常规积累
+        if time_since_last >= timedelta(days=14) and new_orders >= 20:
+            reason = f"超时强制重训练 (距上次{days_since_last}天, 新增{new_orders}条)"
+            print(f"✅ 需要重训练: {reason}")
+            return True, reason
+        if time_since_last >= timedelta(days=7) and new_orders >= 100:
+            reason = f"定期重训练 (距上次{days_since_last}天, 新增{new_orders}条数据)"
+            print(f"✅ 需要重训练: {reason}")
+            return True, reason
+
+        # 新模型部署后，质量信号只看“当前生产模型部署后的订单”，避免旧模型坏账反复触发重训。
+        deployed_at = self._get_production_model_deployed_at()
+        quality_since_dt = deployed_at
+        post_deploy_age_hours = None
+        post_deploy_orders = None
+        if deployed_at is not None:
+            post_deploy_age_hours = (datetime.now() - deployed_at).total_seconds() / 3600.0
+            post_deploy_orders = self._count_orders_since(deployed_at)
+            print(f"当前生产模型部署时间: {deployed_at.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"部署后已观察: {post_deploy_age_hours:.1f} 小时, 订单结果: {post_deploy_orders} 条")
+
+            if (
+                post_deploy_age_hours < th["post_deploy_grace_hours"] or
+                post_deploy_orders < th["post_deploy_min_orders"]
+            ):
+                reasons = []
+                if post_deploy_age_hours < th["post_deploy_grace_hours"]:
+                    reasons.append(
+                        f"观察时间不足 {post_deploy_age_hours:.1f}h < {th['post_deploy_grace_hours']:.1f}h"
+                    )
+                if post_deploy_orders < th["post_deploy_min_orders"]:
+                    reasons.append(
+                        f"部署后样本不足 {post_deploy_orders} < {th['post_deploy_min_orders']}"
+                    )
+                print("\n判断结果:")
+                print(
+                    "⏳ 暂不重训练: 当前生产模型仍在观察窗口内, "
+                    + "，".join(reasons)
+                )
+                return False, None
+
+        # 条件2: 全局近期成交率（若新模型刚部署，则仅看部署后的订单）
+        exec_rate_7d = self.get_recent_execution_rate(days=7, since_dt=quality_since_dt)
         print(f"近7天全局成交率: {exec_rate_7d:.2%}")
 
         # 条件3: 按 period 分组检查
-        period_anomalies = self.get_per_period_execution_anomalies(days=7)
+        period_anomalies = self.get_per_period_execution_anomalies(days=7, since_dt=quality_since_dt)
         if period_anomalies:
             print(f"按 period 分组异常:")
             for a in period_anomalies:
@@ -421,7 +588,7 @@ class RetrainingScheduler:
             print(f"按 period 分组: 无异常")
 
         # 条件4: 跟随误差与120d稳定性 (闭环主质量指标)
-        follow_metrics = self._get_follow_stability_metrics(days=7)
+        follow_metrics = self._get_follow_stability_metrics(days=7, since_dt=quality_since_dt)
         if follow_metrics["samples"] > 0:
             print(
                 f"跟随误差(近7天): MAE={follow_metrics['follow_mae']:.4f}, "
@@ -437,17 +604,6 @@ class RetrainingScheduler:
             print("跟随误差指标: 数据不足")
 
         print("\n判断结果:")
-        th = self._trigger_thresholds()
-
-        # 定期重训练 — 双路径: 超时强制 或 常规积累
-        if time_since_last >= timedelta(days=14) and new_orders >= 20:
-            reason = f"超时强制重训练 (距上次{days_since_last}天, 新增{new_orders}条)"
-            print(f"✅ 需要重训练: {reason}")
-            return True, reason
-        if time_since_last >= timedelta(days=7) and new_orders >= 100:
-            reason = f"定期重训练 (距上次{days_since_last}天, 新增{new_orders}条数据)"
-            print(f"✅ 需要重训练: {reason}")
-            return True, reason
 
         # 简单直接触发: 全局成交率严重异常 (优先于多信号score，不依赖样本积累)
         exec_low = th.get("global_exec_low", 0.30)
@@ -462,7 +618,7 @@ class RetrainingScheduler:
             return True, reason
 
         # 执行率快速下滑检测 (14d→7d 趋势漂移)
-        exec_rate_14d = self.get_recent_execution_rate(days=14)
+        exec_rate_14d = self.get_recent_execution_rate(days=14, since_dt=quality_since_dt)
         if exec_rate_14d is not None and exec_rate_7d is not None:
             drift = exec_rate_14d - exec_rate_7d  # 正值 = 近期恶化
             if drift > 0.15 and exec_rate_7d < exec_high:
@@ -471,12 +627,18 @@ class RetrainingScheduler:
                 return True, reason
 
         # 货币对零流动性检测
-        zero_liq = self._check_zero_liquidity_anomaly()
-        if zero_liq:
-            currencies = [(r[0], r[1]) for r in zero_liq]
-            reason = f"货币对零流动性 (7天内<2单): {currencies}"
-            print(f"⚠️  需要重训练: {reason}")
-            return True, reason
+        zero_liq_ready = (
+            deployed_at is None or
+            post_deploy_age_hours is None or
+            post_deploy_age_hours >= th["post_deploy_zero_liq_min_hours"]
+        )
+        if zero_liq_ready:
+            zero_liq = self._check_zero_liquidity_anomaly(since_dt=quality_since_dt)
+            if zero_liq:
+                currencies = [(r[0], r[1]) for r in zero_liq]
+                reason = f"货币对零流动性 (7天内<2单): {currencies}"
+                print(f"⚠️  需要重训练: {reason}")
+                return True, reason
 
         # Multi-signal trigger score (execution + follow + stability + per-period anomalies).
         trigger_score, components = self._compute_retrain_trigger_score(
@@ -547,7 +709,7 @@ class RetrainingScheduler:
                 return True, reason
 
         # 2天短窗口: 检测急剧崩溃（避免7天窗口稀释0%信号）
-        short_anomalies = self.get_per_period_execution_anomalies(days=2)
+        short_anomalies = self.get_per_period_execution_anomalies(days=2, since_dt=quality_since_dt)
         zero_rate_2d = [a for a in short_anomalies if a['exec_rate'] == 0.0 and a['total'] >= 2]
         if zero_rate_2d:
             details = ", ".join(f"{a['currency']}-{a['period']}d" for a in zero_rate_2d)
@@ -556,7 +718,7 @@ class RetrainingScheduler:
             return True, reason
 
         # 市场偏离触发: 多数 pair 预测利率系统性高于市场 2 倍（market regime change）
-        if self._check_market_divergence_trigger():
+        if zero_liq_ready and self._check_market_divergence_trigger(since_dt=quality_since_dt):
             reason = "市场偏离触发: >=50% 活跃组合预测利率高于市场中位 2 倍以上"
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
@@ -583,7 +745,11 @@ class RetrainingScheduler:
 
         return False, None
 
-    def _get_follow_stability_metrics(self, days: int = 7) -> Dict[str, float]:
+    def _get_follow_stability_metrics(
+        self,
+        days: int = 7,
+        since_dt: Optional[datetime] = None
+    ) -> Dict[str, float]:
         """
         Calculate closed-loop quality metrics from recent validated orders.
 
@@ -597,7 +763,7 @@ class RetrainingScheduler:
         columns = set(self._virtual_orders_columns())
         cursor = conn.cursor()
 
-        since_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        since_date = self._effective_since_dt(days=days, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
 
         if "market_median" not in columns:
             conn.close()
@@ -823,7 +989,7 @@ class RetrainingScheduler:
             print(f"  增强模型: {enhanced_count}/{len(enhanced_models)}")
 
             if missing_enhanced_models:
-                print(f"  ⚠️  增强模型缺失: {', '.join(missing_enhanced_models)}（核心模型完整，允许部署）")
+                print(f"  ⚠️  增强模型缺失: {', '.join(missing_enhanced_models)}（拒绝部署，避免能力回退）")
                 comparison['checks']['enhanced_models'] = False
                 comparison['checks']['enhanced_model_retention'] = False
                 comparison['missing_enhanced_models'] = missing_enhanced_models
@@ -838,7 +1004,11 @@ class RetrainingScheduler:
                 old_model_dir, new_model_dir, comparison
             )
 
-            is_better = comparison['checks']['completeness'] and performance_ok
+            is_better = (
+                comparison['checks']['completeness'] and
+                comparison['checks'].get('enhanced_models', False) and
+                performance_ok
+            )
             comparison['is_better'] = is_better
 
             if is_better:
@@ -913,12 +1083,16 @@ class RetrainingScheduler:
             if not sanity_ok:
                 all_pass = False
 
-            # Closed-loop quality gate: follow error + 120d stability.
+            # Live follow/stability is a retraining trigger signal, not a hard
+            # deploy gate for the challenger. Otherwise stale production metrics
+            # can permanently block any new model from replacing a degraded incumbent.
             follow_ok, follow_metrics = self._evaluate_follow_and_stability(days=7)
             metrics_comparison.update(follow_metrics)
             if not follow_ok:
-                print("  ❌ 跟随误差/稳定性未达标,拒绝部署")
-                all_pass = False
+                print("  ⚠️  当前线上跟随误差/稳定性未达标，仅记录告警，不阻断新模型部署")
+                comparison['checks']['live_follow_stability'] = 'warning'
+            else:
+                comparison['checks']['live_follow_stability'] = 'passed'
 
             comparison['checks']['performance'] = 'passed' if all_pass else 'degraded'
 
@@ -1271,25 +1445,14 @@ class RetrainingScheduler:
             deployed: 是否部署
             comparison: 模型对比结果
         """
-        # 加载现有历史
-        history = {}
-        if os.path.exists(self.history_log_path):
-            try:
-                with open(self.history_log_path, 'r') as f:
-                    history = json.load(f)
-            except Exception as e:
-                print(f"⚠️  Failed to read retraining history: {e}")
-                history = {}
-
-        # 添加新记录
-        date_key = datetime.now().strftime('%Y-%m-%d')
-        history[date_key] = {
+        history = self._load_retraining_history_entries()
+        history.append({
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'trigger': trigger,
             'retrained': retrained,
             'deployed': deployed,
             'comparison': comparison
-        }
+        })
 
         # 保存
         with open(self.history_log_path, 'w') as f:
@@ -1459,6 +1622,14 @@ def main():
             print(f"\n结论: 暂不需要重训练")
     else:
         # 执行完整流程
+        if not args.force:
+            should_retrain, reason = scheduler.should_retrain()
+            if not should_retrain:
+                print("\n" + "="*80)
+                print(" "*20 + "✅ 无需重训练,流程结束")
+                print("="*80)
+                raise SystemExit(0)
+
         ok = scheduler.run(force=args.force)
         raise SystemExit(0 if ok else 1)
 

@@ -220,7 +220,7 @@ class TrainingDataBuilder:
         market_data = market_data.sort_values('datetime')
         execution_results = execution_results.sort_values('order_timestamp')
 
-        # 时间对齐合并：market_data 为 LEFT（密集），execution_results 为 RIGHT（稀疏）
+        # 时间对齐合并：execution_results 为 LEFT（订单级闭环样本），market_data 为 RIGHT（历史特征）
         merge_cols = [
             'order_timestamp', 'currency', 'period', 'status',
             'predicted_rate', 'execution_confidence', 'total_score',
@@ -238,25 +238,28 @@ class TrainingDataBuilder:
                 merge_cols.append(c)
 
         merged = pd.merge_asof(
-            market_data.sort_values('datetime'),                            # 主表：市场数据（密集）
-            execution_results[merge_cols].sort_values('order_timestamp'),  # 右表：订单（稀疏）
-            left_on='datetime',
-            right_on='order_timestamp',
+            execution_results[merge_cols].sort_values('order_timestamp'),
+            market_data.sort_values('datetime'),
+            left_on='order_timestamp',
+            right_on='datetime',
             by=['currency', 'period'],
-            direction='backward',  # 只匹配过去/当前订单，防止前视偏差
+            direction='backward',
             tolerance=pd.Timedelta('2h')  # 严格限制在2小时内
         )
 
+        if 'decision_mode' in merged.columns:
+            merged = merged[merged['decision_mode'].fillna('exploit') == 'exploit'].copy()
+
         # 计算 _order_match_minutes: 订单与市场行的时间差
-        if 'order_timestamp' in merged.columns:
-            time_diff = merged['datetime'] - merged['order_timestamp']
+        if 'datetime' in merged.columns:
+            time_diff = merged['order_timestamp'] - merged['datetime']
             merged['_order_match_minutes'] = time_diff.dt.total_seconds() / 60.0
             # 无订单匹配时 order_timestamp 为 NaT → _order_match_minutes 为 NaN
         else:
             merged['_order_match_minutes'] = np.nan
 
         # _execution_label_eligible: 订单紧邻（≤30min）且非前视
-        # backward merge 保证 order_timestamp <= datetime，只需检查时间差
+        # backward merge 保证 datetime <= order_timestamp，只需检查时间差
         merged['_execution_label_eligible'] = (
             merged['_order_match_minutes'].notna() &
             (merged['_order_match_minutes'] >= 0) &
