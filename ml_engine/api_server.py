@@ -944,33 +944,25 @@ async def run_full_pipeline():
                 if stderr:
                     logger.warning(f"Retraining stderr (last 500 chars):\n{stderr[-500:]}")
 
-                if rc != 0:
+                # exit code: 0=部署成功或训练成功但未部署, 1=训练失败, 2=无需重训练
+                if rc == 0:
+                    deployed = '新模型已部署' in (stdout or '')
+                    _last_forced_retrain_time = datetime.now()
+                    save_retraining_state(_last_forced_retrain_time, reason="forced_by_pipeline")
+                    if deployed:
+                        logger.info(f"✅ Retraining completed and new models deployed")
+                    else:
+                        logger.info(f"✅ Retraining completed but models not deployed (keeping current)")
+                elif rc == 2:
+                    logger.info(f"ℹ️ Retraining check: not needed")
+                else:
+                    # rc == 1 or timeout (-1): 训练失败
                     logger.error(f"❌ Retraining failed (exit code {rc})")
-                    # 检查 stderr 中是否有具体错误信息
                     if stderr:
                         logger.error(f"Retraining error details: {stderr[-300:]}")
-                    degraded_msg = "Retraining failed or not deployed"
+                    degraded_msg = "Retraining failed"
                     pipeline_degraded_reasons.append(degraded_msg)
                     update_status("degraded", "4. Retraining Models", degraded_msg)
-                    # 不返回，继续使用现有模型生成预测
-                else:
-                    # 额外检查：即使 rc==0，stderr 中含训练框架错误也视为失败
-                    _has_training_error = stderr and any(
-                        kw in stderr for kw in (
-                            'LightGBMError', 'CatBoostError', 'XGBoostError', 'OpenCL',
-                            'ValueError', 'Invalid columns',
-                            'Traceback (most recent call last)',
-                        )
-                    )
-                    if _has_training_error:
-                        logger.error(f"❌ Retraining subprocess returned 0 but stderr contains errors: {stderr[-300:]}")
-                        degraded_msg = "Retraining emitted framework errors and was not trusted"
-                        pipeline_degraded_reasons.append(degraded_msg)
-                        update_status("degraded", "4. Retraining Models", degraded_msg)
-                    else:
-                        _last_forced_retrain_time = datetime.now()
-                        save_retraining_state(_last_forced_retrain_time, reason="forced_by_pipeline")
-                        logger.info(f"✅ Retraining completed successfully")
 
             except Exception as e:
                 logger.error(f"❌ Retraining system error: {e}")
@@ -1554,27 +1546,25 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
             if stderr_text:
                 logger.warning(f"Retraining stderr (last 500 chars):\n{stderr_text[-500:]}")
 
-            if rc != 0:
+            # exit code: 0=部署成功或训练成功但未部署, 1=训练失败, 2=无需重训练
+            if rc == 1:
                 err_msg = stderr_text or stdout_text or "Retraining failed"
                 logger.error(f"❌ Closed-loop retraining failed: {err_msg}")
-                update_status("degraded", "Closed-Loop Retraining", f"Failed or not deployed: {err_msg[-200:]}")
+                update_status("degraded", "Closed-Loop Retraining", f"Training failed: {err_msg[-200:]}")
+            elif rc == 2:
+                logger.info(f"ℹ️ Closed-loop retraining: not needed")
+                update_status("online", "Idle", f"Retraining not needed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             else:
-                _has_training_error = stderr_text and any(
-                    kw in stderr_text for kw in (
-                        'LightGBMError', 'CatBoostError', 'XGBoostError', 'OpenCL',
-                        'ValueError', 'Invalid columns',
-                        'Traceback (most recent call last)',
-                    )
-                )
-                if _has_training_error:
-                    logger.error(f"❌ Closed-loop retraining returned 0 but stderr contains errors: {stderr_text[-300:]}")
-                    update_status("degraded", "Closed-Loop Retraining", "Failed or not deployed: stderr indicates training errors")
+                # rc == 0: 训练成功（可能部署也可能未部署）
+                deployed = '新模型已部署' in (stdout_text or '')
+                if force:
+                    _last_forced_retrain_time = datetime.now()
+                    save_retraining_state(_last_forced_retrain_time, reason="manual_force")
+                if deployed:
+                    logger.info("✅ Closed-loop retraining completed and new models deployed")
                 else:
-                    if force:
-                        _last_forced_retrain_time = datetime.now()
-                        save_retraining_state(_last_forced_retrain_time, reason="manual_force")
-                    logger.info("✅ Closed-loop retraining completed successfully")
-                    update_status("online", "Idle", f"Retraining completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    logger.info("✅ Closed-loop retraining completed but models not deployed (keeping current)")
+                update_status("online", "Idle", f"Retraining completed at {datetime.now().strftime('%Y-%m-%d:%S')}")
 
         except Exception as e:
             logger.error(f"❌ Retraining task error: {e}")

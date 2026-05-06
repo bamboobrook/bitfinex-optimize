@@ -309,10 +309,15 @@ class TrainingDataBuilder:
         has_data_quality = 'data_quality_label' in df.columns
         has_eligible = '_execution_label_eligible' in df.columns
 
+        # _exploit_quality: 筛选"决策质量高"的样本供 v2 模型训练
+        # data_quality_label 衡量的是执行结果的可信度（STRONG=直接成交验证, WEAK_PROXY=代理估算），
+        # 而非决策时的数据质量。FAILED 订单的执行结果是 WEAK_PROXY，但决策本身（exploit 模式）
+        # 是高质量的，应纳入 v2 训练以提供正负样本平衡。
+        # 排除 CENSORED（无市场数据，决策本身不可靠）。
         if has_decision_mode and has_data_quality and has_eligible:
             df['_exploit_quality'] = (
                 (df['decision_mode'] == 'exploit') &
-                (df['data_quality_label'] == 'STRONG') &
+                (df['data_quality_label'] != 'CENSORED') &
                 df['_execution_label_eligible']
             )
         elif has_eligible:

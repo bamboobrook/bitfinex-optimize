@@ -879,7 +879,7 @@ class RetrainingScheduler:
 
             # 训练所有模型
             # 使用完整历史数据 (从2025-01-01开始)
-            start_date = '2025-01-01'
+            start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')  # 最近6个月
             end_date = datetime.now().strftime('%Y-%m-%d')
 
             print(f"\n训练数据范围: {start_date} 至 {end_date}")
@@ -976,27 +976,35 @@ class RetrainingScheduler:
 
             enhanced_count = 0
             missing_enhanced_models = []
+            retained_count = 0
             for model_prefix in enhanced_models:
                 old_meta_file = os.path.join(old_model_dir, f"{model_prefix}_meta.json")
                 new_meta_file = os.path.join(new_model_dir, f"{model_prefix}_meta.json")
 
                 if os.path.exists(new_meta_file):
                     enhanced_count += 1
-
-                if not os.path.exists(new_meta_file):
+                elif os.path.exists(old_meta_file):
+                    # 旧模型有但新模型没有 → 能力回退，拒绝部署
                     missing_enhanced_models.append(model_prefix)
+                # 旧模型也没有 → 不算回退，新模型没有是正常的
 
-            print(f"  增强模型: {enhanced_count}/{len(enhanced_models)}")
+                if os.path.exists(old_meta_file) and os.path.exists(new_meta_file):
+                    retained_count += 1
+
+            print(f"  增强模型: {enhanced_count}/{len(enhanced_models)} (旧模型保留: {retained_count})")
 
             if missing_enhanced_models:
-                print(f"  ⚠️  增强模型缺失: {', '.join(missing_enhanced_models)}（拒绝部署，避免能力回退）")
+                print(f"  ⚠️  增强模型回退: {', '.join(missing_enhanced_models)}（旧模型有但新模型缺失，拒绝部署）")
                 comparison['checks']['enhanced_models'] = False
                 comparison['checks']['enhanced_model_retention'] = False
                 comparison['missing_enhanced_models'] = missing_enhanced_models
             else:
                 comparison['checks']['enhanced_model_retention'] = True
-                comparison['checks']['enhanced_models'] = True
-                print(f"  ✅ 增强模型完整")
+                comparison['checks']['enhanced_models'] = enhanced_count > 0 or not any(
+                    os.path.exists(os.path.join(old_model_dir, f"{p}_meta.json"))
+                    for p in enhanced_models
+                )
+                print(f"  ✅ 增强模型检查通过（无回退）")
 
             # 检查3: 实际性能对比 (S2 核心修复)
             print("\n检查3: 模型性能对比 (验证集)")
@@ -1413,14 +1421,30 @@ class RetrainingScheduler:
             if not self.backup_production_models():
                 print("⚠️  备份失败,但继续部署")
 
-            # 删除旧模型
-            if os.path.exists(self.production_model_dir):
-                print(f"删除旧模型: {self.production_model_dir}")
-                shutil.rmtree(self.production_model_dir)
+            prod_dir = self.production_model_dir
 
-            # 复制新模型
-            print(f"复制新模型: {new_model_dir} -> {self.production_model_dir}")
-            shutil.copytree(new_model_dir, self.production_model_dir)
+            # 合并部署：保留旧模型中存在但新模型中未重新训练的增强模型
+            enhanced_suffixes = ['_v2_', '_revenue_optimized_']
+            retained_files = []
+            if os.path.exists(prod_dir):
+                for fname in os.listdir(prod_dir):
+                    src_path = os.path.join(prod_dir, fname)
+                    dst_path = os.path.join(new_model_dir, fname)
+                    if not os.path.exists(dst_path) and os.path.isfile(src_path):
+                        if any(s in fname for s in enhanced_suffixes):
+                            shutil.copy2(src_path, dst_path)
+                            retained_files.append(fname)
+
+                # 删除旧模型
+                print(f"删除旧模型: {prod_dir}")
+                shutil.rmtree(prod_dir)
+
+            # 复制新模型（含保留的增强模型）
+            print(f"复制新模型: {new_model_dir} -> {prod_dir}")
+            shutil.copytree(new_model_dir, prod_dir)
+
+            if retained_files:
+                print(f"  📎 保留旧增强模型: {', '.join(retained_files)}")
 
             print("✅ 部署成功")
             return True
@@ -1510,7 +1534,7 @@ class RetrainingScheduler:
 
         print("🧹 清理完成")
 
-    def run(self, force: bool = False) -> bool:
+    def run(self, force: bool = False) -> str:
         """
         执行完整的重训练流程
 
@@ -1518,7 +1542,7 @@ class RetrainingScheduler:
             force: 是否强制重训练(忽略判断条件)
 
         Returns:
-            是否成功部署新模型
+            状态码: 'deployed' | 'trained_not_deployed' | 'trained_not_better' | 'not_needed' | 'train_failed'
         """
         print("\n" + "="*80)
         print(" "*20 + "🔄 定期重训练调度器")
@@ -1532,7 +1556,7 @@ class RetrainingScheduler:
                 print("\n" + "="*80)
                 print(" "*20 + "✅ 无需重训练,流程结束")
                 print("="*80)
-                return False
+                return 'not_needed'
         else:
             reason = "强制重训练"
             print(f"\n⚠️  {reason}")
@@ -1551,7 +1575,7 @@ class RetrainingScheduler:
             print(" "*20 + "❌ 重训练失败,流程结束")
             print("="*80)
             self.cleanup_old_artifacts(retrained_dir)
-            return False
+            return 'train_failed'
 
         # Step 3: 对比新旧模型
         is_better, comparison = self.compare_models(
@@ -1575,13 +1599,13 @@ class RetrainingScheduler:
                 print(" "*20 + "✅ 新模型已部署到生产环境")
                 print("="*80)
                 self.cleanup_old_artifacts(retrained_dir)
-                return True
+                return 'deployed'
             else:
                 print("\n" + "="*80)
                 print(" "*20 + "⚠️  部署失败,保持现有模型")
                 print("="*80)
                 self.cleanup_old_artifacts(retrained_dir)
-                return False
+                return 'trained_not_deployed'
         else:
             self.log_retraining_event(
                 trigger=reason,
@@ -1594,7 +1618,7 @@ class RetrainingScheduler:
             print(" "*20 + "⚠️  新模型未达标,保持现有模型")
             print("="*80)
             self.cleanup_old_artifacts(retrained_dir)
-            return False
+            return 'trained_not_better'
 
 
 def main():
@@ -1631,7 +1655,16 @@ def main():
                 raise SystemExit(0)
 
         ok = scheduler.run(force=args.force)
-        raise SystemExit(0 if ok else 1)
+        # exit code: 0=部署成功或训练成功但未部署, 1=训练失败, 2=无需重训练
+        exit_code = {
+            'deployed': 0,
+            'trained_not_deployed': 0,
+            'trained_not_better': 0,
+            'not_needed': 2,
+            'train_failed': 1,
+        }.get(ok, 1)
+        print(f"\n重训练结果: {ok} (exit code: {exit_code})")
+        raise SystemExit(exit_code)
 
 
 if __name__ == '__main__':
