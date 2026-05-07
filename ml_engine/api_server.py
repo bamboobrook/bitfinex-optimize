@@ -644,7 +644,7 @@ def run_all_validation_tests():
 
 # Subprocess timeout constants
 TIMEOUT_DOWNLOAD = 600    # 10 minutes (--days 30 incremental is fast)
-TIMEOUT_TRAIN = 1800      # 30 minutes (6 models × 5 min)
+TIMEOUT_TRAIN = 2400      # 40 minutes (6 models × 5 min + v2 models + buffer)
 TIMEOUT_PREDICT = 600     # 10 minutes (56 tasks + 24 order creations)
 TIMEOUT_VALIDATE = 300    # 5 minutes
 TIMEOUT_ORDERS = 300      # 5 minutes
@@ -673,8 +673,23 @@ def _build_subprocess_env():
     return env
 
 
-def _check_db_data_freshness(fUSD_max: int = 240, fUST_max: int = 1440) -> bool:
+def _check_db_data_freshness(fUSD_max: int = None, fUST_max: int = None) -> bool:
     """Check if funding_rates has fresh data for at least one currency. Returns True if any currency is fresh."""
+    # Read thresholds from system_policy.json, fall back to hardcoded defaults
+    _auto = {}
+    try:
+        from ml_engine.system_policy import load_system_policy
+        _policy = load_system_policy()
+        _auto = _policy.get("automation", {})
+        if fUSD_max is None:
+            fUSD_max = int(_auto.get("stale_data_hard_minutes", 300))
+        if fUST_max is None:
+            fUST_max = int(_auto.get("stale_data_hard_minutes_fUST", _auto.get("stale_data_hard_minutes", 900)))
+    except Exception:
+        if fUSD_max is None:
+            fUSD_max = 300
+        if fUST_max is None:
+            fUST_max = 900
     try:
         import sqlite3 as _sqlite3
         from datetime import datetime as _dt
@@ -708,6 +723,8 @@ def _check_db_data_freshness(fUSD_max: int = 240, fUST_max: int = 1440) -> bool:
                 logger.info(f"✅ {currency} data is fresh (age={age_minutes:.0f}min <= {max_age}min)")
                 any_fresh = True
         # 修复4: fUST 长周期 per-period 诊断（流动性枯竭预警）
+        _fust_tier = _auto.get("stale_data_hard_minutes_fUST_by_period_tier", {})
+        _fust_long_threshold = int(_fust_tier.get("long", 10080))
         for period in [30, 60, 90]:
             cursor.execute("SELECT MAX(timestamp) FROM funding_rates WHERE currency='fUST' AND period=?", (period,))
             p_row = cursor.fetchone()
@@ -718,9 +735,11 @@ def _check_db_data_freshness(fUSD_max: int = 240, fUST_max: int = 1440) -> bool:
                 else:
                     p_dt = _dt.fromtimestamp(p_ts)
                 p_age = (_dt.now() - p_dt).total_seconds() / 60
-                if p_age > 900:
-                    logger.warning(f"  WARN: fUST-{period} is {p_age:.0f}min old (>900min, possible liquidity drought)")
+                if p_age > _fust_long_threshold:
+                    logger.warning(f"  WARN: fUST-{period} is {p_age:.0f}min old (>{_fust_long_threshold}min, possible liquidity drought)")
         # 优化3: fUSD 长周期 per-period 诊断（数据源异常预警）
+        _fusd_tier = _auto.get("stale_data_hard_minutes_by_period_tier", {})
+        _fusd_warn_threshold = int(_fusd_tier.get("long", 1440))
         for period in [15, 20, 60, 90, 120]:
             cursor.execute("SELECT MAX(timestamp) FROM funding_rates WHERE currency='fUSD' AND period=?", (period,))
             p_row = cursor.fetchone()
@@ -731,8 +750,8 @@ def _check_db_data_freshness(fUSD_max: int = 240, fUST_max: int = 1440) -> bool:
                 else:
                     p_dt = _dt.fromtimestamp(p_ts)
                 p_age = (_dt.now() - p_dt).total_seconds() / 60
-                if p_age > 300:
-                    logger.warning(f"  WARN: fUSD-{period} is {p_age:.0f}min old (>300min, check Bitfinex data supply)")
+                if p_age > _fusd_warn_threshold:
+                    logger.warning(f"  WARN: fUSD-{period} is {p_age:.0f}min old (>{_fusd_warn_threshold}min, check Bitfinex data supply)")
         conn.close()
         return any_fresh
     except Exception as e:
@@ -958,9 +977,22 @@ async def run_full_pipeline():
                 else:
                     # rc == 1 or timeout (-1): 训练失败
                     logger.error(f"❌ Retraining failed (exit code {rc})")
-                    if stderr:
-                        logger.error(f"Retraining error details: {stderr[-300:]}")
-                    degraded_msg = "Retraining failed"
+                    # Extract meaningful error: prefer stdout error lines, filter normal stderr noise
+                    err_detail = ""
+                    if stdout:
+                        for line in reversed(stdout.splitlines()):
+                            if '❌' in line or '失败' in line or 'ERROR' in line or 'Traceback' in line:
+                                err_detail = line.strip()
+                                break
+                    if not err_detail and stderr:
+                        noise_patterns = ['Capping', 'extreme', 'percentile', 'UserWarning', 'FutureWarning']
+                        stderr_lines = [l.strip() for l in stderr.splitlines()
+                                        if l.strip() and not any(p in l for p in noise_patterns)]
+                        if stderr_lines:
+                            err_detail = stderr_lines[-1]
+                    if err_detail:
+                        logger.error(f"Retraining error details: {err_detail}")
+                    degraded_msg = f"Retraining failed (rc={rc})"
                     pipeline_degraded_reasons.append(degraded_msg)
                     update_status("degraded", "4. Retraining Models", degraded_msg)
 
@@ -1548,7 +1580,20 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
 
             # exit code: 0=部署成功或训练成功但未部署, 1=训练失败, 2=无需重训练
             if rc == 1:
-                err_msg = stderr_text or stdout_text or "Retraining failed"
+                # Extract meaningful error: prefer stdout error lines, filter normal stderr noise
+                err_detail = ""
+                if stdout_text:
+                    for line in reversed(stdout_text.splitlines()):
+                        if '❌' in line or '失败' in line or 'ERROR' in line or 'Traceback' in line:
+                            err_detail = line.strip()
+                            break
+                if not err_detail and stderr_text:
+                    noise_patterns = ['Capping', 'extreme', 'percentile', 'UserWarning', 'FutureWarning']
+                    stderr_lines = [l.strip() for l in stderr_text.splitlines()
+                                    if l.strip() and not any(p in l for p in noise_patterns)]
+                    if stderr_lines:
+                        err_detail = stderr_lines[-1]
+                err_msg = err_detail or "Retraining failed"
                 logger.error(f"❌ Closed-loop retraining failed: {err_msg}")
                 update_status("degraded", "Closed-Loop Retraining", f"Training failed: {err_msg[-200:]}")
             elif rc == 2:

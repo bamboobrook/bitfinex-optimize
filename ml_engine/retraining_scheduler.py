@@ -878,8 +878,8 @@ class RetrainingScheduler:
             )
 
             # 训练所有模型
-            # 使用完整历史数据 (从2025-01-01开始)
-            start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')  # 最近6个月
+            # 使用动态训练窗口：90天（3个月数据足够训练，且避免超时）
+            start_date = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')  # 最近3个月
             end_date = datetime.now().strftime('%Y-%m-%d')
 
             print(f"\n训练数据范围: {start_date} 至 {end_date}")

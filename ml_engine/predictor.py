@@ -489,15 +489,27 @@ class EnsemblePredictor:
     def _freshness_thresholds_minutes(self, currency: str = "", period: int = 0) -> Tuple[float, float]:
         warn_minutes = float(self._policy_value("automation", "stale_data_warn_minutes", 60))
         hard_minutes = float(self._policy_value("automation", "stale_data_hard_minutes", 120))
-        # fUST has naturally sparse market data (often 4-24h gaps) - use a per-currency override
-        if currency:
+        # fUST has naturally sparse market data (often 4-24h gaps) - use per-currency overrides
+        is_fust = currency.upper() == "FUST"
+        if is_fust:
+            per_cur_warn = self._policy_value("automation", "stale_data_warn_minutes_fUST", None)
+            if per_cur_warn is not None:
+                warn_minutes = float(per_cur_warn)
+            per_cur_hard = self._policy_value("automation", "stale_data_hard_minutes_fUST", None)
+            if per_cur_hard is not None:
+                hard_minutes = float(per_cur_hard)
+        elif currency:
             per_cur_key = f"stale_data_hard_minutes_{currency}"
             per_cur_hard = self._policy_value("automation", per_cur_key, None)
             if per_cur_hard is not None:
                 hard_minutes = float(per_cur_hard)
         # Period-tier override: long periods have sparser data on Bitfinex
         if period > 0:
-            tier_config = self._policy_value("automation", "stale_data_hard_minutes_by_period_tier", None)
+            if is_fust:
+                tier_key = "stale_data_hard_minutes_fUST_by_period_tier"
+                tier_config = self._policy_value("automation", tier_key, None)
+            else:
+                tier_config = self._policy_value("automation", "stale_data_hard_minutes_by_period_tier", None)
             if tier_config:
                 if period >= 30:
                     tier_hard = tier_config.get("long")
