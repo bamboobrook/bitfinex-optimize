@@ -926,10 +926,20 @@ async def run_full_pipeline():
                     should_retrain = True
                     logger.info(f"✅ Retraining trigger detected (bypass_cooldown=True): {stdout[-300:]}")
                 else:
-                    # 紧急重训练(单period异常)冷却6h，普通重训练冷却24h
+                    # 紧急重训练(单period异常)冷却6h
+                    # 全局成交率过低(exec<30%)冷却12h（比普通24h更短，但比紧急6h保守）
+                    # 普通重训练冷却24h
                     is_urgent = "紧急重训练" in stdout
-                    cooldown = timedelta(hours=6) if is_urgent else timedelta(hours=24)
-                    cooldown_label = "6h" if is_urgent else "24h"
+                    is_exec_low = "全局成交率过低" in stdout
+                    if is_urgent:
+                        cooldown = timedelta(hours=6)
+                        cooldown_label = "6h"
+                    elif is_exec_low:
+                        cooldown = timedelta(hours=12)
+                        cooldown_label = "12h"
+                    else:
+                        cooldown = timedelta(hours=24)
+                        cooldown_label = "24h"
 
                     # Fix6: 每次从磁盘重新读取，而非依赖内存变量（重启后状态也能正确加载）
                     _disk_state = load_retraining_state()

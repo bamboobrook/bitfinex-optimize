@@ -513,6 +513,10 @@ class EnsemblePredictor:
             if tier_config:
                 if period >= 30:
                     tier_hard = tier_config.get("long")
+                elif period >= 10:
+                    # fUST period 10-20: Bitfinex data is naturally sparse (1-2 day gaps)
+                    # Use sparse_medium tier if available, else medium
+                    tier_hard = tier_config.get("sparse_medium", tier_config.get("medium"))
                 elif period >= 6:
                     tier_hard = tier_config.get("medium")
                 else:
