@@ -2,6 +2,10 @@
 /log
 .env
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Local secrets (never commit real tokens/keys)
 .env.*
 !.env.example

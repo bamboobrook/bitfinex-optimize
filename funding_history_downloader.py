@@ -63,13 +63,18 @@ class BitfinexDataDownloader:
         now_ms = int(datetime.now().timestamp() * 1000)
         return max(0.0, (now_ms - latest_ts) / 60000.0)
 
-    def freshness_target_minutes(self, currency: str) -> int:
-        """
-        与 predictor 的硬阈值对齐:
-        - fUSD: 300 分钟
-        - fUST: 900 分钟
-        """
-        return 900 if currency == 'fUST' else 300
+    def freshness_target_minutes(self, currency: str, period: int = 0) -> int:
+        """与predictor的period-tier阈值对齐，减少误导性stale报告"""
+        if currency == 'fUST':
+            if period >= 30: return 10080   # long tier
+            elif period >= 10: return 2880  # sparse_medium tier
+            elif period >= 6: return 1440   # medium tier
+            else: return 900                # short tier
+        else:
+            if period >= 30: return 1440    # long tier
+            elif period >= 10: return 720   # medium tier
+            elif period >= 6: return 720    # medium tier
+            else: return 300                # short tier
     
     def init_database(self):
         """初始化数据库和表结构"""
@@ -457,7 +462,7 @@ class BitfinexDataDownloader:
 
             start_ts = int(start_time.timestamp() * 1000)
             end_ts = int(end_time.timestamp() * 1000)
-            freshness_target = self.freshness_target_minutes(currency)
+            freshness_target = self.freshness_target_minutes(currency, period)
             before_latest_ts = self.get_latest_timestamp(currency, period)
 
             logger.info(f"    Requested time range: {start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')}")
@@ -693,12 +698,13 @@ class BitfinexDataDownloader:
                     result = self.cursor.fetchone()
                     if result and result[0]:
                         latest_dt = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
-                        age_hours = (datetime.now() - latest_dt).total_seconds() / 3600
-                        if age_hours > 4:
-                            logger.warning(f"  STALE: {currency}-{period}d latest data is {age_hours:.1f}h old ({result[0]})")
+                        age_minutes = (datetime.now() - latest_dt).total_seconds() / 60
+                        threshold = self.freshness_target_minutes(currency, period)
+                        if age_minutes > threshold:
+                            logger.warning(f"  STALE: {currency}-{period}d latest data is {age_minutes:.0f}m old (threshold: {threshold}m) ({result[0]})")
                             stale_count += 1
                         else:
-                            logger.info(f"  OK: {currency}-{period}d latest: {result[0]} ({age_hours:.1f}h ago)")
+                            logger.info(f"  OK: {currency}-{period}d latest: {result[0]} ({age_minutes:.0f}m ago, threshold: {threshold}m)")
                     else:
                         logger.warning(f"  MISSING: {currency}-{period}d has no data")
                         stale_count += 1
