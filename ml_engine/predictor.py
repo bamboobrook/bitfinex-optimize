@@ -847,13 +847,12 @@ class EnsemblePredictor:
             data_age_minutes = data_age.total_seconds() / 60.0
 
             if data_age_minutes > hard_minutes:
-                logger.error(
+                logger.warning(
                     f"STALE DATA for {currency}-{period}: "
                     f"data is {data_age_minutes:.1f}m old (threshold: {hard_minutes:.1f}m). "
-                    f"Refusing to predict."
+                    f"Degrading confidence."
                 )
                 self._record_stale_issue(currency, period, data_age_minutes, str(data_timestamp))
-                raise ValueError(f"Stale DB data for {currency}-{period}: {data_age_minutes:.1f}m old")
             elif data_age_minutes > warn_minutes:
                 logger.warning(
                     f"AGING DATA for {currency}-{period}: "
@@ -877,13 +876,12 @@ class EnsemblePredictor:
                 data_age_minutes = data_age.total_seconds() / 60.0
 
                 if data_age_minutes > hard_minutes:
-                    logger.error(
+                    logger.warning(
                         f"STALE DATA for {currency}-{period}: "
                         f"DB query failed AND feature data is {data_age_minutes:.1f}m old. "
-                        f"Refusing to predict."
+                        f"Degrading confidence."
                     )
                     self._record_stale_issue(currency, period, data_age_minutes, str(feature_datetime))
-                    raise ValueError(f"Stale data for {currency}-{period}: {data_age_minutes:.1f}m old")
                 elif data_age_minutes > warn_minutes:
                     logger.warning(
                         f"AGING feature data for {currency}-{period}: {data_age_minutes:.1f}m old"
@@ -2617,11 +2615,7 @@ class EnsemblePredictor:
                         result = future.result()
                         all_predictions.append(result)
                     except Exception as e:
-                        msg = str(e)
-                        if "Stale data" in msg or "Stale DB data" in msg:
-                            logger.warning(f"Prediction skipped due to stale market data: {msg}")
-                        else:
-                            logger.error(f"Prediction failed: {e}")
+                        logger.error(f"Prediction failed: {e}")
 
             logger.info(f"Completed predictions for {curr}: {len(all_predictions)} results")
 

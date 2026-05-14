@@ -797,7 +797,7 @@ def _is_partial_download_with_stale(stdout: str, stderr: str, rc: int) -> bool:
 
 async def _download_with_retry(cwd, max_retries=3):
     """Download with exponential backoff retry. Partial stale refresh should not block pipeline."""
-    download_cmd = ["python", "-m", "funding_history_downloader", "--days", "30"]
+    download_cmd = [sys.executable, "-m", "funding_history_downloader", "--days", "30"]
     for attempt in range(max_retries):
         stdout, stderr, rc = await _run_subprocess_with_timeout(
             download_cmd, cwd, TIMEOUT_DOWNLOAD, "Data Download"
@@ -888,7 +888,7 @@ async def run_full_pipeline():
 
         try:
             stdout, stderr, rc = await _run_subprocess_with_timeout(
-                ["python", str(BASE_DIR / "ml_engine" / "execution_validator.py")],
+                [sys.executable, str(BASE_DIR / "ml_engine" / "execution_validator.py")],
                 BASE_DIR, TIMEOUT_VALIDATE, "Order Validation"
             )
             if rc != 0:
@@ -907,7 +907,7 @@ async def run_full_pipeline():
         should_retrain = False
         try:
             stdout, stderr, rc = await _run_subprocess_with_timeout(
-                ["python", str(BASE_DIR / "ml_engine" / "retraining_scheduler.py"), "--dry-run"],
+                [sys.executable, str(BASE_DIR / "ml_engine" / "retraining_scheduler.py"), "--dry-run"],
                 BASE_DIR, TIMEOUT_VALIDATE, "Retraining Check"
             )
 
@@ -964,7 +964,7 @@ async def run_full_pipeline():
 
             try:
                 stdout, stderr, rc = await _run_subprocess_with_timeout(
-                    ["python", str(BASE_DIR / "ml_engine" / "retraining_scheduler.py"), "--force"],
+                    [sys.executable, str(BASE_DIR / "ml_engine" / "retraining_scheduler.py"), "--force"],
                     BASE_DIR, TIMEOUT_TRAIN, "Model Retraining"
                 )
 
@@ -1022,7 +1022,7 @@ async def run_full_pipeline():
 
         try:
             stdout, stderr, rc = await _run_subprocess_with_timeout(
-                ["python", "-m", "ml_engine.predictor"],
+                [sys.executable, "-m", "ml_engine.predictor"],
                 BASE_DIR, TIMEOUT_PREDICT, "Prediction"
             )
 
@@ -1328,7 +1328,7 @@ async def trigger_download(background_tasks: BackgroundTasks):
 
         try:
             process = await asyncio.create_subprocess_exec(
-                "python", "-m", "funding_history_downloader",
+                sys.executable, "-m", "funding_history_downloader",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(BASE_DIR),
@@ -1374,7 +1374,7 @@ async def trigger_feature_processing(background_tasks: BackgroundTasks):
 
         try:
             process = await asyncio.create_subprocess_exec(
-                "python", "-m", "ml_engine.data_processor",
+                sys.executable, "-m", "ml_engine.data_processor",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(BASE_DIR),
@@ -1420,7 +1420,7 @@ async def trigger_training(background_tasks: BackgroundTasks):
 
         try:
             process = await asyncio.create_subprocess_exec(
-                "python", "-m", "ml_engine.model_trainer",
+                sys.executable, "-m", "ml_engine.model_trainer",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(BASE_DIR),
@@ -1466,7 +1466,7 @@ async def trigger_prediction(background_tasks: BackgroundTasks):
 
         try:
             process = await asyncio.create_subprocess_exec(
-                "python", "-m", "ml_engine.predictor",
+                sys.executable, "-m", "ml_engine.predictor",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(BASE_DIR),
@@ -1517,7 +1517,7 @@ async def trigger_order_validation(background_tasks: BackgroundTasks):
 
         try:
             process = await asyncio.create_subprocess_exec(
-                "python", str(BASE_DIR / "ml_engine" / "execution_validator.py"),
+                sys.executable, str(BASE_DIR / "ml_engine" / "execution_validator.py"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(BASE_DIR),
@@ -1575,7 +1575,7 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
 
         try:
             # 构建命令
-            cmd = ["python", str(BASE_DIR / "ml_engine" / "retraining_scheduler.py")]
+            cmd = [sys.executable, str(BASE_DIR / "ml_engine" / "retraining_scheduler.py")]
             if force:
                 cmd.append("--force")
 
