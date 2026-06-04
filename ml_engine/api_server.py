@@ -644,7 +644,7 @@ def run_all_validation_tests():
 
 # Subprocess timeout constants
 TIMEOUT_DOWNLOAD = 600    # 10 minutes (--days 30 incremental is fast)
-TIMEOUT_TRAIN = 2400      # 40 minutes (6 models × 5 min + v2 models + buffer)
+TIMEOUT_TRAIN = 3000      # 50 minutes (12 models × 2.5 min + v2 models + compare + buffer)
 TIMEOUT_PREDICT = 600     # 10 minutes (56 tasks + 24 order creations)
 TIMEOUT_VALIDATE = 300    # 5 minutes
 TIMEOUT_ORDERS = 300      # 5 minutes
@@ -911,8 +911,9 @@ async def run_full_pipeline():
                 BASE_DIR, TIMEOUT_VALIDATE, "Retraining Check"
             )
 
-            # 检查输出中是否包含"需要重训练"
-            if "需要重训练" in stdout:
+            # 检查输出中是否包含实际触发信号（排除标题"🔍 检查是否需要重训练"的误匹配）
+            # 方案B: 匹配实际触发行前缀 "⚠️  需要重训练" 或 "✅ 需要重训练"
+            if "⚠️  需要重训练" in stdout or "✅ 需要重训练" in stdout:
                 # 极端低流动性（exec_rate < 10%）：绕过冷却强制重训
                 _bypass_cooldown = False
                 if "全局成交率过低" in stdout:
