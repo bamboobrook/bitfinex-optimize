@@ -22,6 +22,7 @@ from sklearn.model_selection import TimeSeriesSplit
 import warnings
 warnings.filterwarnings('ignore')
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from training_data_builder import TrainingDataBuilder
 
 
@@ -515,44 +516,54 @@ class EnhancedModelTrainer:
         models = {}
         scores = {}
 
-        # 训练三个模型 (传入 sample_weight)
-        if task_type == 'regression':
-            # XGBoost
-            models['xgb'], scores['xgb'] = self.train_xgboost_regression(
-                X_train, y_train, X_val, y_val, sample_weight=w_train
-            )
-            print(f"  XGBoost MAE: {scores['xgb']:.6f}")
+        # 训练三个模型 (P1: 并行训练 XGBoost/LightGBM/CatBoost)
+        def _train_xgb():
+            if task_type == 'regression':
+                m, s = self.train_xgboost_regression(X_train, y_train, X_val, y_val, sample_weight=w_train)
+                print(f"  XGBoost MAE: {s:.6f}")
+            else:
+                m, s = self.train_xgboost_classification(X_train, y_train, X_val, y_val, sample_weight=w_train)
+                print(f"  XGBoost AUC: {s:.6f}")
+            return 'xgb', m, s
 
-            # LightGBM
-            models['lgb'], scores['lgb'] = self.train_lightgbm_regression(
-                X_train, y_train, X_val, y_val, sample_weight=w_train
-            )
-            print(f"  LightGBM MAE: {scores['lgb']:.6f}")
+        def _train_lgb():
+            if task_type == 'regression':
+                m, s = self.train_lightgbm_regression(X_train, y_train, X_val, y_val, sample_weight=w_train)
+                print(f"  LightGBM MAE: {s:.6f}")
+            else:
+                m, s = self.train_lightgbm_classification(X_train, y_train, X_val, y_val, sample_weight=w_train)
+                print(f"  LightGBM AUC: {s:.6f}")
+            return 'lgb', m, s
 
-            # CatBoost
-            models['cat'], scores['cat'] = self.train_catboost_regression(
-                X_train, y_train, X_val, y_val, sample_weight=w_train
-            )
-            print(f"  CatBoost MAE: {scores['cat']:.6f}")
+        def _train_cat():
+            if task_type == 'regression':
+                m, s = self.train_catboost_regression(X_train, y_train, X_val, y_val, sample_weight=w_train)
+                print(f"  CatBoost MAE: {s:.6f}")
+            else:
+                m, s = self.train_catboost_classification(X_train, y_train, X_val, y_val, sample_weight=w_train)
+                print(f"  CatBoost AUC: {s:.6f}")
+            return 'cat', m, s
 
-        else:  # classification
-            # XGBoost
-            models['xgb'], scores['xgb'] = self.train_xgboost_classification(
-                X_train, y_train, X_val, y_val, sample_weight=w_train
-            )
-            print(f"  XGBoost AUC: {scores['xgb']:.6f}")
-
-            # LightGBM
-            models['lgb'], scores['lgb'] = self.train_lightgbm_classification(
-                X_train, y_train, X_val, y_val, sample_weight=w_train
-            )
-            print(f"  LightGBM AUC: {scores['lgb']:.6f}")
-
-            # CatBoost
-            models['cat'], scores['cat'] = self.train_catboost_classification(
-                X_train, y_train, X_val, y_val, sample_weight=w_train
-            )
-            print(f"  CatBoost AUC: {scores['cat']:.6f}")
+        # 并行执行三个模型的训练
+        try:
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {
+                    executor.submit(_train_xgb): 'xgb',
+                    executor.submit(_train_lgb): 'lgb',
+                    executor.submit(_train_cat): 'cat',
+                }
+                for future in as_completed(futures):
+                    name, model, score = future.result()
+                    models[name] = model
+                    scores[name] = score
+        except Exception as e:
+            print(f"⚠️  并行训练失败,回退到串行: {e}")
+            # 回退: 串行训练
+            for fn in [_train_xgb, _train_lgb, _train_cat]:
+                name, model, score = fn()
+                if name not in models:
+                    models[name] = model
+                    scores[name] = score
 
         # 计算集成权重
         if task_type == 'regression':
@@ -634,6 +645,20 @@ class EnhancedModelTrainer:
         _t_prep = _time_all.time()
         df = self.prepare_training_data(start_date, end_date, use_execution_feedback)
         print(f"📊 数据准备耗时: {_time_all.time() - _t_prep:.1f}s")
+
+        # 特征工程: 添加技术指标 (P0)
+        _t_fe = _time_all.time()
+        try:
+            from ml_engine.data_processor import CryptoDataProcessor
+            dp = CryptoDataProcessor(self.db_path)
+            df = df.groupby(['currency', 'period'], group_keys=False).apply(
+                dp.add_technical_indicators
+            )
+            print(f"📊 特征工程耗时: {_time_all.time() - _t_fe:.1f}s (新增 {len(df.columns)} 列)")
+        except Exception as e:
+            print(f"⚠️  特征工程失败,使用原始特征: {e}")
+            import traceback
+            traceback.print_exc()
 
         # 训练前断言：确保数据非空
         if len(df) == 0:

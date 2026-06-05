@@ -1661,6 +1661,19 @@ async def _scheduled_pipeline_loop():
 async def startup_event():
     """Start the built-in scheduler on server startup."""
     global _scheduler_task
+    if _scheduler_task is not None and not _scheduler_task.done():
+        logger.info("Scheduler already running, skipping duplicate registration")
+        return
+    # PID文件防止多进程重复注册调度器
+    import fcntl
+    _lock_path = os.path.join(BASE_DIR, ".scheduler.lock")
+    _lock_fd = open(_lock_path, 'w')
+    try:
+        fcntl.lockf(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        _lock_fd.close()
+        logger.info("Another scheduler instance is running (lock held), skipping")
+        return
     _scheduler_task = asyncio.create_task(_scheduled_pipeline_loop())
     logger.info(
         "Built-in scheduler registered "
