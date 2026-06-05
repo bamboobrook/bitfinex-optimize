@@ -389,6 +389,8 @@ class EnhancedModelTrainer:
             task_type: 'regression' or 'classification'
             output_prefix: 输出文件前缀
         """
+        import time as _time
+        _t0 = _time.time()
         print(f"\n{'='*60}")
         print(f"训练 {output_prefix} ({currency})")
         print(f"目标: {target_name}, 类型: {task_type}")
@@ -567,6 +569,8 @@ class EnhancedModelTrainer:
         self.save_ensemble_models(currency, output_prefix, models, normalized_weights,
                                  feature_cols, task_type)
 
+        _elapsed = _time.time() - _t0
+        print(f"✅ {output_prefix} ({currency}) 完成, 耗时: {_elapsed:.1f}s")
         return models, normalized_weights
 
     def save_ensemble_models(
@@ -620,12 +624,16 @@ class EnhancedModelTrainer:
             end_date: 结束日期
             use_execution_feedback: 是否使用执行反馈
         """
+        import time as _time_all
+        _t_all = _time_all.time()
         print("\n" + "="*80)
         print(" "*20 + "🚀 增强版模型训练器启动")
         print("="*80)
 
         # 准备训练数据
+        _t_prep = _time_all.time()
         df = self.prepare_training_data(start_date, end_date, use_execution_feedback)
+        print(f"📊 数据准备耗时: {_time_all.time() - _t_prep:.1f}s")
 
         # 训练前断言：确保数据非空
         if len(df) == 0:
@@ -708,8 +716,9 @@ class EnhancedModelTrainer:
 
             print(f"\n✅ {currency} 模型训练完成")
 
+        _total_elapsed = _time_all.time() - _t_all
         print("\n" + "="*80)
-        print(" "*20 + "✅ 所有模型训练完成")
+        print(" "*20 + f"✅ 所有模型训练完成 (总耗时: {_total_elapsed:.1f}s = {_total_elapsed/60:.1f}min)")
         print("="*80)
 
 

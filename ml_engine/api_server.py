@@ -644,7 +644,7 @@ def run_all_validation_tests():
 
 # Subprocess timeout constants
 TIMEOUT_DOWNLOAD = 600    # 10 minutes (--days 30 incremental is fast)
-TIMEOUT_TRAIN = 3000      # 50 minutes (12 models × 2.5 min + v2 models + compare + buffer)
+TIMEOUT_TRAIN = 4200      # 70 minutes (12 models × 3.5 min + v2 models + compare + buffer)
 TIMEOUT_PREDICT = 600     # 10 minutes (56 tasks + 24 order creations)
 TIMEOUT_VALIDATE = 300    # 5 minutes
 TIMEOUT_ORDERS = 300      # 5 minutes
@@ -774,8 +774,17 @@ async def _run_subprocess_with_timeout(cmd, cwd, timeout, step_name):
     except asyncio.TimeoutError:
         logger.error(f"TIMEOUT: {step_name} exceeded {timeout}s, killing subprocess")
         process.kill()
-        await process.wait()
-        return "", f"Subprocess timed out after {timeout}s", -1
+        # 读取已缓冲的 stdout/stderr，避免超时时丢失全部子进程输出
+        try:
+            remaining_stdout, remaining_stderr = await process.communicate()
+            partial_out = (remaining_stdout or b"").decode().strip()
+            partial_err = (remaining_stderr or b"").decode().strip()
+        except Exception:
+            partial_out = ""
+            partial_err = ""
+        if not partial_out and not partial_err:
+            partial_err = f"Subprocess timed out after {timeout}s"
+        return partial_out, partial_err, -1
 
 
 def _is_partial_download_with_stale(stdout: str, stderr: str, rc: int) -> bool:
@@ -970,7 +979,7 @@ async def run_full_pipeline():
                 )
 
                 if stdout:
-                    logger.info(f"Retraining output (last 1000 chars):\n{stdout[-1000:]}")
+                    logger.info(f"Retraining output (last 5000 chars):\n{stdout[-5000:]}")
                 if stderr:
                     logger.warning(f"Retraining stderr (last 500 chars):\n{stderr[-500:]}")
 
