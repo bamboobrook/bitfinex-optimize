@@ -645,7 +645,7 @@ def run_all_validation_tests():
 # Subprocess timeout constants
 TIMEOUT_DOWNLOAD = 600    # 10 minutes (--days 30 incremental is fast)
 TIMEOUT_TRAIN = 4200      # 70 minutes (12 models × 3.5 min + v2 models + compare + buffer)
-TIMEOUT_PREDICT = 600     # 10 minutes (56 tasks + 24 order creations)
+TIMEOUT_PREDICT = 900     # 15 minutes (56 tasks + 24 order creations)
 TIMEOUT_VALIDATE = 300    # 5 minutes
 TIMEOUT_ORDERS = 300      # 5 minutes
 
@@ -979,7 +979,7 @@ async def run_full_pipeline():
                 )
 
                 if stdout:
-                    logger.info(f"Retraining output (last 5000 chars):\n{stdout[-5000:]}")
+                    logger.info(f"Retraining output (last 10000 chars):\n{stdout[-10000:]}")
                 if stderr:
                     logger.warning(f"Retraining stderr (last 500 chars):\n{stderr[-500:]}")
 
@@ -1594,7 +1594,7 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
             )
 
             if stdout_text:
-                logger.info(f"Retraining output (last 1000 chars):\n{stdout_text[-1000:]}")
+                logger.info(f"Retraining output (last 10000 chars):\n{stdout_text[-10000:]}")
             if stderr_text:
                 logger.warning(f"Retraining stderr (last 500 chars):\n{stderr_text[-500:]}")
 

@@ -649,8 +649,8 @@ class EnhancedModelTrainer:
         # 特征工程: 添加技术指标 (P0)
         _t_fe = _time_all.time()
         try:
-            from ml_engine.data_processor import CryptoDataProcessor
-            dp = CryptoDataProcessor(self.db_path)
+            from ml_engine.data_processor import DataProcessor
+            dp = DataProcessor(self.db_path)
             df = df.groupby(['currency', 'period'], group_keys=False).apply(
                 dp.add_technical_indicators
             )

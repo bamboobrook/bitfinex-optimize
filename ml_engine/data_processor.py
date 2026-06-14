@@ -427,8 +427,11 @@ class DataProcessor:
         future_80pct = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.8)
         df['future_execution_prob'] = (df['close_annual'] <= future_80pct).astype(int)
 
-        # 清理 NaN
-        df = df.dropna()
+        # 清理 NaN (仅核心列,派生特征的 NaN 由模型自行处理)
+        core_cols = ['open_annual', 'close_annual', 'high_annual', 'low_annual', 'volume']
+        core_cols = [c for c in core_cols if c in df.columns]
+        if core_cols:
+            df = df.dropna(subset=core_cols)
 
         return df
 
