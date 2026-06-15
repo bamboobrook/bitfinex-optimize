@@ -9,3 +9,6 @@ __pycache__/
 # Local secrets (never commit real tokens/keys)
 .env.*
 !.env.example
+
+# Runtime scheduler lock (fcntl 文件锁,运行时产物)
+.scheduler.lock

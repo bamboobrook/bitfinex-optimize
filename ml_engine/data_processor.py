@@ -428,6 +428,10 @@ class DataProcessor:
         df['future_execution_prob'] = (df['close_annual'] <= future_80pct).astype(int)
 
         # 清理 NaN (仅核心列,派生特征的 NaN 由模型自行处理)
+        # 注意: 长窗口特征(如 ma_10080/robust_ma_10080, 见上方 rolling(window=10080))
+        # 在前7天样本中为 NaN。XGBoost/LightGBM 原生支持 NaN,这些行会进入训练。
+        # 但 predictor 仅取 tail(1)(最新行,特征已填满),训练分布与推理分布存在轻微错位。
+        # 此处不改 dropna 行为(会改变训练样本集,属预测逻辑范畴),仅标注已知风险。
         core_cols = ['open_annual', 'close_annual', 'high_annual', 'low_annual', 'volume']
         core_cols = [c for c in core_cols if c in df.columns]
         if core_cols:
