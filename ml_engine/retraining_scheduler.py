@@ -1212,7 +1212,7 @@ class RetrainingScheduler:
                 if missing:
                     continue
 
-                subset = df[feature_cols + [target]].dropna()
+                subset = df[feature_cols + [target]].dropna(subset=[target])
                 if len(subset) < 40:
                     continue
                 X = subset[feature_cols].copy()

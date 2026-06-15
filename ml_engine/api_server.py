@@ -1645,6 +1645,7 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
 
 # --- Built-in Scheduler (S3) ---
 _scheduler_task = None
+_scheduler_lock_fd = None
 
 async def _scheduled_pipeline_loop():
     """Background loop that runs the pipeline immediately, then every 2 hours."""
@@ -1664,14 +1665,16 @@ async def startup_event():
     if _scheduler_task is not None and not _scheduler_task.done():
         logger.info("Scheduler already running, skipping duplicate registration")
         return
-    # PID文件防止多进程重复注册调度器
+    # 文件锁防止多进程重复注册调度器 (持有全局引用防止GC回收fd)
     import fcntl
+    global _scheduler_lock_fd
     _lock_path = os.path.join(BASE_DIR, ".scheduler.lock")
-    _lock_fd = open(_lock_path, 'w')
+    _scheduler_lock_fd = open(_lock_path, 'w')
     try:
-        fcntl.lockf(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.lockf(_scheduler_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (IOError, OSError):
-        _lock_fd.close()
+        _scheduler_lock_fd.close()
+        _scheduler_lock_fd = None
         logger.info("Another scheduler instance is running (lock held), skipping")
         return
     _scheduler_task = asyncio.create_task(_scheduled_pipeline_loop())
