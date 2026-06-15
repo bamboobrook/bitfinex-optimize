@@ -844,23 +844,24 @@ async def _terminate_process_group(process, step_name: str, grace_seconds: int =
 
 def _is_partial_download_with_stale(stdout: str, stderr: str, rc: int) -> bool:
     """
-    下载器已执行完成，但仅因为仍有 stale/missing 组合而返回非 0。
+    下载器已执行完成，但仅因为仍有 stale/missing 组合而返回 rc=2。
     这种情况不应阻塞后续 pipeline，freshness 交给预测阶段判定。
-    """
-    if rc == 0:
-        return False
 
-    text = f"{stdout}\n{stderr}"
-    markers = [
-        "Download finished with stale/failed combinations",
-        "currency-period combinations have stale or missing data",
-        "stale or missing data",
-    ]
-    return any(marker in text for marker in markers)
+    P1-3: 改用精确 exit code 判定（rc=2 = 部分stale软失败），不再依赖文本 marker 匹配。
+      rc=0: 全部fresh成功；rc=2: 部分stale（软失败）；rc=1: 真实失败（异常）；-1: 超时。
+    """
+    return rc == 2
 
 
 async def _download_with_retry(cwd, max_retries=3):
-    """Download with exponential backoff retry. Partial stale refresh should not block pipeline."""
+    """Download with exponential backoff retry. Partial stale refresh should not block pipeline.
+
+    exit code 语义（P1-3）：
+      rc=0  → 全部 fresh，放行
+      rc=2  → 部分 stale（软失败），放行，freshness 由 predictor 判定
+      rc=1  → 真实失败（异常），重试
+      rc=-1 → 超时，重试
+    """
     download_cmd = [sys.executable, "-m", "funding_history_downloader", "--days", "30"]
     for attempt in range(max_retries):
         stdout, stderr, rc = await _run_subprocess_with_timeout(
@@ -871,14 +872,15 @@ async def _download_with_retry(cwd, max_retries=3):
         if stderr:
             logger.warning(f"Download stderr:\n{stderr[-500:]}")
         if rc == 0:
-            logger.info("✅ Market data download completed")
+            logger.info("✅ Market data download completed (all fresh)")
             return True
         if _is_partial_download_with_stale(stdout, stderr, rc):
             logger.warning(
-                "⚠️  Market data download completed with stale/missing pairs. "
+                "⚠️  Market data download completed with stale/missing pairs (rc=2). "
                 "Continuing pipeline; freshness gate will be enforced at prediction stage."
             )
             return True
+        # rc=1（真实失败）或 rc=-1（超时）：触发重试
         wait_time = 60 * (2 ** attempt)  # 60s, 120s, 240s
         if attempt < max_retries - 1:
             logger.warning(f"⚠️  Download failed (attempt {attempt+1}/{max_retries}, exit={rc}), retrying in {wait_time}s")
@@ -1038,7 +1040,7 @@ async def run_full_pipeline():
                 if stderr:
                     logger.warning(f"Retraining stderr (last 500 chars):\n{stderr[-500:]}")
 
-                # exit code: 0=部署成功或训练成功但未部署, 1=训练失败, 2=无需重训练
+                # exit code: 0=部署成功或训练成功但未部署, 1=训练失败, 2=无需重训练, -1=超时
                 if rc == 0:
                     deployed = '新模型已部署' in (stdout or '')
                     _last_forced_retrain_time = datetime.now()
@@ -1049,8 +1051,17 @@ async def run_full_pipeline():
                         logger.info(f"✅ Retraining completed but models not deployed (keeping current)")
                 elif rc == 2:
                     logger.info(f"ℹ️ Retraining check: not needed")
+                elif rc == -1:
+                    # P1-2: 训练超时也更新冷却时间，防止每2h反复触发70min超时训练耗尽槽位
+                    # 真实失败(rc==1)不更新冷却，让下轮重试；仅超时更新，避免无效占用
+                    logger.error(f"❌ Retraining timed out (70min)")
+                    _last_forced_retrain_time = datetime.now()
+                    save_retraining_state(_last_forced_retrain_time, reason="retrain_timeout_cooldown")
+                    degraded_msg = "Retraining timed out (rc=-1)"
+                    pipeline_degraded_reasons.append(degraded_msg)
+                    update_status("degraded", "4. Retraining Models", degraded_msg)
                 else:
-                    # rc == 1 or timeout (-1): 训练失败
+                    # rc == 1: 训练失败，不更新冷却（让下轮重试）
                     logger.error(f"❌ Retraining failed (exit code {rc})")
                     # Extract meaningful error: prefer stdout error lines, filter normal stderr noise
                     err_detail = ""

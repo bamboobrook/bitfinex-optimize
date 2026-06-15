@@ -40,6 +40,11 @@ class BitfinexDataDownloader:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'application/json'
         })
+
+        # P1-3: 统计本次下载的 fresh/stale 组合数，供 main() 决定 exit code
+        # rc=0 全部fresh, rc=2 部分stale(软失败), rc=1 真实失败(异常)
+        self._fresh_count = 0
+        self._stale_count = 0
         
         logger.info("✅ Data downloader initialized")
         logger.info(f"   Database: {db_path}")
@@ -551,6 +556,7 @@ class BitfinexDataDownloader:
                 )
                 total_count = self.cursor.fetchone()[0]
                 logger.info(f"        Total records in database: {total_count:,}")
+                self._fresh_count += 1
                 return True
 
             if final_latest_ts:
@@ -571,6 +577,7 @@ class BitfinexDataDownloader:
                 logger.warning(f"    ⚠️ Refresh incomplete for {currency}-{period}d: still no data in DB")
             # 数据已存在于DB但stale，或DB无数据但下载尝试完成
             # 返回True：下载操作本身成功，stale由predictor confidence degradation处理
+            self._stale_count += 1
             return True
 
         except Exception as e:
@@ -745,8 +752,26 @@ def main():
     periods = [2,3,4,5,6,7,10,14,15,20,30,60,90,120]
 
     all_ok = downloader.download_multiple(currencies, periods, args.days)
-    if not all_ok:
-        logger.warning("⚠️ Download finished with some failed downloads (not stale)")
+    # P1-3: 用 exit code 区分三种结果，恢复 rc 信号语义
+    #   rc=0: 全部成功且 fresh
+    #   rc=2: 部分 stale（软失败，pipeline可继续，freshness由predictor判定）
+    #   rc=1: 真实失败（有下载异常，应触发重试）
+    if all_ok:
+        if downloader._stale_count > 0:
+            logger.warning(
+                f"⚠️ Download finished with {downloader._stale_count} stale/missing combinations "
+                f"(fresh={downloader._fresh_count}); exit code 2 (partial stale)"
+            )
+            sys.exit(2)
+        else:
+            logger.info(f"✅ Download finished all fresh ({downloader._fresh_count} combinations)")
+            sys.exit(0)
+    else:
+        logger.warning(
+            f"❌ Download finished with real failures; exit code 1 "
+            f"(fresh={downloader._fresh_count}, stale={downloader._stale_count})"
+        )
+        sys.exit(1)
     
 def check_database():
     try:

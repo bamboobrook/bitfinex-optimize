@@ -569,6 +569,17 @@ class EnhancedModelTrainer:
             return 'cat', m, s
 
         # 并行执行三个模型的训练
+        # P1-1: 并行时限制每个模型内部线程数为 cpu_threads//3，避免 3×cpu_threads 线程超售
+        # (XGBoost GPU 仍串行，CPU 部分 3 个模型各占 cpu_threads//3 ≈ 总核数)
+        _per_model_threads = max(1, self.cpu_threads // 3)
+        _orig_xgb_nthread = self.xgb_params.get('nthread')
+        _orig_lgb_threads = self.lgb_params.get('num_threads')
+        _orig_cat_threads = self.catboost_params.get('thread_count')
+        self.xgb_params['nthread'] = _per_model_threads
+        self.xgb_params['n_jobs'] = _per_model_threads
+        self.lgb_params['num_threads'] = _per_model_threads
+        self.lgb_params['n_jobs'] = _per_model_threads
+        self.catboost_params['thread_count'] = _per_model_threads
         try:
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = {
@@ -582,12 +593,24 @@ class EnhancedModelTrainer:
                     scores[name] = score
         except Exception as e:
             print(f"⚠️  并行训练失败,回退到串行: {e}")
-            # 回退: 串行训练
+            # 回退: 串行训练 (串行时单模型独占CPU，恢复满线程数更高效)
+            self.xgb_params['nthread'] = _orig_xgb_nthread or self.cpu_threads
+            self.xgb_params['n_jobs'] = _orig_xgb_nthread or self.cpu_threads
+            self.lgb_params['num_threads'] = _orig_lgb_threads or self.cpu_threads
+            self.lgb_params['n_jobs'] = _orig_lgb_threads or self.cpu_threads
+            self.catboost_params['thread_count'] = _orig_cat_threads or self.cpu_threads
             for fn in [_train_xgb, _train_lgb, _train_cat]:
                 name, model, score = fn()
                 if name not in models:
                     models[name] = model
                     scores[name] = score
+        finally:
+            # 恢复原始线程数配置，避免影响后续训练
+            self.xgb_params['nthread'] = _orig_xgb_nthread or self.cpu_threads
+            self.xgb_params['n_jobs'] = _orig_xgb_nthread or self.cpu_threads
+            self.lgb_params['num_threads'] = _orig_lgb_threads or self.cpu_threads
+            self.lgb_params['n_jobs'] = _orig_lgb_threads or self.cpu_threads
+            self.catboost_params['thread_count'] = _orig_cat_threads or self.cpu_threads
 
         # 计算集成权重
         if task_type == 'regression':
