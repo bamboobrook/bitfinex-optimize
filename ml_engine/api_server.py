@@ -668,8 +668,11 @@ def _build_subprocess_env():
     env["VECLIB_MAXIMUM_THREADS"] = str(cpu_threads)
 
     # Inference-level parallel controls
-    env.setdefault("PREDICT_MAX_WORKERS", str(max(4, min(cpu_threads, 24))))
-    env.setdefault("PREDICT_INFER_THREADS", str(min(cpu_threads, 24)))
+    # 预测并行度保持保守：max_workers=8（14 period 并行足够），infer_threads=4
+    # 避免在高负载宿主机上 24×24=576 线程需求导致 CPU 上下文切换风暴
+    # （训练侧不受影响，训练的线程限制由 model_trainer_v2 P1-1 单独控制）
+    env.setdefault("PREDICT_MAX_WORKERS", str(max(4, min(cpu_threads, 8))))
+    env.setdefault("PREDICT_INFER_THREADS", str(min(cpu_threads, 4)))
     env.setdefault("CUDA_VISIBLE_DEVICES", "0")
     return env
 
