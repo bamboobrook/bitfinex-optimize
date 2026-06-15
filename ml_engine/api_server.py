@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 import sqlite3
 import tempfile
+import signal
 from collections import defaultdict
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -760,20 +761,27 @@ def _check_db_data_freshness(fUSD_max: int = None, fUST_max: int = None) -> bool
 
 
 async def _run_subprocess_with_timeout(cmd, cwd, timeout, step_name):
-    """Run subprocess with timeout, kill on timeout. Returns (stdout, stderr, returncode)."""
+    """Run subprocess with timeout, kill on timeout. Returns (stdout, stderr, returncode).
+
+    使用 start_new_session=True 让子进程成为新进程组的 leader，
+    超时时用 os.killpg 杀整个进程组（含 GPU/OpenMP worker），避免孤儿进程占用资源。
+    采用 SIGTERM → 8s grace → SIGKILL 两阶段，给模型 save_model 留优雅退出时间。
+    """
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(cwd),
-        env=_build_subprocess_env()
+        env=_build_subprocess_env(),
+        start_new_session=True,  # 子进程成为新会话/进程组leader，便于killpg
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         return stdout.decode().strip(), stderr.decode().strip(), process.returncode
     except asyncio.TimeoutError:
-        logger.error(f"TIMEOUT: {step_name} exceeded {timeout}s, killing subprocess")
-        process.kill()
+        logger.error(f"TIMEOUT: {step_name} exceeded {timeout}s, killing process group")
+        # 两阶段终止：先SIGTERM（优雅退出，让save_model完成），8s后SIGKILL
+        await _terminate_process_group(process, step_name)
         # 读取已缓冲的 stdout/stderr，避免超时时丢失全部子进程输出
         try:
             remaining_stdout, remaining_stderr = await process.communicate()
@@ -785,6 +793,53 @@ async def _run_subprocess_with_timeout(cmd, cwd, timeout, step_name):
         if not partial_out and not partial_err:
             partial_err = f"Subprocess timed out after {timeout}s"
         return partial_out, partial_err, -1
+
+
+async def _terminate_process_group(process, step_name: str, grace_seconds: int = 8):
+    """优雅终止整个子进程组：SIGTERM → 等待 grace → SIGKILL。
+
+    覆盖训练子进程派生的 GPU/OpenMP worker，避免孤儿进程占用 GPU/CPU。
+    """
+    try:
+        pgid = os.getpgid(process.pid)
+    except ProcessLookupError:
+        # 子进程已退出，无需处理
+        return
+    except Exception as e:
+        logger.warning(f"{step_name}: 无法获取进程组({e}), 回退到 kill 单进程")
+        try:
+            process.kill()
+        except Exception:
+            pass
+        return
+
+    # 阶段1：SIGTERM 整个进程组
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception as e:
+        logger.warning(f"{step_name}: SIGTERM进程组失败({e})")
+
+    # 等待 grace period 让子进程优雅退出
+    try:
+        await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+        return  # 已优雅退出
+    except asyncio.TimeoutError:
+        pass  # 超时，进入阶段2
+
+    # 阶段2：SIGKILL 强制清理整个进程组
+    logger.warning(f"{step_name}: SIGTERM后{grace_seconds}s未退出, SIGKILL进程组")
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception as e:
+        logger.warning(f"{step_name}: SIGKILL进程组失败({e}), 回退到 kill 单进程")
+        try:
+            process.kill()
+        except Exception:
+            pass
 
 
 def _is_partial_download_with_stale(stdout: str, stderr: str, rc: int) -> bool:

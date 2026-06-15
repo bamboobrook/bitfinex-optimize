@@ -26,6 +26,30 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from training_data_builder import TrainingDataBuilder
 
 
+def _atomic_save_model(target_path: str, save_fn):
+    """原子保存模型文件：先写 .tmp，成功后 os.replace 替换目标。
+
+    防止训练中途被超时 SIGKILL 留下半截模型文件。
+    save_fn 接收临时路径，执行实际的 save_model 调用。
+    """
+    tmp_path = target_path + '.tmp'
+    save_fn(tmp_path)
+    # 确保 .tmp 内容落盘后再 rename（避免 rename 后才写入的窗口）
+    try:
+        with open(tmp_path, 'rb'):
+            pass
+    except Exception:
+        pass
+    os.replace(tmp_path, target_path)
+
+
+def _atomic_save_text(target_path: str, save_fn):
+    """原子保存文本/JSON文件：先写 .tmp，成功后 os.replace 替换目标。"""
+    tmp_path = target_path + '.tmp'
+    save_fn(tmp_path)
+    os.replace(tmp_path, target_path)
+
+
 class EnhancedModelTrainer:
     """
     增强版模型训练器
@@ -593,25 +617,34 @@ class EnhancedModelTrainer:
         feature_cols: list,
         task_type: str
     ):
-        """保存集成模型的所有组件"""
-        # 保存XGBoost
-        models['xgb'].save_model(os.path.join(self.model_dir, f"{currency}_{prefix}_xgb.json"))
+        """保存集成模型的所有组件
 
-        # 保存LightGBM
-        models['lgb'].save_model(os.path.join(self.model_dir, f"{currency}_{prefix}_lgb.txt"))
+        所有文件均采用原子写（先写 .tmp 再 os.replace），防止训练中途被超时 kill
+        留下半截模型文件导致下次 predictor 加载失败或得到垃圾预测。
+        """
+        # 保存XGBoost（原子写）
+        xgb_path = os.path.join(self.model_dir, f"{currency}_{prefix}_xgb.json")
+        _atomic_save_model(xgb_path, lambda p: models['xgb'].save_model(p))
 
-        # 保存CatBoost
-        models['cat'].save_model(os.path.join(self.model_dir, f"{currency}_{prefix}_cat.cbm"))
+        # 保存LightGBM（原子写）
+        lgb_path = os.path.join(self.model_dir, f"{currency}_{prefix}_lgb.txt")
+        _atomic_save_model(lgb_path, lambda p: models['lgb'].save_model(p))
 
-        # 保存元信息
+        # 保存CatBoost（原子写）
+        cat_path = os.path.join(self.model_dir, f"{currency}_{prefix}_cat.cbm")
+        _atomic_save_model(cat_path, lambda p: models['cat'].save_model(p))
+
+        # 保存元信息（原子写）
         meta_info = {
             'weights': weights,
             'feature_cols': feature_cols,
             'task_type': task_type
         }
         meta_path = os.path.join(self.model_dir, f"{currency}_{prefix}_meta.json")
-        with open(meta_path, 'w') as f:
-            json.dump(meta_info, f, indent=2)
+        _atomic_save_text(
+            meta_path,
+            lambda p: json.dump(meta_info, open(p, 'w'), indent=2)
+        )
 
         print(f"✓ 模型已保存到 {self.model_dir}")
 
