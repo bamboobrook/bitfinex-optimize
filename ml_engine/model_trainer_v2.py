@@ -27,14 +27,19 @@ from training_data_builder import TrainingDataBuilder
 
 
 def _atomic_save_model(target_path: str, save_fn):
-    """原子保存模型文件：先写 .tmp，成功后 os.replace 替换目标。
+    """原子保存模型文件：先写临时文件，成功后 os.replace 替换目标。
 
     防止训练中途被超时 SIGKILL 留下半截模型文件。
-    save_fn 接收临时路径，执行实际的 save_model 调用。
+
+    关键：临时文件必须保留原扩展名（如 .json/.txt/.cbm），因为 XGBoost 等
+    库会根据扩展名决定序列化格式。若临时文件用 .tmp 扩展名，XGBoost 会输出
+    UBJSON 二进制而非文本 JSON，os.replace 到 .json 后加载会报 json.cc:409 错误。
+    所以这里用 "<target>.tmp<原扩展名>" 作为临时文件名（如 x.json -> x.tmp.json）。
     """
-    tmp_path = target_path + '.tmp'
+    ext = os.path.splitext(target_path)[1]  # 如 .json / .txt / .cbm
+    tmp_path = f"{target_path}.tmp{ext}"
     save_fn(tmp_path)
-    # 确保 .tmp 内容落盘后再 rename（避免 rename 后才写入的窗口）
+    # 确保 tmp 内容落盘后再 rename
     try:
         with open(tmp_path, 'rb'):
             pass
@@ -44,8 +49,12 @@ def _atomic_save_model(target_path: str, save_fn):
 
 
 def _atomic_save_text(target_path: str, save_fn):
-    """原子保存文本/JSON文件：先写 .tmp，成功后 os.replace 替换目标。"""
-    tmp_path = target_path + '.tmp'
+    """原子保存文本/JSON文件：先写临时文件（保留扩展名），成功后 os.replace 替换。
+
+    保留原扩展名以兼容依赖扩展名判断格式的库（同 _atomic_save_model）。
+    """
+    ext = os.path.splitext(target_path)[1]
+    tmp_path = f"{target_path}.tmp{ext}"
     save_fn(tmp_path)
     os.replace(tmp_path, target_path)
 
