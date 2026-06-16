@@ -14,57 +14,73 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 def _install_predictor_import_stubs():
-    xgb = types.ModuleType("xgboost")
+    def _has_real_module(name):
+        module = sys.modules.get(name)
+        if module is not None and getattr(module, "__file__", None):
+            return True
+        if module is not None:
+            sys.modules.pop(name, None)
+        try:
+            __import__(name)
+            return True
+        except ImportError:
+            return False
 
-    class Booster:
-        def load_model(self, *args, **kwargs):
-            return None
+    if not _has_real_module("xgboost"):
+        xgb = types.ModuleType("xgboost")
 
-        def set_param(self, *args, **kwargs):
-            return None
+        class Booster:
+            def load_model(self, *args, **kwargs):
+                return None
 
-        def predict(self, *args, **kwargs):
-            return []
+            def set_param(self, *args, **kwargs):
+                return None
 
-    class DMatrix:
-        def __init__(self, *args, **kwargs):
-            pass
+            def predict(self, *args, **kwargs):
+                return []
 
-    xgb.Booster = Booster
-    xgb.DMatrix = DMatrix
-    sys.modules.setdefault("xgboost", xgb)
+        class DMatrix:
+            def __init__(self, *args, **kwargs):
+                pass
 
-    lgb = types.ModuleType("lightgbm")
+        xgb.Booster = Booster
+        xgb.DMatrix = DMatrix
+        sys.modules["xgboost"] = xgb
 
-    class LightGBMBooster:
-        def __init__(self, *args, **kwargs):
-            pass
+    if not _has_real_module("lightgbm"):
+        lgb = types.ModuleType("lightgbm")
 
-        def predict(self, *args, **kwargs):
-            return []
+        class LightGBMBooster:
+            def __init__(self, *args, **kwargs):
+                pass
 
-    lgb.Booster = LightGBMBooster
-    sys.modules.setdefault("lightgbm", lgb)
+            def predict(self, *args, **kwargs):
+                return []
 
-    cat = types.ModuleType("catboost")
+        lgb.Booster = LightGBMBooster
+        sys.modules["lightgbm"] = lgb
 
-    class CatBoostRegressor:
-        def load_model(self, *args, **kwargs):
-            return None
+    if not _has_real_module("catboost"):
+        cat = types.ModuleType("catboost")
 
-        def predict(self, *args, **kwargs):
-            return []
+        class CatBoostRegressor:
+            def load_model(self, *args, **kwargs):
+                return None
 
-    class CatBoostClassifier:
-        def load_model(self, *args, **kwargs):
-            return None
+            def predict(self, *args, **kwargs):
+                return []
 
-        def predict_proba(self, *args, **kwargs):
-            return []
+        class CatBoostClassifier:
+            def load_model(self, *args, **kwargs):
+                return None
 
-    cat.CatBoostRegressor = CatBoostRegressor
-    cat.CatBoostClassifier = CatBoostClassifier
-    sys.modules.setdefault("catboost", cat)
+            def predict_proba(self, *args, **kwargs):
+                return []
+
+        cat.CatBoostRegressor = CatBoostRegressor
+        cat.CatBoostClassifier = CatBoostClassifier
+        cat.Pool = object
+        sys.modules["catboost"] = cat
 
     loguru = types.ModuleType("loguru")
 

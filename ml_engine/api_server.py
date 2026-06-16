@@ -644,7 +644,7 @@ def run_all_validation_tests():
 # --- 核心逻辑: 完整更新流水线 (每2小时运行) - 闭环优化版 ---
 
 # Subprocess timeout constants
-TIMEOUT_DOWNLOAD = 600    # 10 minutes (--days 30 incremental is fast)
+TIMEOUT_DOWNLOAD = 1200   # 20 minutes (Bitfinex refresh is serial and can stall on network retries)
 TIMEOUT_TRAIN = 4200      # 70 minutes (12 models × 3.5 min + v2 models + compare + buffer)
 TIMEOUT_PREDICT = 900     # 15 minutes (56 tasks + 24 order creations)
 TIMEOUT_VALIDATE = 300    # 5 minutes

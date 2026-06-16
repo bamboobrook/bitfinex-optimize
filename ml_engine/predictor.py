@@ -1070,11 +1070,29 @@ class EnsemblePredictor:
         # 分层锚定: 长周期偏稳健, 短中周期偏敏感
         anchor_minutes = profile["anchor_minutes"]
         if anchor_minutes >= 10080:
-            anchor_rate = float(row_data.get('robust_ma_10080', row_data.get('ma_10080', current_rate)))
+            anchor_rate = self._finite_rate(
+                row_data.get('robust_ma_10080'),
+                row_data.get('ma_10080'),
+                row_data.get('robust_ma_1440'),
+                row_data.get('ma_1440'),
+                row_data.get('robust_ma_720'),
+                row_data.get('ma_720'),
+                current_rate,
+            )
         elif anchor_minutes >= 1440:
-            anchor_rate = float(row_data.get('robust_ma_1440', row_data.get('ma_1440', current_rate)))
+            anchor_rate = self._finite_rate(
+                row_data.get('robust_ma_1440'),
+                row_data.get('ma_1440'),
+                row_data.get('robust_ma_720'),
+                row_data.get('ma_720'),
+                current_rate,
+            )
         elif anchor_minutes >= 720:
-            anchor_rate = float(row_data.get('robust_ma_720', row_data.get('ma_720', current_rate)))
+            anchor_rate = self._finite_rate(
+                row_data.get('robust_ma_720'),
+                row_data.get('ma_720'),
+                current_rate,
+            )
         else:
             anchor_rate = current_rate
 
@@ -1147,9 +1165,24 @@ class EnsemblePredictor:
             raise ValueError(f"NaN in final_rate for {currency}-{period}")
 
         # 动态安全边界: 分层锚点 + 执行率感知 floor，避免长周期卡死高位
-        ma_720 = float(row_data.get('robust_ma_720', row_data.get('ma_720', current_rate)))
-        ma_1440 = float(row_data.get('robust_ma_1440', row_data.get('ma_1440', ma_720)))
-        ma_10080 = float(row_data.get('robust_ma_10080', row_data.get('ma_10080', ma_1440)))
+        ma_720 = self._finite_rate(
+            row_data.get('robust_ma_720'),
+            row_data.get('ma_720'),
+            current_rate,
+        )
+        ma_1440 = self._finite_rate(
+            row_data.get('robust_ma_1440'),
+            row_data.get('ma_1440'),
+            ma_720,
+            current_rate,
+        )
+        ma_10080 = self._finite_rate(
+            row_data.get('robust_ma_10080'),
+            row_data.get('ma_10080'),
+            ma_1440,
+            ma_720,
+            current_rate,
+        )
         if period >= 60:
             bound_base = 0.7 * ma_10080 + 0.3 * ma_1440
         elif period >= 20:
@@ -1410,6 +1443,18 @@ class EnsemblePredictor:
     @staticmethod
     def _clip_unit(value: float) -> float:
         return float(np.clip(value, 0.0, 1.0))
+
+    @staticmethod
+    def _finite_rate(value, *fallbacks) -> float:
+        """Return the first finite numeric rate from value then fallbacks."""
+        for candidate in (value, *fallbacks):
+            try:
+                rate = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(rate):
+                return rate
+        return 0.0
 
     def _calc_fillability_signal(self, bid_levels: list) -> float:
         """

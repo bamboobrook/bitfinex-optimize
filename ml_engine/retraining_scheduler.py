@@ -983,10 +983,9 @@ class RetrainingScheduler:
 
                 if os.path.exists(new_meta_file):
                     enhanced_count += 1
-                elif os.path.exists(old_meta_file):
-                    # 旧模型有但新模型没有 → 能力回退，拒绝部署
+                else:
+                    # 增强模型是当前闭环能力的必备输出；新模型缺失即拒绝部署。
                     missing_enhanced_models.append(model_prefix)
-                # 旧模型也没有 → 不算回退，新模型没有是正常的
 
                 if os.path.exists(old_meta_file) and os.path.exists(new_meta_file):
                     retained_count += 1
@@ -994,17 +993,15 @@ class RetrainingScheduler:
             print(f"  增强模型: {enhanced_count}/{len(enhanced_models)} (旧模型保留: {retained_count})")
 
             if missing_enhanced_models:
-                print(f"  ⚠️  增强模型回退: {', '.join(missing_enhanced_models)}（旧模型有但新模型缺失，拒绝部署）")
+                print(f"  ⚠️  增强模型缺失: {', '.join(missing_enhanced_models)}（拒绝部署）")
                 comparison['checks']['enhanced_models'] = False
                 comparison['checks']['enhanced_model_retention'] = False
                 comparison['missing_enhanced_models'] = missing_enhanced_models
             else:
                 comparison['checks']['enhanced_model_retention'] = True
-                comparison['checks']['enhanced_models'] = enhanced_count > 0 or not any(
-                    os.path.exists(os.path.join(old_model_dir, f"{p}_meta.json"))
-                    for p in enhanced_models
-                )
-                print(f"  ✅ 增强模型检查通过（无回退）")
+                comparison['checks']['enhanced_models'] = True
+                comparison['missing_enhanced_models'] = []
+                print(f"  ✅ 增强模型检查通过")
 
             # 检查3: 实际性能对比 (S2 核心修复)
             print("\n检查3: 模型性能对比 (验证集)")

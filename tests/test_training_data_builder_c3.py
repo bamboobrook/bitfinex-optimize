@@ -16,19 +16,34 @@ if str(ML_ENGINE_ROOT) not in sys.path:
 
 
 def _install_training_lib_stubs():
-    if "xgboost" not in sys.modules:
+    def _has_real_module(name):
+        module = sys.modules.get(name)
+        if module is not None and getattr(module, "__file__", None):
+            return True
+        if module is not None:
+            sys.modules.pop(name, None)
+        try:
+            __import__(name)
+            return True
+        except ImportError:
+            return False
+
+    if not _has_real_module("xgboost"):
         xgb_module = types.ModuleType("xgboost")
         xgb_module.DMatrix = object
         xgb_module.train = lambda *args, **kwargs: None
         sys.modules["xgboost"] = xgb_module
 
-    if "lightgbm" not in sys.modules:
+    if not _has_real_module("lightgbm"):
         lgb_module = types.ModuleType("lightgbm")
         lgb_module.Dataset = object
         lgb_module.train = lambda *args, **kwargs: None
         lgb_module.early_stopping = lambda *args, **kwargs: None
         lgb_module.log_evaluation = lambda *args, **kwargs: None
         sys.modules["lightgbm"] = lgb_module
+
+    if _has_real_module("catboost"):
+        return
 
     catboost_module = sys.modules.get("catboost")
     if catboost_module is None:
@@ -404,6 +419,56 @@ def test_build_training_data_handles_execution_results_with_missing_optional_col
     assert "market_median" in df.columns
 
 
+def test_merge_keeps_single_market_row_when_there_are_no_orders(tmp_path):
+    db_path = tmp_path / "no_orders.sqlite"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE funding_rates (
+                currency TEXT NOT NULL,
+                period INTEGER NOT NULL,
+                timestamp INTEGER,
+                datetime TEXT NOT NULL,
+                open_annual REAL,
+                close_annual REAL,
+                high_annual REAL,
+                low_annual REAL,
+                volume REAL,
+                hour INTEGER,
+                day_of_week INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                order_timestamp TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                period INTEGER NOT NULL,
+                predicted_rate REAL NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO funding_rates VALUES
+            ('fUSD', 30, 1, '2026-04-01 00:00:00', 10.0, 10.2, 10.4, 9.8, 1000.0, 0, 3)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    builder = TrainingDataBuilder(str(db_path))
+    df = builder.build_training_data("2026-04-01", "2026-04-02", include_execution_results=True)
+
+    assert len(df) == 1
+    assert df.iloc[0]["_sample_role"] == "market_dense"
+    assert df["actual_execution_binary"].isna().all()
+
+
 def test_build_training_data_only_assigns_path_targets_to_strong_rows(tmp_path):
     db_path = tmp_path / "path_gating.sqlite"
     _seed_training_db(db_path)
@@ -533,6 +598,28 @@ def test_prepare_features_excludes_path_identity_and_validation_columns(tmp_path
     assert "realized_terminal_mode" not in feature_cols
     assert "realized_terminal_value" not in feature_cols
     assert "realized_wait_hours" not in feature_cols
+
+
+def test_prepare_training_data_keeps_order_feedback_out_of_traditional_targets(tmp_path):
+    db_path = tmp_path / "feedback.sqlite"
+    _seed_training_db(db_path)
+
+    trainer = EnhancedModelTrainer(db_path=str(db_path), model_dir=str(tmp_path / "models"))
+    df = trainer.prepare_training_data(
+        "2026-04-01",
+        "2026-04-02",
+        use_execution_feedback=True,
+    )
+
+    assert len(df) == 3
+    assert set(df["_sample_role"].unique()) == {"order_supervision"}
+    assert df["actual_execution_binary"].notna().sum() == 3
+    assert df[[
+        "future_conservative",
+        "future_aggressive",
+        "future_balanced",
+        "future_execution_prob",
+    ]].isna().all().all()
 
 
 def test_train_single_target_skips_classification_when_target_has_single_class(tmp_path):

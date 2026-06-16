@@ -181,8 +181,25 @@ class EnhancedModelTrainer:
         """
         print("\n添加传统训练目标...")
 
+        if '_sample_role' not in df.columns:
+            df['_sample_role'] = 'market_dense'
+
+        traditional_targets = [
+            'future_conservative',
+            'future_aggressive',
+            'future_balanced',
+            'future_execution_prob',
+        ]
+        for target in traditional_targets:
+            if target not in df.columns:
+                df[target] = np.nan
+
+        market_mask = df['_sample_role'].eq('market_dense')
+        market_df = df[market_mask].copy()
+        other_df = df[~market_mask].copy()
+
         # 按 currency + period 分组计算
-        df = df.sort_values(['currency', 'period', 'datetime'])
+        market_df = market_df.sort_values(['currency', 'period', 'datetime'])
 
         def compute_targets(group):
             # Fix3: 用 shift + 后向滚动窗口替代 FixedForwardWindowIndexer，消除前向偏差（数据泄露）
@@ -206,12 +223,16 @@ class EnhancedModelTrainer:
 
             return group
 
-        df = df.groupby(['currency', 'period'], group_keys=False).apply(compute_targets)
+        if len(market_df) > 0:
+            market_df = market_df.groupby(['currency', 'period'], group_keys=False).apply(compute_targets)
 
-        # 清理 NaN
+        df = pd.concat([market_df, other_df], ignore_index=True, sort=False)
+
+        # 清理传统目标 NaN，但保留订单监督行给 v2 执行反馈模型。
         initial_rows = len(df)
-        df = df.dropna(subset=['future_conservative', 'future_aggressive',
-                               'future_balanced', 'future_execution_prob'])
+        valid_traditional = df[traditional_targets].notna().all(axis=1)
+        order_supervision = df['_sample_role'].eq('order_supervision')
+        df = df[valid_traditional | order_supervision].copy()
         final_rows = len(df)
 
         print(f"✓ 传统目标添加完成 (保留 {final_rows:,}/{initial_rows:,} 行)")
@@ -266,6 +287,7 @@ class EnhancedModelTrainer:
             'update_cycle_id',
             'recommendation_rank',
             'rank_weight',
+            '_sample_role',
             '_order_match_minutes',
             '_execution_label_eligible',
             '_exploit_quality',

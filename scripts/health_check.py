@@ -16,6 +16,7 @@ import os
 import sys
 import json
 import subprocess
+import time
 from datetime import datetime, timedelta
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,10 +25,14 @@ APP_LOG = os.path.join(LOG_DIR, "ml_optimizer.log")
 HEALTH_LOG = os.path.join(LOG_DIR, "health_check.log")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SERVICE_NAME = "optimize-api"
+API_STATUS_URL = "http://127.0.0.1:5000/status"
+SUPPORTED_PERIODS = {2, 3, 4, 5, 6, 7, 10, 14, 15, 20, 30, 60, 90, 120}
 
 # 健康阈值
 PIPELINE_STALE_HOURS = 5      # pipeline 超过 5h 没跑视为调度器卡死（正常 2h 一轮）
 PREDICTION_STALE_HOURS = 12   # optimal_combination.json 超过 12h 未更新视为预测异常
+API_STATUS_RETRIES = 3
+API_STATUS_RETRY_DELAY_SECONDS = 2
 
 
 def log(msg, level="INFO"):
@@ -51,13 +56,39 @@ def run_cmd(cmd):
         return f"<cmd failed: {e}>", -1
 
 
+def _api_status_online(retries=API_STATUS_RETRIES, delay_seconds=API_STATUS_RETRY_DELAY_SECONDS):
+    last_out = ""
+    last_rc = -1
+    for attempt in range(retries):
+        status_out, status_rc = run_cmd(["curl", "-sS", API_STATUS_URL])
+        last_out, last_rc = status_out, status_rc
+        if status_rc == 0:
+            try:
+                status = json.loads(status_out)
+            except json.JSONDecodeError:
+                status = {}
+            if status.get("api_online") is True:
+                return True, status_out, status_rc
+        if attempt < retries - 1:
+            time.sleep(delay_seconds)
+    return False, last_out, last_rc
+
+
 def check_service():
     """1. 检查 systemd 服务状态。"""
     out, rc = run_cmd(["systemctl", "--user", "is-active", SERVICE_NAME])
     if rc == 0 and out == "active":
         log(f"✅ 服务 {SERVICE_NAME} 正常运行 (active)")
         return True
-    log(f"❌ 服务 {SERVICE_NAME} 异常: is-active={out} (rc={rc})", "ERROR")
+    api_online, status_out, status_rc = _api_status_online()
+    if api_online:
+        log(f"✅ API 在线（systemd 状态不可用: is-active={out or '<empty>'}, rc={rc}）")
+        return True
+    log(
+        f"❌ 服务 {SERVICE_NAME} 异常: is-active={out or '<empty>'} (rc={rc}); "
+        f"api_status_rc={status_rc}, api_status={status_out[:120]}",
+        "ERROR",
+    )
     return False
 
 
@@ -138,6 +169,12 @@ def check_recent_errors():
         log("⚠️  日志中未找到完整 pipeline 记录", "WARN")
         return True
     recent = lines[start_idx:]
+    pipeline_completed = any("CLOSED-LOOP Pipeline completed successfully" in line for line in recent)
+    download_fallback_ok = any(
+        "Existing DB data is fresh enough, continuing pipeline despite download failure" in line
+        or "Existing DB data is fresh enough, continuing pipeline despite download error" in line
+        for line in recent
+    )
 
     issues = []
     for line in recent:
@@ -147,9 +184,18 @@ def check_recent_errors():
         elif "Retraining failed (exit code" in line or "Retraining timed out" in line:
             issues.append(f"重训失败/超时: {line.split(' | ')[-1][:120]}")
         elif "TIMEOUT:" in line and "exceeded" in line:
+            if "Data Download" in line and download_fallback_ok and pipeline_completed:
+                continue
             issues.append(f"子进程超时: {line.split(' | ')[-1][:120]}")
         elif "❌ Data download failed and DB data is stale" in line:
             issues.append("下载失败且 DB 数据 stale")
+        elif "NaN detected in final_rate" in line or "Prediction failed: NaN in final_rate" in line:
+            issues.append(f"预测 NaN: {line.split(' | ')[-1][:120]}")
+        elif (
+            "Prediction finished with stale_data gate" in line
+            and "partial_stale_data_skipped" not in line
+        ):
+            issues.append(f"预测数据 stale: {line.split(' | ')[-1][:120]}")
 
     if issues:
         log(f"❌ 最近一轮 pipeline 发现 {len(issues)} 个问题:", "ERROR")
@@ -157,6 +203,29 @@ def check_recent_errors():
             log(f"     - {iss}", "ERROR")
         return False
     log("✅ 最近一轮 pipeline 无关键错误")
+    return True
+
+
+def _is_supported_partial_stale(payload):
+    if payload.get("status") != "success":
+        return False
+    if payload.get("stale_reason") != "partial_stale_data_skipped":
+        return False
+    recommendations = payload.get("recommendations") or []
+    if not recommendations:
+        return False
+    stale_issues = payload.get("stale_issues") or []
+    if not stale_issues:
+        return False
+    for issue in stale_issues:
+        if issue.get("currency") not in {"fUSD", "fUST"}:
+            return False
+        try:
+            period = int(issue.get("period"))
+        except (TypeError, ValueError):
+            return False
+        if period not in SUPPORTED_PERIODS:
+            return False
     return True
 
 
@@ -170,6 +239,32 @@ def check_prediction_output():
     age = datetime.now() - mtime
     if age > timedelta(hours=PREDICTION_STALE_HOURS):
         log(f"❌ 预测输出 {age} 未更新（超过 {PREDICTION_STALE_HOURS}h）", "ERROR")
+        return False
+    try:
+        with open(combo_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict) and payload.get("stale_data"):
+            if _is_supported_partial_stale(payload):
+                stale_issues = payload.get("stale_issues") or []
+                log(
+                    f"⚠️  预测输出包含可跳过的部分 stale 数据: "
+                    f"{payload.get('stale_reason', '')} issues={stale_issues[:3]}",
+                    "WARN",
+                )
+                log(f"✅ 预测输出最近更新于 {mtime}（{age} 前）")
+                return True
+            stale_issues = payload.get("stale_issues") or []
+            log(
+                f"❌ 预测输出包含 stale_data=true: "
+                f"{payload.get('stale_reason', '')} issues={stale_issues[:3]}",
+                "ERROR",
+            )
+            return False
+        if isinstance(payload, dict) and payload.get("status") in {"error", "failed", "stale_data"}:
+            log(f"❌ 预测输出状态异常: {payload.get('status')}", "ERROR")
+            return False
+    except Exception as e:
+        log(f"❌ 预测输出 JSON 检查失败: {e}", "ERROR")
         return False
     log(f"✅ 预测输出最近更新于 {mtime}（{age} 前）")
     return True

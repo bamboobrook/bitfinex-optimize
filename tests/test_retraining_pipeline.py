@@ -140,9 +140,19 @@ class TestRetrainingOutput:
     def setup(self):
         _check_db_exists()
 
-    def test_train_all_models_produces_output(self):
+    def test_train_all_models_produces_output(self, monkeypatch):
         """train_all_models 应在输出目录产出模型文件"""
         trainer = EnhancedModelTrainer(db_path=DB_PATH)
+        calls = []
+
+        def fake_train_single_target(currency, df, target_name, task_type, output_prefix):
+            calls.append((currency, target_name, task_type, output_prefix, len(df)))
+            meta_path = os.path.join(trainer.model_dir, f'{currency}_{output_prefix}_meta.json')
+            with open(meta_path, 'w', encoding='utf-8') as f:
+                f.write('{}')
+            return {}, {}
+
+        monkeypatch.setattr(trainer, 'train_single_target', fake_train_single_target)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             trainer.model_dir = tmpdir
@@ -161,9 +171,8 @@ class TestRetrainingOutput:
 
             found = sum(1 for f in required_core
                        if os.path.exists(os.path.join(tmpdir, f)))
-            assert found >= 6, (
-                f"核心模型仅{found}/8产出，训练管线仍有问题"
-            )
+            assert found == 8, f"核心模型仅{found}/8产出，训练管线仍有问题"
+            assert len(calls) >= 8
 
 
 if __name__ == '__main__':

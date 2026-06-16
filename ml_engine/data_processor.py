@@ -7,6 +7,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Tuple
 from functools import partial
 
+SUPPORTED_PERIODS = (2, 3, 4, 5, 6, 7, 10, 14, 15, 20, 30, 60, 90, 120)
+
 class DataProcessor:
     def __init__(self, db_path: str = None):
         # Use absolute path for database
@@ -40,6 +42,7 @@ class DataProcessor:
             hour, day_of_week{month_col}
         FROM funding_rates
         WHERE currency = ?
+          AND period IN ({','.join(str(p) for p in SUPPORTED_PERIODS)})
         ORDER BY period, timestamp
         """
         try:

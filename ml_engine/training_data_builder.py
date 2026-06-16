@@ -176,18 +176,18 @@ class TrainingDataBuilder:
         execution_results: pd.DataFrame
     ) -> pd.DataFrame:
         """
-        时间对齐: 以 dense market_data 为主表，匹配最近的执行结果
+        时间对齐: 保留 dense market_data，并追加订单级监督样本
 
         策略:
-        - 使用 merge_asof 以 market_data 为 LEFT（密集 ~887K 行）
-        - execution_results 为 RIGHT（稀疏 ~12K 行），无匹配时订单列为 NaN
-        - direction='backward': 只匹配过去/当前订单，防止前视偏差
+        - market_data 保留为密集市场样本，供传统未来分位目标训练
+        - execution_results 另行对齐最近的历史市场行，生成订单级监督样本
+        - 订单监督样本使用 direction='backward'，只使用下单前/当前市场特征
         - 匹配容忍度: 2小时
         - 按 currency + period 分组匹配
 
         新增内部字段:
         - _order_match_minutes: 订单与市场行的时间差（分钟），NaN 表示无匹配
-        - _execution_label_eligible: 订单紧邻且非前视的资格标记
+        - _execution_label_eligible: 订单监督样本紧邻且非前视的资格标记
         - _exploit_quality: exploit + STRONG + _execution_label_eligible
 
         Args:
@@ -203,6 +203,7 @@ class TrainingDataBuilder:
             for col in ['actual_execution_binary', 'revenue_reward', 'rate_competitiveness',
                         '_order_match_minutes', '_execution_label_eligible', '_exploit_quality']:
                 market_data[col] = np.nan
+            market_data['_sample_role'] = 'market_dense'
             return market_data
 
         # 确保时间字段格式正确
@@ -220,7 +221,7 @@ class TrainingDataBuilder:
         market_data = market_data.sort_values('datetime')
         execution_results = execution_results.sort_values('order_timestamp')
 
-        # 时间对齐合并：execution_results 为 LEFT（订单级闭环样本），market_data 为 RIGHT（历史特征）
+        # market_data 保留为密集市场样本，执行相关列保持 NaN，避免把稀疏订单广播到市场序列。
         merge_cols = [
             'order_timestamp', 'currency', 'period', 'status',
             'predicted_rate', 'execution_confidence', 'total_score',
@@ -237,35 +238,62 @@ class TrainingDataBuilder:
             if c in execution_results.columns:
                 merge_cols.append(c)
 
-        merged = pd.merge_asof(
-            execution_results[merge_cols].sort_values('order_timestamp'),
+        market_counts = market_data.groupby(['currency', 'period'])['datetime'].transform('size')
+        dense_market = market_data.loc[market_counts > 1].copy()
+        dense_market['_sample_role'] = 'market_dense'
+        dense_market['_order_match_minutes'] = np.nan
+        dense_market['_execution_label_eligible'] = False
+
+        # 订单监督样本：一笔订单保留一行，并回看最近市场特征。probe 决策不进入 exploit 监督标签。
+        order_source = execution_results[merge_cols].copy()
+        if 'decision_mode' in order_source.columns:
+            order_source = order_source[
+                order_source['decision_mode'].fillna('exploit') == 'exploit'
+            ].copy()
+
+        order_rows = pd.merge_asof(
+            order_source.sort_values('order_timestamp'),
             market_data.sort_values('datetime'),
             left_on='order_timestamp',
             right_on='datetime',
             by=['currency', 'period'],
             direction='backward',
-            tolerance=pd.Timedelta('2h')  # 严格限制在2小时内
+            tolerance=pd.Timedelta('2h')
         )
-
-        if 'decision_mode' in merged.columns:
-            merged = merged[merged['decision_mode'].fillna('exploit') == 'exploit'].copy()
+        order_rows['_sample_role'] = 'order_supervision'
 
         # 计算 _order_match_minutes: 订单与市场行的时间差
-        if 'datetime' in merged.columns:
-            time_diff = merged['order_timestamp'] - merged['datetime']
-            merged['_order_match_minutes'] = time_diff.dt.total_seconds() / 60.0
+        if 'datetime' in order_rows.columns and 'order_timestamp' in order_rows.columns:
+            time_diff = order_rows['order_timestamp'] - order_rows['datetime']
+            order_rows['_order_match_minutes'] = time_diff.dt.total_seconds() / 60.0
             # 无订单匹配时 order_timestamp 为 NaT → _order_match_minutes 为 NaN
         else:
-            merged['_order_match_minutes'] = np.nan
+            order_rows['_order_match_minutes'] = np.nan
 
         # _execution_label_eligible: 订单紧邻（≤30min）且非前视
-        # backward merge 保证 datetime <= order_timestamp，只需检查时间差
-        merged['_execution_label_eligible'] = (
-            merged['_order_match_minutes'].notna() &
-            (merged['_order_match_minutes'] >= 0) &
-            (merged['_order_match_minutes'] <= 30) &
-            merged.get('status', pd.Series(dtype=str)).notna()
+        order_rows['_execution_label_eligible'] = (
+            order_rows['_order_match_minutes'].notna() &
+            (order_rows['_order_match_minutes'] >= 0) &
+            (order_rows['_order_match_minutes'] <= 30) &
+            order_rows.get('status', pd.Series(dtype=str)).notna()
         )
+
+        pieces = [df.dropna(axis=1, how='all') for df in (dense_market, order_rows) if not df.empty]
+        if pieces:
+            merged = pd.concat(pieces, ignore_index=True, sort=False)
+        else:
+            merged = market_data.iloc[0:0].copy()
+        for col in merge_cols:
+            if col not in {'currency', 'period'} and col not in merged.columns:
+                merged[col] = np.nan
+        if '_order_match_minutes' not in merged.columns:
+            merged['_order_match_minutes'] = np.nan
+        if '_execution_label_eligible' not in merged.columns:
+            merged['_execution_label_eligible'] = False
+        if '_sample_role' not in merged.columns:
+            merged['_sample_role'] = 'market_dense'
+        if 'datetime' in merged.columns:
+            merged = merged.sort_values(['currency', 'period', 'datetime'], kind='mergesort').reset_index(drop=True)
 
         # 生成增强标签（不再 blanket 过滤 decision_mode）
         merged = self._generate_enhanced_labels(merged)
