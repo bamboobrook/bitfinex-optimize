@@ -23,6 +23,8 @@ from pathlib import Path
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "lending_history.db"
 DEFAULT_RESULT = Path(__file__).resolve().parent.parent / "data" / "optimal_combination.json"
 FRESHNESS_TARGETS = {"fUSD": 300.0, "fUST": 900.0}
+SUPPORTED_CURRENCIES = {"fUSD", "fUST"}
+SUPPORTED_PERIODS = {2, 3, 4, 5, 6, 7, 10, 14, 15, 20, 30, 60, 90, 120}
 
 
 @dataclass
@@ -117,12 +119,15 @@ def fetch_group_metrics(conn: sqlite3.Connection, start: datetime, end: datetime
 
 def fetch_freshness(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
-        """
+        f"""
         SELECT currency, period, MAX(datetime) AS latest_dt
         FROM funding_rates
+        WHERE currency IN ({','.join('?' for _ in SUPPORTED_CURRENCIES)})
+          AND period IN ({','.join('?' for _ in SUPPORTED_PERIODS)})
         GROUP BY currency, period
         ORDER BY currency, period
-        """
+        """,
+        (*sorted(SUPPORTED_CURRENCIES), *sorted(SUPPORTED_PERIODS)),
     ).fetchall()
 
     now = datetime.now()

@@ -673,5 +673,10 @@ def test_train_single_target_regression_path_still_trains(tmp_path):
     models, weights = result
     assert set(models) == {"xgb", "lgb", "cat"}
     assert set(weights) == {"xgb", "lgb", "cat"}
-    assert [call[0] for call in trainer.calls] == ["xgb_reg", "lgb_reg", "cat_reg"]
+    calls_by_model = {call[0]: call[1:] for call in trainer.calls}
+    assert calls_by_model == {
+        "xgb_reg": (108, 12),
+        "lgb_reg": (108, 12),
+        "cat_reg": (108, 12),
+    }
     assert trainer.saved["task_type"] == "regression"

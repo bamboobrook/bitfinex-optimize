@@ -9,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.evaluate_recent_optimization import fetch_path_metrics
+from scripts.evaluate_recent_optimization import fetch_freshness, fetch_path_metrics
 from test_predictor_rank6 import EnsemblePredictor, _make_prediction
 
 
@@ -70,6 +70,37 @@ def test_fetch_path_metrics_reports_label_coverage_and_terminal_matrix(tmp_path)
     assert metrics["avg_realized_terminal_value"] == 10.0
     assert metrics["terminal_mode_matrix"]["stage1_fixed->FIXED"] == 1
     assert metrics["terminal_mode_matrix"]["stage2_frr->FRR_PROXY"] == 1
+
+
+def test_fetch_freshness_ignores_unsupported_periods(tmp_path):
+    db_path = tmp_path / "metrics.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE funding_rates (
+                currency TEXT,
+                period INTEGER,
+                datetime TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO funding_rates VALUES (?, ?, ?)",
+            [
+                ("fUSD", 2, "2026-04-01 00:00:00"),
+                ("fUSD", 8, "2026-04-01 00:00:00"),
+                ("fUST", 15, "2026-04-01 00:00:00"),
+                ("fEUR", 2, "2026-04-01 00:00:00"),
+            ],
+        )
+
+        freshness = fetch_freshness(conn)
+    finally:
+        conn.close()
+
+    pairs = {(item["currency"], item["period"]) for item in freshness}
+    assert pairs == {("fUSD", 2), ("fUST", 15)}
 
 
 def test_fetch_path_metrics_handles_legacy_schema_without_path_columns(tmp_path):

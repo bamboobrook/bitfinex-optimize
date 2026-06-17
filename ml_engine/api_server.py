@@ -845,6 +845,11 @@ async def _terminate_process_group(process, step_name: str, grace_seconds: int =
             pass
 
 
+def _is_service_shutdown_returncode(rc: int) -> bool:
+    """True when a child process exited because the service is shutting down."""
+    return rc in {-signal.SIGTERM, 128 + signal.SIGTERM, -signal.SIGINT, 128 + signal.SIGINT}
+
+
 def _is_partial_download_with_stale(stdout: str, stderr: str, rc: int) -> bool:
     """
     下载器已执行完成，但仅因为仍有 stale/missing 组合而返回 rc=2。
@@ -1111,6 +1116,13 @@ async def run_full_pipeline():
                 logger.warning(f"Prediction stderr:\n{stderr[-500:]}")
 
             if rc != 0:
+                if _is_service_shutdown_returncode(rc):
+                    logger.info(
+                        f"Prediction subprocess terminated during service shutdown (exit code {rc}); "
+                        "leaving previous prediction result intact"
+                    )
+                    update_status("online", "Idle", "Service shutdown interrupted prediction")
+                    return
                 err_msg = stderr or stdout or "Prediction failed"
                 logger.error(f"❌ Prediction failed (exit code {rc}): {err_msg}")
                 update_status("error", "5. Generating Predictions", f"Failed: {err_msg[-200:]}")
