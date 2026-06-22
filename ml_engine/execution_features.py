@@ -142,7 +142,11 @@ class ExecutionFeatures:
 
     def _get_connection(self):
         """Get database connection"""
-        return sqlite3.connect(self.db_path)
+        busy_timeout_seconds = float(os.getenv("PREDICT_SQLITE_BUSY_TIMEOUT", "2.0"))
+        conn = sqlite3.connect(self.db_path, timeout=busy_timeout_seconds)
+        conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_seconds * 1000)}")
+        conn.execute("PRAGMA query_only = ON")
+        return conn
 
     @staticmethod
     def get_period_window_profile(period: int, profile_name: Optional[str] = None) -> Dict[str, int]:

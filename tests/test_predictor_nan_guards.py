@@ -1,6 +1,6 @@
 import math
 
-from ml_engine.predictor import EnsemblePredictor
+from test_predictor_rank6 import EnsemblePredictor
 
 
 def test_sanitize_rate_falls_back_for_nan_long_anchor():

@@ -4,8 +4,12 @@ import lightgbm as lgb
 from catboost import CatBoostRegressor, CatBoostClassifier
 import json
 import os
+import queue
+import sqlite3
 import sys
 import tempfile
+import threading
+import time
 from loguru import logger
 from datetime import datetime, timedelta
 import numpy as np
@@ -14,7 +18,6 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
@@ -63,9 +66,11 @@ class EnsemblePredictor:
         )
         self._stale_issues = []
         self._funding_book_cache = {}
+        self.period_prediction_timeout = float(os.getenv("PREDICT_PERIOD_TIMEOUT", "120"))
         logger.info(
             f"Predictor parallel config: max_workers={self.max_workers}, "
-            f"infer_threads={self.infer_threads}"
+            f"infer_threads={self.infer_threads}, "
+            f"period_timeout={self.period_prediction_timeout}s"
         )
 
         # 导入OrderManager用于创建虚拟订单
@@ -78,6 +83,14 @@ class EnsemblePredictor:
 
         # 加载所有模型
         self.load_all_models()
+
+    def _connect_db(self, read_only: bool = False):
+        busy_timeout_seconds = float(os.getenv("PREDICT_SQLITE_BUSY_TIMEOUT", "2.0"))
+        conn = sqlite3.connect(self.db_path, timeout=busy_timeout_seconds)
+        conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_seconds * 1000)}")
+        if read_only:
+            conn.execute("PRAGMA query_only = ON")
+        return conn
 
     def load_ensemble_models(self, currency: str, prefix: str):
         """
@@ -230,8 +243,7 @@ class EnsemblePredictor:
 
     def get_latest_rate_from_db(self, currency: str, period: int) -> tuple:
         """Query database directly for the most recent rate"""
-        import sqlite3
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db(read_only=True)
         cursor = conn.cursor()
 
         try:
@@ -255,9 +267,7 @@ class EnsemblePredictor:
 
     def _get_previous_predicted_rate(self, currency: str, period: int) -> Optional[float]:
         """Get the latest historical predicted rate for step-cap control."""
-        import sqlite3
-
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db(read_only=True)
         cursor = conn.cursor()
         try:
             cursor.execute(
@@ -288,7 +298,7 @@ class EnsemblePredictor:
         import sqlite3
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect_db(read_only=True) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     """
@@ -350,7 +360,7 @@ class EnsemblePredictor:
         """Returns days since last EXECUTED order for (currency, period), or None if never executed."""
         import sqlite3
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect_db(read_only=True) as conn:
                 row = conn.execute(
                     "SELECT MAX(created_at) FROM virtual_orders "
                     "WHERE currency = ? AND period = ? AND status = 'EXECUTED'",
@@ -1649,7 +1659,7 @@ class EnsemblePredictor:
             # 查 funding_rates 24h vs 30d 平均成交量（用 period=30 作代表性基准）
             try:
                 import sqlite3
-                with sqlite3.connect(self.db_path) as conn:
+                with self._connect_db(read_only=True) as conn:
                     row = conn.execute("""
                         SELECT
                             AVG(CASE WHEN datetime >= strftime('%Y-%m-%d %H:%M:%S','now','-1 day')
@@ -1791,7 +1801,7 @@ class EnsemblePredictor:
         import sqlite3
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect_db(read_only=True) as conn:
                 row = conn.execute(
                     """
                     SELECT
@@ -2173,7 +2183,7 @@ class EnsemblePredictor:
     def _ensure_prediction_history_schema(self):
         import sqlite3
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect_db(read_only=False) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -2267,7 +2277,7 @@ class EnsemblePredictor:
 
         market_rows = []
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect_db(read_only=True) as conn:
                 close_rows = conn.execute(
                     """
                     SELECT close_annual
@@ -2501,7 +2511,7 @@ class EnsemblePredictor:
         import sqlite3
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect_db(read_only=False) as conn:
                 conn.execute(
                     "DELETE FROM prediction_history WHERE update_cycle_id = ?",
                     (update_cycle_id,),
@@ -2591,7 +2601,7 @@ class EnsemblePredictor:
                 pred.get("expected_terminal_mode"),
             ))
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect_db(read_only=False) as conn:
             conn.executemany(
                 """
                 INSERT INTO prediction_history (
@@ -2614,6 +2624,72 @@ class EnsemblePredictor:
         logger.info(
             f"Persisted prediction_history snapshot: cycle={update_cycle_id}, rows={len(rows)}, stale={bool(stale_flag)}"
         )
+
+    def _run_period_prediction_batch(self, latest_data, feature_cols: list, currency: str) -> list:
+        """Run period predictions with a hard batch deadline so one stuck period cannot block the cycle."""
+        rows = [row.to_dict() for _, row in latest_data.iterrows()]
+        if not rows:
+            return []
+
+        timeout = float(getattr(self, "period_prediction_timeout", None) or os.getenv("PREDICT_PERIOD_TIMEOUT", "120"))
+        deadline = time.monotonic() + max(timeout, 0.001)
+        task_queue = queue.Queue()
+        result_queue = queue.Queue()
+        stop_event = threading.Event()
+        pending_periods = set()
+        results = []
+
+        for row_dict in rows:
+            period = int(row_dict.get("period", 0) or 0)
+            pending_periods.add(period)
+            task_queue.put((period, row_dict))
+
+        def worker():
+            while not stop_event.is_set():
+                try:
+                    period, row_dict = task_queue.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    result = self.predict_single_period(row_dict, feature_cols, currency)
+                    result_queue.put(("ok", period, result))
+                except Exception as e:
+                    result_queue.put(("error", period, e))
+                finally:
+                    task_queue.task_done()
+
+        workers = []
+        worker_count = max(1, min(int(self.max_workers), len(rows)))
+        for _ in range(worker_count):
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            workers.append(thread)
+
+        while pending_periods:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                status, period, payload = result_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+
+            if period not in pending_periods:
+                continue
+            pending_periods.remove(period)
+            if status == "ok":
+                results.append(payload)
+            else:
+                logger.error(f"Prediction failed for {currency}-{period}: {payload}")
+
+        stop_event.set()
+        for period in sorted(pending_periods):
+            logger.error(
+                f"Prediction period timeout: {currency}-{period} skipped after {timeout:.1f}s batch deadline"
+            )
+        for thread in workers:
+            thread.join(timeout=0)
+        return results
 
     def get_latest_predictions(self):
         """获取最新预测结果 - 并行化版本"""
@@ -2646,21 +2722,9 @@ class EnsemblePredictor:
             # 并行化预测
             logger.info(f"Starting parallel predictions for {curr} with {self.max_workers} workers...")
 
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # 创建预测任务
-                futures = []
-                for idx, row in latest_data.iterrows():
-                    row_dict = row.to_dict()
-                    future = executor.submit(self.predict_single_period, row_dict, feature_cols, curr)
-                    futures.append(future)
-
-                # 收集结果
-                for future in as_completed(futures):
-                    try:
-                        result = future.result()
-                        all_predictions.append(result)
-                    except Exception as e:
-                        logger.error(f"Prediction failed: {e}")
+            all_predictions.extend(
+                self._run_period_prediction_batch(latest_data, feature_cols, curr)
+            )
 
             logger.info(f"Completed predictions for {curr}: {len(all_predictions)} results")
 
