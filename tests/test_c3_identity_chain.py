@@ -35,6 +35,39 @@ class C3IdentityChainTest(unittest.TestCase):
         predictor._is_zero_liquidity_suspended = lambda currency, period: False
         return predictor
 
+    def test_model_version_prefers_successful_deployment_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            model_dir = data_dir / "models"
+            model_dir.mkdir()
+            (model_dir / "fUSD_model_balanced_meta.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            (data_dir / "retraining_history.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "timestamp": "2026-04-01 10:05:00",
+                            "deployed": True,
+                        },
+                        {
+                            "timestamp": "2026-04-02 10:05:00",
+                            "deployed": False,
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+            predictor.model_dir = str(model_dir)
+
+            self.assertEqual(
+                predictor._derive_model_version(),
+                "model_20260401_100500",
+            )
+
     def test_prediction_history_and_virtual_orders_share_identity_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "lending_history.db"
@@ -43,6 +76,7 @@ class C3IdentityChainTest(unittest.TestCase):
             predictor.db_path = str(db_path)
             predictor.policy = {}
             predictor.policy_version = "test-policy"
+            predictor.model_version = "model_20260401_100000"
             predictor._stale_issues = []
             predictor._ensure_prediction_history_schema()
 
@@ -53,6 +87,8 @@ class C3IdentityChainTest(unittest.TestCase):
                 "rank_weight": 0.60,
                 "candidate_id": "fUSD-120-balanced-mid",
                 "decision_mode": "exploit",
+                "traditional_execution_probability": 0.70,
+                "v2_execution_probability": 0.50,
             })
             predictor._persist_prediction_history([pred])
 
@@ -61,16 +97,30 @@ class C3IdentityChainTest(unittest.TestCase):
 
             with sqlite3.connect(db_path) as conn:
                 history = conn.execute(
-                    "SELECT update_cycle_id, recommendation_rank, rank_weight, candidate_id, decision_mode "
+                    "SELECT update_cycle_id, recommendation_rank, rank_weight, candidate_id, decision_mode, "
+                    "model_version, traditional_execution_probability, v2_execution_probability "
                     "FROM prediction_history"
                 ).fetchone()
                 order = conn.execute(
-                    "SELECT update_cycle_id, recommendation_rank, rank_weight, candidate_id, decision_mode "
+                    "SELECT update_cycle_id, recommendation_rank, rank_weight, candidate_id, decision_mode, "
+                    "model_version "
                     "FROM virtual_orders"
                 ).fetchone()
 
-            self.assertEqual(history, ("cycle-1", 1, 0.60, "fUSD-120-balanced-mid", "exploit"))
-            self.assertEqual(order, ("cycle-1", 1, 0.60, "fUSD-120-balanced-mid", "exploit"))
+            self.assertEqual(
+                history,
+                (
+                    "cycle-1", 1, 0.60, "fUSD-120-balanced-mid", "exploit",
+                    "model_20260401_100000", 0.70, 0.50,
+                ),
+            )
+            self.assertEqual(
+                order,
+                (
+                    "cycle-1", 1, 0.60, "fUSD-120-balanced-mid", "exploit",
+                    "model_20260401_100000",
+                ),
+            )
 
     def test_generate_recommendations_assigns_shared_identity_chain_on_main_path(self):
         with tempfile.TemporaryDirectory() as tmp:

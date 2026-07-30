@@ -105,8 +105,19 @@ class TrainingDataBuilder:
             'realized_terminal_mode',
             'realized_terminal_value',
             'realized_wait_hours',
+            'validated_at',
+            'validation_window_hours',
         ]
         selected_cols.extend([c for c in optional_cols if c in table_cols])
+
+        validation_cutoff_clause = ""
+        query_params = [start_date, end_date]
+        if 'validated_at' in table_cols:
+            # A label belongs to the training window only after it was observable.
+            validation_cutoff_clause = (
+                "AND validated_at IS NOT NULL AND validated_at < ?"
+            )
+            query_params.append(end_date)
 
         query = f"""
         SELECT
@@ -114,15 +125,21 @@ class TrainingDataBuilder:
         FROM virtual_orders
         WHERE order_timestamp >= ? AND order_timestamp < ?
           AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
+          {validation_cutoff_clause}
         ORDER BY order_timestamp
         """
 
-        df = pd.read_sql_query(query, conn, params=(start_date, end_date))
+        df = pd.read_sql_query(query, conn, params=query_params)
         conn.close()
 
         # 转换时间字段
         if len(df) > 0:
             df['order_timestamp'] = pd.to_datetime(df['order_timestamp'])
+            if 'validated_at' in df.columns:
+                df['validated_at'] = pd.to_datetime(
+                    df['validated_at'],
+                    errors='coerce',
+                )
 
         expired_count = (df['status'] == 'EXPIRED').sum() if len(df) > 0 else 0
         print(f"✓ 加载执行结果: {len(df)} 条 (EXECUTED: {(df['status']=='EXECUTED').sum()}, FAILED: {(df['status']=='FAILED').sum()}, EXPIRED: {expired_count})")
@@ -234,7 +251,8 @@ class TrainingDataBuilder:
                   'rank_weight', 'candidate_id', 'decision_mode',
                   'data_quality_label', 'validation_label',
                   'realized_terminal_mode', 'realized_terminal_value',
-                  'realized_wait_hours']:
+                  'realized_wait_hours', 'validated_at',
+                  'validation_window_hours']:
             if c in execution_results.columns:
                 merge_cols.append(c)
 

@@ -7,6 +7,8 @@ import tempfile
 import types
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 
@@ -539,6 +541,377 @@ def test_compare_model_performance_does_not_reject_better_model_only_due_to_live
     assert comparison["metrics"]["p120_step_p95_7d"] == 0.20
 
 
+def test_compare_model_performance_rejects_degraded_enhanced_model(
+    tmp_path, scheduler_module, monkeypatch
+):
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_prepare_champion_validation_data",
+        lambda days=7, warmup_days=21: {"fUSD": list(range(250))},
+    )
+    old_eval = {
+        "overall_score": 0.70,
+        "currency_scores": {"fUSD": 0.70},
+        "metrics": {
+            "fUSD": {
+                "model_execution_prob_v2_eligible_samples": 60,
+                "model_execution_prob_v2_auc": 0.75,
+                "model_execution_prob_v2_brier": 0.18,
+                "model_revenue_optimized_eligible_samples": 60,
+                "model_revenue_optimized_mae": 0.50,
+            }
+        },
+    }
+    new_eval = {
+        "overall_score": 0.71,
+        "currency_scores": {"fUSD": 0.71},
+        "metrics": {
+            "fUSD": {
+                "model_execution_prob_v2_eligible_samples": 60,
+                "model_execution_prob_v2_auc": 0.70,
+                "model_execution_prob_v2_brier": 0.22,
+                "model_revenue_optimized_eligible_samples": 60,
+                "model_revenue_optimized_mae": 0.60,
+            }
+        },
+    }
+    monkeypatch.setattr(
+        scheduler,
+        "_evaluate_model_dir_on_validation",
+        lambda model_dir, val_data: (
+            new_eval if model_dir == "new-models" else old_eval
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_sanity_check_new_models",
+        lambda model_dir: True,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_evaluate_follow_and_stability",
+        lambda days=7: (True, {}),
+    )
+
+    comparison = {"checks": {}, "metrics": {}}
+    is_better = scheduler._compare_model_performance(
+        "old-models",
+        "new-models",
+        comparison,
+    )
+
+    assert is_better is False
+    assert comparison["checks"]["enhanced_performance"] == "degraded"
+
+
+def test_compare_model_performance_enforces_absolute_enhanced_floors_without_champion_metrics(
+    tmp_path, scheduler_module, monkeypatch
+):
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_prepare_champion_validation_data",
+        lambda days=7, warmup_days=21: {"fUSD": list(range(250))},
+    )
+    old_eval = {
+        "overall_score": 0.70,
+        "currency_scores": {"fUSD": 0.70},
+        "metrics": {"fUSD": {}},
+    }
+    new_eval = {
+        "overall_score": 0.80,
+        "currency_scores": {"fUSD": 0.80},
+        "metrics": {
+            "fUSD": {
+                "model_execution_prob_v2_eligible_samples": 60,
+                "model_execution_prob_v2_auc": 0.0,
+                "model_execution_prob_v2_brier": 1.0,
+                "model_revenue_optimized_eligible_samples": 60,
+                "model_revenue_optimized_mae": 49.0,
+            }
+        },
+    }
+    monkeypatch.setattr(
+        scheduler,
+        "_evaluate_model_dir_on_validation",
+        lambda model_dir, val_data: (
+            new_eval if model_dir == "new-models" else old_eval
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_sanity_check_new_models",
+        lambda model_dir: True,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_evaluate_follow_and_stability",
+        lambda days=7: (True, {}),
+    )
+
+    comparison = {"checks": {}, "metrics": {}}
+    is_better = scheduler._compare_model_performance(
+        "old-models",
+        "new-models",
+        comparison,
+    )
+
+    assert is_better is False
+    assert comparison["checks"]["enhanced_performance"] == "degraded"
+
+
+def test_compare_model_performance_rejects_non_finite_enhanced_metrics(
+    tmp_path, scheduler_module, monkeypatch
+):
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_prepare_champion_validation_data",
+        lambda days=7, warmup_days=21: {"fUSD": list(range(250))},
+    )
+    old_eval = {
+        "overall_score": 0.70,
+        "currency_scores": {"fUSD": 0.70},
+        "metrics": {"fUSD": {}},
+    }
+    new_eval = {
+        "overall_score": 0.80,
+        "currency_scores": {"fUSD": 0.80},
+        "metrics": {
+            "fUSD": {
+                "model_execution_prob_v2_eligible_samples": 60,
+                "model_execution_prob_v2_auc": float("nan"),
+                "model_execution_prob_v2_brier": float("nan"),
+                "model_revenue_optimized_eligible_samples": 60,
+                "model_revenue_optimized_mae": float("inf"),
+            }
+        },
+    }
+    monkeypatch.setattr(
+        scheduler,
+        "_evaluate_model_dir_on_validation",
+        lambda model_dir, val_data: (
+            new_eval if model_dir == "new-models" else old_eval
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_sanity_check_new_models",
+        lambda model_dir: True,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_evaluate_follow_and_stability",
+        lambda days=7: (True, {}),
+    )
+
+    comparison = {"checks": {}, "metrics": {}}
+    is_better = scheduler._compare_model_performance(
+        "old-models",
+        "new-models",
+        comparison,
+    )
+
+    assert is_better is False
+    assert comparison["checks"]["enhanced_performance"] == "degraded"
+
+
+def test_small_validation_slice_still_checks_mature_feedback_labels(
+    tmp_path, scheduler_module, monkeypatch
+):
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    validation = pd.DataFrame(
+        {
+            "actual_execution_binary": [1.0] * 50 + [np.nan] * 149,
+            "revenue_optimized_target": [8.0] * 50 + [np.nan] * 149,
+        }
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_prepare_champion_validation_data",
+        lambda days=7, warmup_days=21: {"fUSD": validation},
+    )
+    old_eval = {
+        "overall_score": 0.70,
+        "currency_scores": {"fUSD": 0.70},
+        "metrics": {"fUSD": {}},
+    }
+    new_eval = {
+        "overall_score": 0.80,
+        "currency_scores": {"fUSD": 0.80},
+        "metrics": {
+            "fUSD": {
+                "model_execution_prob_v2_eligible_samples": 50,
+                "model_execution_prob_v2_auc": 0.0,
+                "model_execution_prob_v2_brier": 1.0,
+                "model_revenue_optimized_eligible_samples": 50,
+                "model_revenue_optimized_mae": 49.0,
+            }
+        },
+    }
+    evaluation_calls = []
+
+    def _evaluate(model_dir, val_data):
+        evaluation_calls.append(model_dir)
+        return new_eval if model_dir == "new-models" else old_eval
+
+    monkeypatch.setattr(
+        scheduler,
+        "_evaluate_model_dir_on_validation",
+        _evaluate,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_sanity_check_new_models",
+        lambda model_dir: True,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_evaluate_follow_and_stability",
+        lambda days=7: (True, {}),
+    )
+
+    comparison = {"checks": {}, "metrics": {}}
+    is_better = scheduler._compare_model_performance(
+        "old-models",
+        "new-models",
+        comparison,
+    )
+
+    assert evaluation_calls == ["old-models", "new-models"]
+    assert is_better is False
+
+
+def test_model_artifact_check_requires_every_positive_weight_component(
+    tmp_path, scheduler_module
+):
+    model_prefix = "fUSD_model_execution_prob_v2"
+    (tmp_path / f"{model_prefix}_meta.json").write_text(
+        json.dumps(
+            {
+                "weights": {"xgb": 0.7, "lgb": 0.0, "cat": 0.3},
+                "feature_cols": ["signal"],
+                "task_type": "classification",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / f"{model_prefix}_cat.cbm").write_text(
+        "cat",
+        encoding="utf-8",
+    )
+
+    complete, reason = scheduler_module.RetrainingScheduler._check_model_artifact_set(
+        str(tmp_path),
+        model_prefix,
+    )
+    assert complete is False
+    assert "xgb" in reason
+
+    (tmp_path / f"{model_prefix}_xgb.json").write_text(
+        "xgb",
+        encoding="utf-8",
+    )
+    complete, reason = scheduler_module.RetrainingScheduler._check_model_artifact_set(
+        str(tmp_path),
+        model_prefix,
+    )
+    assert complete is True
+    assert reason == ""
+
+
+def test_validation_evaluator_scores_v2_and_revenue_models(
+    tmp_path, scheduler_module, monkeypatch
+):
+    model_types = [
+        "model_execution_prob",
+        "model_conservative",
+        "model_aggressive",
+        "model_balanced",
+        "model_execution_prob_v2",
+        "model_revenue_optimized",
+    ]
+
+    class _Predictor:
+        def __init__(self, model_dir, max_workers):
+            self.meta_info = {
+                "fUSD": {
+                    model_type: {"feature_cols": ["signal"]}
+                    for model_type in model_types
+                }
+            }
+
+        def predict_with_ensemble(self, X, currency, model_type):
+            if "execution_prob" in model_type:
+                return X["signal"].to_numpy()
+            return (5.0 + X["signal"]).to_numpy()
+
+    monkeypatch.setattr(scheduler_module, "EnsemblePredictor", _Predictor)
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    signal = np.linspace(0.01, 0.99, 50)
+    validation = pd.DataFrame(
+        {
+            "signal": signal,
+            "future_execution_prob": (signal >= 0.5).astype(float),
+            "future_conservative": 5.0 + signal,
+            "future_aggressive": 5.0 + signal,
+            "future_balanced": 5.0 + signal,
+            "actual_execution_binary": (signal >= 0.5).astype(float),
+            "revenue_optimized_target": 5.0 + signal,
+        }
+    )
+
+    result = scheduler._evaluate_model_dir_on_validation(
+        "models",
+        {"fUSD": validation},
+    )
+    metrics = result["metrics"]["fUSD"]
+
+    assert metrics["model_execution_prob_v2_eligible_samples"] == 50
+    assert metrics["model_execution_prob_v2_auc"] == pytest.approx(1.0)
+    assert metrics["model_execution_prob_v2_brier"] < 0.1
+    assert metrics["model_revenue_optimized_eligible_samples"] == 50
+    assert metrics["model_revenue_optimized_mae"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("labels", "scores", "expected"),
+    [
+        ([0, 1], [0.5, 0.5], 0.5),
+        ([0, 1, 0, 1], [0.2, 0.2, 0.8, 0.8], 0.5),
+        ([1, 0, 1, 0], [0.5, 0.5, 0.5, 0.5], 0.5),
+        ([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9], 1.0),
+    ],
+)
+def test_safe_auc_uses_average_ranks_for_tied_scores(
+    scheduler_module, labels, scores, expected
+):
+    assert scheduler_module.RetrainingScheduler._safe_auc(labels, scores) == pytest.approx(
+        expected
+    )
+
+
 def test_get_production_model_age_days_uses_newest_meta_file(tmp_path, scheduler_module):
     model_dir = tmp_path / "models"
     model_dir.mkdir()
@@ -575,6 +948,43 @@ def test_get_production_model_age_days_uses_newest_meta_file(tmp_path, scheduler
         monkeypatch.undo()
 
 
+def test_production_deployment_time_prefers_successful_history_event(
+    tmp_path, scheduler_module
+):
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    meta = model_dir / "fUSD_model_balanced_meta.json"
+    meta.write_text("{}", encoding="utf-8")
+    os.utime(meta, (1_700_000_000, 1_700_000_000))
+
+    history = [
+        {
+            "timestamp": "2026-04-01 10:05:00",
+            "retrained": True,
+            "deployed": True,
+        },
+        {
+            "timestamp": "2026-04-02 10:05:00",
+            "retrained": True,
+            "deployed": False,
+        },
+    ]
+    (tmp_path / "retraining_history.json").write_text(
+        json.dumps(history),
+        encoding="utf-8",
+    )
+
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(model_dir),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path),
+    )
+
+    assert scheduler._get_production_model_deployed_at() == (
+        __import__("datetime").datetime(2026, 4, 1, 10, 5, 0)
+    )
+
+
 def test_should_retrain_skips_quality_triggers_during_post_deploy_grace(
     tmp_path, scheduler_module, monkeypatch
 ):
@@ -607,6 +1017,12 @@ def test_should_retrain_skips_quality_triggers_during_post_deploy_grace(
 
     monkeypatch.setattr(scheduler_module, "datetime", _FrozenDatetime)
     monkeypatch.setattr(scheduler, "count_new_execution_results", lambda since_date: 0)
+    monkeypatch.setattr(scheduler, "_count_orders_since", lambda since_dt: 100)
+    monkeypatch.setattr(
+        scheduler,
+        "_count_long_window_orders_since",
+        lambda since_dt: 0,
+    )
     monkeypatch.setattr(scheduler, "get_recent_execution_rate", lambda days=7, since_dt=None: 0.51)
     monkeypatch.setattr(
         scheduler,
@@ -640,6 +1056,106 @@ def test_should_retrain_skips_quality_triggers_during_post_deploy_grace(
 
     assert should_retrain is False
     assert reason is None
+
+
+def test_post_deploy_order_count_uses_created_at_for_model_attribution(
+    tmp_path, scheduler_module
+):
+    db_path = tmp_path / "orders.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                order_timestamp TEXT,
+                created_at TEXT,
+                status TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?)",
+            [
+                ("2026-04-01 09:50:00", "2026-04-01 10:05:00", "EXECUTED"),
+                ("2026-04-01 10:10:00", "2026-04-01 09:55:00", "FAILED"),
+            ],
+        )
+
+    scheduler = scheduler_module.RetrainingScheduler(
+        db_path=str(db_path),
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    deployed_at = __import__("datetime").datetime(2026, 4, 1, 10, 0, 0)
+
+    assert scheduler._count_orders_since(deployed_at) == 1
+
+
+def test_zero_liquidity_requires_resolved_samples_and_zero_executions(
+    tmp_path, scheduler_module, monkeypatch
+):
+    db_path = tmp_path / "orders.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                currency TEXT,
+                period INTEGER,
+                created_at TEXT,
+                status TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?)",
+            [
+                ("fUST", 30, f"2026-04-01 0{hour}:00:00", "FAILED")
+                for hour in range(4)
+            ] + [
+                ("fUST", 60, f"2026-04-01 0{hour}:00:00", "PENDING")
+                for hour in range(6)
+            ] + [
+                ("fUST", 90, f"2026-04-01 0{hour}:00:00", "EXPIRED")
+                for hour in range(6)
+            ],
+        )
+
+    scheduler = scheduler_module.RetrainingScheduler(
+        db_path=str(db_path),
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    scheduler.policy = {"retrain_trigger": {"zero_liq_min_decided_orders": 5}}
+    since_dt = __import__("datetime").datetime(2026, 4, 1, 0, 0, 0)
+
+    class _FrozenDatetime:
+        @classmethod
+        def now(cls):
+            return __import__("datetime").datetime(2026, 4, 2, 0, 0, 0)
+
+    monkeypatch.setattr(scheduler_module, "datetime", _FrozenDatetime)
+
+    assert scheduler._check_zero_liquidity_anomaly(since_dt=since_dt) == []
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?)",
+            ("fUST", 30, "2026-04-01 04:00:00", "FAILED"),
+        )
+
+    anomalies = scheduler._check_zero_liquidity_anomaly(since_dt=since_dt)
+    assert [(row[0], row[1], row[3], row[4]) for row in anomalies] == [
+        ("fUST", 30, 5, 0)
+    ]
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?)",
+            ("fUST", 30, "2026-04-01 05:00:00", "EXECUTED"),
+        )
+
+    assert scheduler._check_zero_liquidity_anomaly(since_dt=since_dt) == []
 
 
 def test_should_retrain_uses_post_deploy_window_for_quality_triggers(
@@ -715,6 +1231,11 @@ def test_should_retrain_uses_post_deploy_window_for_quality_triggers(
         "_count_orders_since",
         lambda since_dt: 60,
     )
+    monkeypatch.setattr(
+        scheduler,
+        "_count_long_window_orders_since",
+        lambda since_dt: 0,
+    )
 
     should_retrain, reason = scheduler.should_retrain()
 
@@ -722,6 +1243,143 @@ def test_should_retrain_uses_post_deploy_window_for_quality_triggers(
     assert "单period成交率极低" in reason
     assert captured["exec_since"] == __import__("datetime").datetime.fromtimestamp(deployed_ts)
     assert captured["period_since"] == __import__("datetime").datetime.fromtimestamp(deployed_ts)
+
+
+def test_should_retrain_defers_high_execution_until_full_validation_window(
+    tmp_path, scheduler_module, monkeypatch, capsys
+):
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    meta = model_dir / "fUSD_model_balanced_meta.json"
+    meta.write_text("{}", encoding="utf-8")
+
+    now_ts = 1_700_000_000
+    deployed_ts = now_ts - 36 * 3600
+    os.utime(meta, (deployed_ts, deployed_ts))
+
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(model_dir),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    class _FrozenDatetime:
+        @classmethod
+        def now(cls):
+            return __import__("datetime").datetime.fromtimestamp(now_ts)
+
+        @classmethod
+        def fromtimestamp(cls, ts):
+            return __import__("datetime").datetime.fromtimestamp(ts)
+
+        @classmethod
+        def strptime(cls, value, fmt):
+            return __import__("datetime").datetime.strptime(value, fmt)
+
+    high_anomaly = {
+        "currency": "fUSD",
+        "period": 7,
+        "exec_rate": 1.0,
+        "total": 10,
+        "severity": "critical",
+    }
+    monkeypatch.setattr(scheduler_module, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(scheduler, "count_new_execution_results", lambda since_date: 0)
+    monkeypatch.setattr(scheduler, "_count_orders_since", lambda since_dt: 100)
+    monkeypatch.setattr(
+        scheduler,
+        "_count_long_window_orders_since",
+        lambda since_dt: 0,
+    )
+    monkeypatch.setattr(scheduler, "get_recent_execution_rate", lambda days=7, since_dt=None: 0.90)
+    monkeypatch.setattr(
+        scheduler,
+        "get_per_period_execution_anomalies",
+        lambda days=7, since_dt=None: [high_anomaly],
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_get_follow_stability_metrics",
+        lambda days=7, since_dt=None: {
+            "samples": 100,
+            "follow_mae": 0.0,
+            "follow_mae_ratio": 0.0,
+            "direction_match_rate": 0.50,
+            "p120_samples": 0,
+            "p120_step_p95": 0.0,
+        },
+    )
+    monkeypatch.setattr(scheduler, "_check_zero_liquidity_anomaly", lambda since_dt=None: [])
+    monkeypatch.setattr(scheduler, "_check_market_divergence_trigger", lambda since_dt=None: False)
+
+    should_retrain, reason = scheduler.should_retrain()
+    output = capsys.readouterr().out
+
+    assert should_retrain is False
+    assert reason is None
+    assert "全局成交率: 90.00% (偏高，等待 72h/120条已决/20条72h结果后再判断)" in output
+    assert "分组异常: 1条高成交率信号等待成熟" in output
+    assert "全局成交率: 90.00% (正常范围" not in output
+
+
+def test_should_retrain_allows_high_execution_after_full_validation_window(
+    tmp_path, scheduler_module, monkeypatch
+):
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    meta = model_dir / "fUSD_model_balanced_meta.json"
+    meta.write_text("{}", encoding="utf-8")
+
+    now_ts = 1_700_000_000
+    deployed_ts = now_ts - 80 * 3600
+    os.utime(meta, (deployed_ts, deployed_ts))
+
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(model_dir),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    class _FrozenDatetime:
+        @classmethod
+        def now(cls):
+            return __import__("datetime").datetime.fromtimestamp(now_ts)
+
+        @classmethod
+        def fromtimestamp(cls, ts):
+            return __import__("datetime").datetime.fromtimestamp(ts)
+
+        @classmethod
+        def strptime(cls, value, fmt):
+            return __import__("datetime").datetime.strptime(value, fmt)
+
+    monkeypatch.setattr(scheduler_module, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(scheduler, "count_new_execution_results", lambda since_date: 0)
+    monkeypatch.setattr(scheduler, "_count_orders_since", lambda since_dt: 160)
+    monkeypatch.setattr(
+        scheduler,
+        "_count_long_window_orders_since",
+        lambda since_dt: 25,
+    )
+    monkeypatch.setattr(scheduler, "get_recent_execution_rate", lambda days=7, since_dt=None: 0.90)
+    monkeypatch.setattr(scheduler, "get_per_period_execution_anomalies", lambda days=7, since_dt=None: [])
+    monkeypatch.setattr(
+        scheduler,
+        "_get_follow_stability_metrics",
+        lambda days=7, since_dt=None: {
+            "samples": 160,
+            "follow_mae": 0.0,
+            "follow_mae_ratio": 0.0,
+            "direction_match_rate": 0.50,
+            "p120_samples": 0,
+            "p120_step_p95": 0.0,
+        },
+    )
+
+    should_retrain, reason = scheduler.should_retrain()
+
+    assert should_retrain is True
+    assert "全局成交率过高" in reason
 
 
 def test_log_retraining_event_keeps_multiple_same_day_entries(tmp_path, scheduler_module, monkeypatch):

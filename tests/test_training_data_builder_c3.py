@@ -582,6 +582,12 @@ def test_prepare_features_excludes_path_identity_and_validation_columns(tmp_path
     df["update_cycle_id"] = list(range(101, 101 + row_count))
     df["recommendation_rank"] = list(range(1, 1 + row_count))
     df["rank_weight"] = np.linspace(1.0, 0.5, row_count)
+    df["validated_at"] = pd.date_range(
+        "2026-04-02",
+        periods=row_count,
+        freq="h",
+    )
+    df["validation_window_hours"] = 72
 
     trainer = EnhancedModelTrainer(db_path=str(db_path), model_dir=str(tmp_path / "models"))
     feature_cols = trainer.prepare_features(df)
@@ -598,6 +604,53 @@ def test_prepare_features_excludes_path_identity_and_validation_columns(tmp_path
     assert "realized_terminal_mode" not in feature_cols
     assert "realized_terminal_value" not in feature_cols
     assert "realized_wait_hours" not in feature_cols
+    assert "validated_at" not in feature_cols
+    assert "validation_window_hours" not in feature_cols
+
+
+def test_load_execution_results_excludes_labels_resolved_after_training_cutoff(
+    tmp_path,
+):
+    db_path = tmp_path / "validation_cutoff.sqlite"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                order_timestamp TEXT,
+                currency TEXT,
+                period INTEGER,
+                predicted_rate REAL,
+                status TEXT,
+                validated_at TEXT,
+                validation_window_hours INTEGER
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO virtual_orders VALUES (?, 'fUSD', 30, 10.0, 'EXECUTED', ?, 72)
+            """,
+            [
+                ("2026-04-01 00:00:00", "2026-04-04 00:00:00"),
+                ("2026-04-02 00:00:00", "2026-04-11 00:00:00"),
+                ("2026-04-03 00:00:00", None),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    builder = TrainingDataBuilder(str(db_path))
+    results = builder.load_execution_results(
+        "2026-04-01 00:00:00",
+        "2026-04-10 00:00:00",
+    )
+
+    assert len(results) == 1
+    assert results.iloc[0]["validated_at"] == pd.Timestamp(
+        "2026-04-04 00:00:00"
+    )
 
 
 def test_prepare_training_data_keeps_order_feedback_out_of_traditional_targets(tmp_path):
@@ -659,7 +712,7 @@ def test_train_single_target_skips_classification_when_validation_split_has_sing
 
 def test_train_single_target_regression_path_still_trains(tmp_path):
     trainer = _RecordingTrainer(db_path=tmp_path / "unused.sqlite", model_dir=tmp_path / "models")
-    df = _make_training_frame("future_conservative", np.linspace(1.0, 2.0, 120))
+    df = _make_training_frame("future_conservative", np.linspace(1.0, 2.0, 360))
 
     result = trainer.train_single_target(
         currency="fUSD",
@@ -675,8 +728,28 @@ def test_train_single_target_regression_path_still_trains(tmp_path):
     assert set(weights) == {"xgb", "lgb", "cat"}
     calls_by_model = {call[0]: call[1:] for call in trainer.calls}
     assert calls_by_model == {
-        "xgb_reg": (108, 12),
-        "lgb_reg": (108, 12),
-        "cat_reg": (108, 12),
+        "xgb_reg": (204, 36),
+        "lgb_reg": (204, 36),
+        "cat_reg": (204, 36),
     }
     assert trainer.saved["task_type"] == "regression"
+
+
+def test_classification_ensemble_weights_exclude_below_random_models():
+    weights = EnhancedModelTrainer._calculate_ensemble_weights(
+        {"xgb": 0.429, "lgb": 0.529, "cat": 0.585},
+        "classification",
+    )
+
+    assert weights["xgb"] == 0.0
+    assert np.isclose(weights["lgb"], 0.029 / 0.114)
+    assert np.isclose(weights["cat"], 0.085 / 0.114)
+
+
+def test_classification_ensemble_weights_fall_back_to_best_weak_model():
+    weights = EnhancedModelTrainer._calculate_ensemble_weights(
+        {"xgb": 0.41, "lgb": 0.49, "cat": 0.45},
+        "classification",
+    )
+
+    assert weights == {"xgb": 0.0, "lgb": 1.0, "cat": 0.0}

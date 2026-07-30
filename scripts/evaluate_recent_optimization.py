@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from pathlib import Path
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "lending_history.db"
 DEFAULT_RESULT = Path(__file__).resolve().parent.parent / "data" / "optimal_combination.json"
+DEFAULT_MODEL_DIR = Path(__file__).resolve().parent.parent / "data" / "models"
 FRESHNESS_TARGETS = {"fUSD": 300.0, "fUST": 900.0}
 SUPPORTED_CURRENCIES = {"fUSD", "fUST"}
 SUPPORTED_PERIODS = {2, 3, 4, 5, 6, 7, 10, 14, 15, 20, 30, 60, 90, 120}
@@ -38,6 +40,302 @@ class WindowMetric:
     @property
     def execution_rate(self) -> float:
         return (self.executed / self.total) if self.total else 0.0
+
+
+def infer_model_deployment_time(model_dir: Path) -> datetime | None:
+    history_path = model_dir.parent / "retraining_history.json"
+    if history_path.exists():
+        try:
+            raw_history = json.loads(history_path.read_text(encoding="utf-8"))
+            entries = (
+                raw_history
+                if isinstance(raw_history, list)
+                else list(raw_history.values())
+                if isinstance(raw_history, dict)
+                else []
+            )
+            deployed_times = []
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("deployed") is not True:
+                    continue
+                try:
+                    deployed_times.append(
+                        datetime.strptime(
+                            entry.get("timestamp", ""),
+                            "%Y-%m-%d %H:%M:%S",
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+            if deployed_times:
+                return max(deployed_times)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    meta_files = list(model_dir.glob("*_meta.json"))
+    if not meta_files:
+        return None
+    return datetime.fromtimestamp(max(path.stat().st_mtime for path in meta_files))
+
+
+def _binary_auc(labels: list[int], scores: list[float]) -> float | None:
+    positives = [score for label, score in zip(labels, scores) if label == 1]
+    negatives = [score for label, score in zip(labels, scores) if label == 0]
+    if not positives or not negatives:
+        return None
+    wins = 0.0
+    for positive in positives:
+        for negative in negatives:
+            if positive > negative:
+                wins += 1.0
+            elif positive == negative:
+                wins += 0.5
+    return wins / (len(positives) * len(negatives))
+
+
+def _expected_calibration_error(
+    labels: list[int],
+    scores: list[float],
+    bins: int = 10,
+) -> float | None:
+    if not labels:
+        return None
+    total = len(labels)
+    error = 0.0
+    for index in range(bins):
+        lower = index / bins
+        upper = (index + 1) / bins
+        selected = [
+            (label, score)
+            for label, score in zip(labels, scores)
+            if lower <= score < upper or (index == bins - 1 and score == 1.0)
+        ]
+        if not selected:
+            continue
+        observed = sum(label for label, _ in selected) / len(selected)
+        predicted = sum(score for _, score in selected) / len(selected)
+        error += len(selected) / total * abs(observed - predicted)
+    return error
+
+
+def _probability_metrics(labels: list[int], scores: list[float]) -> dict:
+    if not labels:
+        return {"mean": None, "auc": None, "brier": None, "ece": None}
+    clipped = [max(0.0, min(1.0, float(score))) for score in scores]
+    return {
+        "mean": sum(clipped) / len(clipped),
+        "auc": _binary_auc(labels, clipped),
+        "brier": sum((score - label) ** 2 for label, score in zip(labels, clipped)) / len(labels),
+        "ece": _expected_calibration_error(labels, clipped),
+    }
+
+
+def _pearson(values_x: list[float], values_y: list[float]) -> float | None:
+    if len(values_x) < 3 or len(values_x) != len(values_y):
+        return None
+    mean_x = sum(values_x) / len(values_x)
+    mean_y = sum(values_y) / len(values_y)
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(values_x, values_y))
+    denom_x = math.sqrt(sum((x - mean_x) ** 2 for x in values_x))
+    denom_y = math.sqrt(sum((y - mean_y) ** 2 for y in values_y))
+    if denom_x <= 1e-12 or denom_y <= 1e-12:
+        return None
+    return numerator / (denom_x * denom_y)
+
+
+def fetch_deployment_cohort_metrics(
+    conn: sqlite3.Connection,
+    deployed_at: datetime,
+) -> dict:
+    deployed_text = deployed_at.strftime("%Y-%m-%d %H:%M:%S")
+    virtual_columns = _get_virtual_order_columns(conn)
+    prediction_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(prediction_history)").fetchall()
+    }
+    stage1_select = (
+        "v.stage1_fill_probability"
+        if "stage1_fill_probability" in virtual_columns
+        else "NULL"
+    )
+    traditional_select = (
+        "p.traditional_execution_probability"
+        if "traditional_execution_probability" in prediction_columns
+        else "NULL"
+    )
+    v2_select = (
+        "p.v2_execution_probability"
+        if "v2_execution_probability" in prediction_columns
+        else "NULL"
+    )
+    model_version_select = (
+        "v.model_version"
+        if "model_version" in virtual_columns
+        else "NULL"
+    )
+    order_market_select = (
+        "COALESCE(p.current_market_rate, v.market_median)"
+        if "current_market_rate" in prediction_columns
+        else "v.market_median"
+    )
+    rows = conn.execute(
+        f"""
+        SELECT
+            v.status,
+            v.validation_window_hours,
+            v.predicted_rate,
+            {order_market_select} AS order_market_rate,
+            v.path_value_score,
+            v.realized_terminal_value,
+            p.execution_probability,
+            COALESCE(
+                p.calibrated_execution_probability,
+                p.execution_probability
+            ) AS calibrated_probability,
+            {stage1_select} AS stage1_probability,
+            {traditional_select} AS traditional_probability,
+            {v2_select} AS v2_probability,
+            {model_version_select} AS model_version
+        FROM virtual_orders AS v
+        LEFT JOIN prediction_history AS p
+          ON p.rowid = (
+              SELECT p2.rowid
+              FROM prediction_history AS p2
+              WHERE p2.update_cycle_id = v.update_cycle_id
+                AND p2.currency = v.currency
+                AND p2.period = v.period
+                AND (
+                    v.candidate_id IS NULL
+                    OR p2.candidate_id = v.candidate_id
+                )
+              ORDER BY p2.rowid DESC
+              LIMIT 1
+          )
+        WHERE v.created_at >= ?
+        """,
+        (deployed_text,),
+    ).fetchall()
+
+    status_counts = defaultdict(int)
+    maturity_by_window = defaultdict(lambda: {"total": 0, "decided": 0})
+    labels = []
+    raw_scores = []
+    calibrated_scores = []
+    stage1_labels = []
+    stage1_scores = []
+    traditional_labels = []
+    traditional_scores = []
+    v2_labels = []
+    v2_scores = []
+    model_versions = defaultdict(int)
+    realized_values = []
+    market_values = []
+    predicted_values = []
+    path_values = []
+
+    for row in rows:
+        (
+            status,
+            window_hours,
+            predicted_rate,
+            market_median,
+            path_value,
+            realized_value,
+            raw_probability,
+            calibrated_probability,
+            stage1_probability,
+            traditional_probability,
+            v2_probability,
+            model_version,
+        ) = row
+        status_counts[status] += 1
+        model_versions[model_version or "unknown"] += 1
+        window = int(window_hours or 0)
+        maturity_by_window[window]["total"] += 1
+        if status in {"EXECUTED", "FAILED"}:
+            maturity_by_window[window]["decided"] += 1
+
+        if status in {"EXECUTED", "FAILED"}:
+            label = 1 if status == "EXECUTED" else 0
+            if raw_probability is not None and calibrated_probability is not None:
+                labels.append(label)
+                raw_scores.append(float(raw_probability))
+                calibrated_scores.append(float(calibrated_probability))
+            if stage1_probability is not None:
+                stage1_labels.append(label)
+                stage1_scores.append(float(stage1_probability))
+            if traditional_probability is not None:
+                traditional_labels.append(label)
+                traditional_scores.append(float(traditional_probability))
+            if v2_probability is not None:
+                v2_labels.append(label)
+                v2_scores.append(float(v2_probability))
+
+        if (
+            status in {"EXECUTED", "FAILED"}
+            and realized_value is not None
+            and market_median is not None
+        ):
+            realized_values.append(float(realized_value))
+            market_values.append(float(market_median))
+            predicted_values.append(float(predicted_rate))
+            path_values.append(float(path_value) if path_value is not None else math.nan)
+
+    decided = sum(status_counts[name] for name in ("EXECUTED", "FAILED"))
+    path_pairs = [
+        (path, realized)
+        for path, realized in zip(path_values, realized_values)
+        if math.isfinite(path)
+    ]
+    return {
+        "deployed_at": deployed_text,
+        "total": len(rows),
+        "decided": decided,
+        "pending": status_counts["PENDING"],
+        "executed": status_counts["EXECUTED"],
+        "failed": status_counts["FAILED"],
+        "expired": status_counts["EXPIRED"],
+        "model_versions": dict(sorted(model_versions.items())),
+        "execution_rate": (
+            status_counts["EXECUTED"] / (status_counts["EXECUTED"] + status_counts["FAILED"])
+            if status_counts["EXECUTED"] + status_counts["FAILED"]
+            else None
+        ),
+        "maturity_by_window": dict(sorted(maturity_by_window.items())),
+        "raw_probability": _probability_metrics(labels, raw_scores),
+        "calibrated_probability": _probability_metrics(labels, calibrated_scores),
+        "stage1_probability": _probability_metrics(stage1_labels, stage1_scores),
+        "traditional_probability": _probability_metrics(
+            traditional_labels,
+            traditional_scores,
+        ),
+        "v2_probability": _probability_metrics(v2_labels, v2_scores),
+        "value_samples": len(realized_values),
+        "avg_realized_value": (
+            sum(realized_values) / len(realized_values) if realized_values else None
+        ),
+        "realized_premium_vs_market": (
+            sum(realized - market for realized, market in zip(realized_values, market_values))
+            / len(realized_values)
+            if realized_values
+            else None
+        ),
+        "predicted_premium_vs_market": (
+            sum(predicted - market for predicted, market in zip(predicted_values, market_values))
+            / len(predicted_values)
+            if predicted_values
+            else None
+        ),
+        "path_mae": (
+            sum(abs(path - realized) for path, realized in path_pairs) / len(path_pairs)
+            if path_pairs
+            else None
+        ),
+        "path_pearson": _pearson(
+            [path for path, _ in path_pairs],
+            [realized for _, realized in path_pairs],
+        ),
+    }
 
 
 def format_pct(value: float | None) -> str:
@@ -258,7 +556,8 @@ def build_combo_delta(recent: dict, previous: dict, min_total: int) -> list[dict
         prev_metric = previous.get(combo)
         recent_total = recent_metric.total if recent_metric else 0
         prev_total = prev_metric.total if prev_metric else 0
-        if max(recent_total, prev_total) < min_total:
+        # Avoid presenting an immature/missing cohort as a real 0% regression.
+        if recent_total < min_total or prev_total < min_total:
             continue
         recent_rate = recent_metric.execution_rate if recent_metric else 0.0
         prev_rate = prev_metric.execution_rate if prev_metric else 0.0
@@ -289,15 +588,26 @@ def main():
     parser = argparse.ArgumentParser(description="评估最近优化效果")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite 数据库路径")
     parser.add_argument("--result", default=str(DEFAULT_RESULT), help="预测结果 JSON 路径")
+    parser.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR), help="生产模型目录")
+    parser.add_argument(
+        "--deployment-at",
+        help="显式指定模型部署时间 (YYYY-MM-DD HH:MM:SS)，默认从 meta mtime 推断",
+    )
     parser.add_argument("--days", type=int, default=7, help="对比窗口天数")
     parser.add_argument("--min-combo-orders", type=int, default=5, help="组合对比最小订单数")
     args = parser.parse_args()
 
     db_path = Path(args.db)
     result_path = Path(args.result)
+    model_dir = Path(args.model_dir)
     now = datetime.now()
     recent_start = now - timedelta(days=args.days)
     prev_start = now - timedelta(days=args.days * 2)
+
+    if args.deployment_at:
+        deployed_at = datetime.strptime(args.deployment_at, "%Y-%m-%d %H:%M:%S")
+    else:
+        deployed_at = infer_model_deployment_time(model_dir)
 
     with sqlite3.connect(db_path) as conn:
         recent_overall = fetch_window_metric(conn, recent_start, now)
@@ -313,6 +623,11 @@ def main():
         history_status = fetch_prediction_history_status(conn)
         recent_path = fetch_path_metrics(conn, recent_start, now)
         previous_path = fetch_path_metrics(conn, prev_start, recent_start)
+        deployment_metrics = (
+            fetch_deployment_cohort_metrics(conn, deployed_at)
+            if deployed_at is not None
+            else None
+        )
 
     result_file = load_result_file(result_path)
     combo_deltas = build_combo_delta(recent_combo, previous_combo, args.min_combo_orders)
@@ -427,6 +742,55 @@ def main():
         f"- terminal_mode_matrix(recent): "
         f"{json.dumps(recent_path['terminal_mode_matrix'], ensure_ascii=False, sort_keys=True)}"
     )
+    print()
+
+    print("八、当前生产模型成熟度")
+    if deployment_metrics is None:
+        print("- 无法识别生产模型部署时间")
+    else:
+        metric = deployment_metrics
+        model_age_hours = (now - deployed_at).total_seconds() / 3600.0
+        print(
+            f"- 部署时间: {metric['deployed_at']} (age={model_age_hours:.1f}h), "
+            f"成熟: {metric['decided']}/{metric['total']}, pending={metric['pending']}"
+        )
+        print(
+            f"- 模型版本分布: "
+            f"{json.dumps(metric['model_versions'], ensure_ascii=False, sort_keys=True)}"
+        )
+        for window, counts in metric["maturity_by_window"].items():
+            print(
+                f"  {window}h: {counts['decided']}/{counts['total']} 已决"
+            )
+        print(
+            f"- 已决成交率: {format_pct(metric['execution_rate'])} "
+            f"({metric['executed']}/{metric['executed'] + metric['failed']})"
+        )
+        for label, key in [
+            ("混合原始", "raw_probability"),
+            ("校准", "calibrated_probability"),
+            ("候选Stage1", "stage1_probability"),
+            ("传统模型", "traditional_probability"),
+            ("v2模型", "v2_probability"),
+        ]:
+            probability = metric[key]
+            if probability["mean"] is None:
+                continue
+            print(
+                f"- {label}: mean={format_pct(probability['mean'])}, "
+                f"AUC={format_num(probability['auc'], 3)}, "
+                f"Brier={format_num(probability['brier'], 4)}, "
+                f"ECE={format_pct(probability['ece'])}"
+            )
+        print(
+            f"- 兑现溢价/下单时市场: {format_num(metric['realized_premium_vs_market'], 3)}, "
+            f"预测溢价/下单时市场: {format_num(metric['predicted_premium_vs_market'], 3)}"
+        )
+        print(
+            f"- 路径 MAE={format_num(metric['path_mae'], 3)}, "
+            f"Pearson={format_num(metric['path_pearson'], 3)}, "
+            f"samples={metric['value_samples']}"
+        )
 
 
 if __name__ == "__main__":

@@ -2,7 +2,16 @@ import json
 import time
 from datetime import datetime
 
+import pytest
+
 import scripts.health_check as health_check
+
+
+@pytest.fixture(autouse=True)
+def isolate_health_check_log(tmp_path, monkeypatch):
+    log_dir = tmp_path / "health-log"
+    monkeypatch.setattr(health_check, "LOG_DIR", str(log_dir))
+    monkeypatch.setattr(health_check, "HEALTH_LOG", str(log_dir / "health_check.log"))
 
 
 def test_check_service_falls_back_to_http_when_systemd_bus_unavailable(monkeypatch):

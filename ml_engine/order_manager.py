@@ -195,7 +195,7 @@ class OrderManager:
                 validation_window,
                 prediction.get('confidence', 'Medium'),
                 prediction.get('strategy', 'Unknown'),
-                'v1.0',  # Model version
+                prediction.get('model_version', 'v1.0'),
                 current_time,  # created_at is when order was inserted
                 prediction.get('update_cycle_id'),
                 prediction.get('recommendation_rank'),

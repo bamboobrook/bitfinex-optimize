@@ -207,6 +207,22 @@ class PredictorRank6FallbackTest(unittest.TestCase):
         self.assertIs(result["market_liquidity"]["fUSD"]["book_live"], True)
         self.assertIsNone(result["market_liquidity"]["fUSD"]["volume_ratio_24h"])
 
+    def test_generate_recommendations_exposes_calibrated_probability_as_primary(self):
+        predictions = self.predictor.get_latest_predictions()
+        self.predictor._stale_issues = []
+        for prediction in predictions:
+            prediction["execution_probability"] = 0.91
+            prediction["calibrated_execution_prob"] = 0.37
+        self.predictor.get_latest_predictions = lambda: predictions
+
+        self.predictor.generate_recommendations(str(self.output_path))
+
+        result = json.loads(self.output_path.read_text())
+        details = result["recommendations"][0]["details"]
+        self.assertEqual(details["execution_probability"], 0.37)
+        self.assertEqual(details["calibrated_execution_probability"], 0.37)
+        self.assertEqual(details["raw_execution_probability"], 0.91)
+
     def test_generate_recommendations_keeps_previous_json_when_replace_fails(self):
         self.output_path.write_text(json.dumps({"status": "old", "recommendations": []}))
 

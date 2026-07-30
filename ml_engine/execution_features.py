@@ -149,6 +149,10 @@ class ExecutionFeatures:
         return conn
 
     @staticmethod
+    def _as_of_token(as_of_date: datetime) -> str:
+        return as_of_date.strftime('%Y%m%d%H%M%S')
+
+    @staticmethod
     def get_period_window_profile(period: int, profile_name: Optional[str] = None) -> Dict[str, int]:
         """Expose period window profile for other modules."""
         return get_period_window_profile(period, profile_name)
@@ -168,12 +172,14 @@ class ExecutionFeatures:
         Returns:
             Execution rate (0.0-1.0), default 0.7 if no data
         """
-        cache_key = f"exec_rate_{currency}_{period}_{lookback_days}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-
         if as_of_date is None:
             as_of_date = datetime.now()
+        cache_key = (
+            f"exec_rate_{currency}_{period}_{lookback_days}_"
+            f"{self._as_of_token(as_of_date)}"
+        )
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         start_date = as_of_date - timedelta(days=lookback_days)
 
@@ -190,6 +196,8 @@ class ExecutionFeatures:
               AND period = ?
               AND order_timestamp >= ?
               AND order_timestamp <= ?
+              AND validated_at IS NOT NULL
+              AND validated_at <= ?
               AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
             """
 
@@ -197,7 +205,8 @@ class ExecutionFeatures:
                 currency,
                 period,
                 start_date.strftime('%Y-%m-%d %H:%M:%S'),
-                as_of_date.strftime('%Y-%m-%d %H:%M:%S')
+                as_of_date.strftime('%Y-%m-%d %H:%M:%S'),
+                as_of_date.strftime('%Y-%m-%d %H:%M:%S'),
             ))
 
             row = cursor.fetchone()
@@ -225,8 +234,15 @@ class ExecutionFeatures:
                     "SELECT COUNT(*) FROM virtual_orders "
                     "WHERE currency = ? AND period = ? "
                     "AND status IN ('EXECUTED', 'FAILED', 'EXPIRED') "
-                    "AND order_timestamp >= ?",
-                    (currency, period, cutoff_90d)
+                    "AND order_timestamp >= ? AND order_timestamp <= ? "
+                    "AND validated_at IS NOT NULL AND validated_at <= ?",
+                    (
+                        currency,
+                        period,
+                        cutoff_90d,
+                        as_of_date.strftime('%Y-%m-%d %H:%M:%S'),
+                        as_of_date.strftime('%Y-%m-%d %H:%M:%S'),
+                    )
                 )
                 total_ever = cursor2.fetchone()[0] or 0
 
@@ -255,8 +271,13 @@ class ExecutionFeatures:
         finally:
             conn.close()
 
-    def calculate_avg_spread(self, currency: str, period: int,
-                            lookback_days: int) -> float:
+    def calculate_avg_spread(
+        self,
+        currency: str,
+        period: int,
+        lookback_days: int,
+        as_of_date: Optional[datetime] = None,
+    ) -> float:
         """
         Calculate average spread for executed orders
         Spread = execution_rate - predicted_rate
@@ -264,11 +285,19 @@ class ExecutionFeatures:
         Returns:
             Average spread (%), 0.0 if no data
         """
-        cache_key = f"avg_spread_{currency}_{period}_{lookback_days}"
+        if as_of_date is None:
+            as_of_date = datetime.now()
+        cache_key = (
+            f"avg_spread_{currency}_{period}_{lookback_days}_"
+            f"{self._as_of_token(as_of_date)}"
+        )
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        start_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d %H:%M:%S')
+        start_date = (
+            as_of_date - timedelta(days=lookback_days)
+        ).strftime('%Y-%m-%d %H:%M:%S')
+        as_of_text = as_of_date.strftime('%Y-%m-%d %H:%M:%S')
 
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -281,9 +310,15 @@ class ExecutionFeatures:
               AND period = ?
               AND status = 'EXECUTED'
               AND order_timestamp >= ?
+              AND order_timestamp <= ?
+              AND validated_at IS NOT NULL
+              AND validated_at <= ?
             """
 
-            cursor.execute(query, (currency, period, start_date))
+            cursor.execute(
+                query,
+                (currency, period, start_date, as_of_text, as_of_text),
+            )
             row = cursor.fetchone()
 
             avg_spread = row[0] if row[0] is not None else 0.0
@@ -293,8 +328,13 @@ class ExecutionFeatures:
         finally:
             conn.close()
 
-    def calculate_avg_rate_gap(self, currency: str, period: int,
-                               lookback_days: int) -> float:
+    def calculate_avg_rate_gap(
+        self,
+        currency: str,
+        period: int,
+        lookback_days: int,
+        as_of_date: Optional[datetime] = None,
+    ) -> float:
         """
         Calculate average rate gap for failed orders
         Rate gap = predicted_rate - max_market_rate
@@ -302,11 +342,19 @@ class ExecutionFeatures:
         Returns:
             Average gap (%), 0.0 if no data
         """
-        cache_key = f"avg_gap_{currency}_{period}_{lookback_days}"
+        if as_of_date is None:
+            as_of_date = datetime.now()
+        cache_key = (
+            f"avg_gap_{currency}_{period}_{lookback_days}_"
+            f"{self._as_of_token(as_of_date)}"
+        )
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        start_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d %H:%M:%S')
+        start_date = (
+            as_of_date - timedelta(days=lookback_days)
+        ).strftime('%Y-%m-%d %H:%M:%S')
+        as_of_text = as_of_date.strftime('%Y-%m-%d %H:%M:%S')
 
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -319,10 +367,16 @@ class ExecutionFeatures:
               AND period = ?
               AND status = 'FAILED'
               AND order_timestamp >= ?
+              AND order_timestamp <= ?
+              AND validated_at IS NOT NULL
+              AND validated_at <= ?
               AND rate_gap IS NOT NULL
             """
 
-            cursor.execute(query, (currency, period, start_date))
+            cursor.execute(
+                query,
+                (currency, period, start_date, as_of_text, as_of_text),
+            )
             row = cursor.fetchone()
 
             avg_gap = row[0] if row[0] is not None else 0.0
@@ -332,9 +386,14 @@ class ExecutionFeatures:
         finally:
             conn.close()
 
-    def calculate_execution_delay_percentile(self, currency: str, period: int,
-                                             lookback_days: int,
-                                             percentile: float = 0.5) -> float:
+    def calculate_execution_delay_percentile(
+        self,
+        currency: str,
+        period: int,
+        lookback_days: int,
+        percentile: float = 0.5,
+        as_of_date: Optional[datetime] = None,
+    ) -> float:
         """
         Calculate execution delay percentile
 
@@ -347,11 +406,19 @@ class ExecutionFeatures:
         Returns:
             Delay in minutes, 0.0 if no data
         """
-        cache_key = f"delay_p{int(percentile*100)}_{currency}_{period}_{lookback_days}"
+        if as_of_date is None:
+            as_of_date = datetime.now()
+        cache_key = (
+            f"delay_p{int(percentile*100)}_{currency}_{period}_{lookback_days}_"
+            f"{self._as_of_token(as_of_date)}"
+        )
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        start_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d %H:%M:%S')
+        start_date = (
+            as_of_date - timedelta(days=lookback_days)
+        ).strftime('%Y-%m-%d %H:%M:%S')
+        as_of_text = as_of_date.strftime('%Y-%m-%d %H:%M:%S')
 
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -364,11 +431,17 @@ class ExecutionFeatures:
               AND period = ?
               AND status = 'EXECUTED'
               AND order_timestamp >= ?
+              AND order_timestamp <= ?
+              AND validated_at IS NOT NULL
+              AND validated_at <= ?
               AND execution_delay_minutes IS NOT NULL
             ORDER BY execution_delay_minutes
             """
 
-            cursor.execute(query, (currency, period, start_date))
+            cursor.execute(
+                query,
+                (currency, period, start_date, as_of_text, as_of_text),
+            )
             delays = [row[0] for row in cursor.fetchall()]
 
             if not delays:
@@ -382,7 +455,12 @@ class ExecutionFeatures:
         finally:
             conn.close()
 
-    def get_all_features(self, currency: str, period: int) -> Dict[str, float]:
+    def get_all_features(
+        self,
+        currency: str,
+        period: int,
+        as_of_date: Optional[datetime] = None,
+    ) -> Dict[str, float]:
         """
         Get all execution features for a currency/period combination
 
@@ -396,10 +474,30 @@ class ExecutionFeatures:
         gap_days = profile["gap_days"]
         delay_days = profile["delay_days"]
 
-        exec_rate_fast = self.calculate_execution_rate(currency, period, fast_days)
-        exec_rate_slow = self.calculate_execution_rate(currency, period, slow_days)
-        avg_spread_profile = self.calculate_avg_spread(currency, period, spread_days)
-        avg_gap_profile = self.calculate_avg_rate_gap(currency, period, gap_days)
+        exec_rate_fast = self.calculate_execution_rate(
+            currency,
+            period,
+            fast_days,
+            as_of_date=as_of_date,
+        )
+        exec_rate_slow = self.calculate_execution_rate(
+            currency,
+            period,
+            slow_days,
+            as_of_date=as_of_date,
+        )
+        avg_spread_profile = self.calculate_avg_spread(
+            currency,
+            period,
+            spread_days,
+            as_of_date=as_of_date,
+        )
+        avg_gap_profile = self.calculate_avg_rate_gap(
+            currency,
+            period,
+            gap_days,
+            as_of_date=as_of_date,
+        )
 
         features = {
             # Profile-aware primary fields
@@ -407,16 +505,38 @@ class ExecutionFeatures:
             'exec_rate_slow': exec_rate_slow,
             'avg_spread_profile': avg_spread_profile,
             'avg_rate_gap_failed_profile': avg_gap_profile,
-            'exec_delay_p50': self.calculate_execution_delay_percentile(currency, period, delay_days, 0.5),
-            'exec_delay_p90': self.calculate_execution_delay_percentile(currency, period, delay_days, 0.9),
+            'exec_delay_p50': self.calculate_execution_delay_percentile(
+                currency,
+                period,
+                delay_days,
+                0.5,
+                as_of_date=as_of_date,
+            ),
+            'exec_delay_p90': self.calculate_execution_delay_percentile(
+                currency,
+                period,
+                delay_days,
+                0.9,
+                as_of_date=as_of_date,
+            ),
 
             # Backward-compatible aliases
             'exec_rate_7d': exec_rate_fast,
             'exec_rate_30d': exec_rate_slow,
             'avg_spread_7d': avg_spread_profile,
-            'avg_spread_30d': self.calculate_avg_spread(currency, period, slow_days),
+            'avg_spread_30d': self.calculate_avg_spread(
+                currency,
+                period,
+                slow_days,
+                as_of_date=as_of_date,
+            ),
             'avg_rate_gap_failed_7d': avg_gap_profile,
-            'avg_rate_gap_failed_30d': self.calculate_avg_rate_gap(currency, period, slow_days),
+            'avg_rate_gap_failed_30d': self.calculate_avg_rate_gap(
+                currency,
+                period,
+                slow_days,
+                as_of_date=as_of_date,
+            ),
         }
 
         # Derived features
@@ -530,23 +650,50 @@ def calculate_execution_rate(currency: str, period: int, lookback_days: int,
     return calc.calculate_execution_rate(currency, period, lookback_days, as_of_date)
 
 
-def calculate_avg_spread(currency: str, period: int, lookback_days: int) -> float:
+def calculate_avg_spread(
+    currency: str,
+    period: int,
+    lookback_days: int,
+    as_of_date: Optional[datetime] = None,
+) -> float:
     """Standalone function to calculate average spread"""
     calc = ExecutionFeatures()
-    return calc.calculate_avg_spread(currency, period, lookback_days)
+    return calc.calculate_avg_spread(
+        currency,
+        period,
+        lookback_days,
+        as_of_date=as_of_date,
+    )
 
 
-def calculate_avg_rate_gap(currency: str, period: int, lookback_days: int) -> float:
+def calculate_avg_rate_gap(
+    currency: str,
+    period: int,
+    lookback_days: int,
+    as_of_date: Optional[datetime] = None,
+) -> float:
     """Standalone function to calculate average rate gap"""
     calc = ExecutionFeatures()
-    return calc.calculate_avg_rate_gap(currency, period, lookback_days)
+    return calc.calculate_avg_rate_gap(
+        currency,
+        period,
+        lookback_days,
+        as_of_date=as_of_date,
+    )
 
 
 def calculate_execution_delay_percentile(currency: str, period: int,
-                                        lookback_days: int, percentile: float) -> float:
+                                        lookback_days: int, percentile: float,
+                                        as_of_date: Optional[datetime] = None) -> float:
     """Standalone function to calculate execution delay percentile"""
     calc = ExecutionFeatures()
-    return calc.calculate_execution_delay_percentile(currency, period, lookback_days, percentile)
+    return calc.calculate_execution_delay_percentile(
+        currency,
+        period,
+        lookback_days,
+        percentile,
+        as_of_date=as_of_date,
+    )
 
 
 if __name__ == "__main__":

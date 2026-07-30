@@ -36,7 +36,20 @@
     "direction_match_threshold": 0.4,
     "p120_step_p95_threshold": 0.05,
     "global_exec_low": 0.30,
-    "global_exec_high": 0.6
+    "global_exec_high": 0.6,
+    "post_deploy_grace_hours": 12,
+    "post_deploy_min_orders": 40,
+    "post_deploy_high_exec_grace_hours": 72,
+    "post_deploy_high_exec_min_orders": 120,
+    "post_deploy_high_exec_min_72h_orders": 20,
+    "post_deploy_zero_liq_min_hours": 72,
+    "post_deploy_zero_liq_min_orders": 120,
+    "zero_liq_min_decided_orders": 5
+  },
+  "model_gate": {
+    "min_execution_v2_auc": 0.50,
+    "max_execution_v2_brier": 0.25,
+    "max_revenue_mae": 5.0
   },
   "combo_optimizer": {
     "combo_mode": "shadow",

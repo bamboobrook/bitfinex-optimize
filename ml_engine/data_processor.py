@@ -3,6 +3,7 @@ import numpy as np
 import sqlite3
 from loguru import logger
 import os
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Tuple
 from functools import partial
@@ -172,6 +173,8 @@ class DataProcessor:
         """
         # 避免 SettingWithCopyWarning
         df = group_df.copy()
+        if 'datetime' in df.columns:
+            df = df.sort_values('datetime', kind='mergesort')
 
         # ============ 1. 基础滞后特征 (保留原有) ============
         lags = [15, 30, 60, 120, 240, 1440] # 15m, 30m, 1h, 2h, 4h, 24h
@@ -265,14 +268,20 @@ class DataProcessor:
             from ml_engine.execution_features import ExecutionFeatures, get_period_window_profile
 
             # 获取当前币种和周期
-            currency = df['currency'].iloc[0] if 'currency' in df.columns else 'fUSD'
-            period = df['period'].iloc[0] if 'period' in df.columns else 30
+            currency = (
+                str(df['currency'].iloc[0])
+                if 'currency' in df.columns
+                else 'fUSD'
+            )
+            period = (
+                int(df['period'].iloc[0])
+                if 'period' in df.columns
+                else 30
+            )
 
-            exec_calc = ExecutionFeatures()
+            exec_calc = ExecutionFeatures(self.db_path)
             profile = get_period_window_profile(int(period))
             fast_days = profile['fast_days']
-            slow_days = profile['slow_days']
-            gap_days = profile['gap_days']
 
             # 按时间采样计算执行特征 (每周一个采样点)
             # 对于每个时间点,使用 as_of_date 参数计算当时的执行率
@@ -290,76 +299,104 @@ class DataProcessor:
                     sample_freq = '3D'
                 else:
                     sample_freq = '7D'
-                sample_dates = pd.date_range(start=min_date, end=max_date, freq=sample_freq)
+                sample_dates = pd.date_range(
+                    start=min_date,
+                    end=max_date,
+                    freq=sample_freq,
+                )
+                if len(sample_dates) == 0:
+                    sample_dates = pd.DatetimeIndex([pd.Timestamp(max_date)])
+                elif sample_dates[-1] < pd.Timestamp(max_date):
+                    sample_dates = sample_dates.append(
+                        pd.DatetimeIndex([pd.Timestamp(max_date)])
+                    )
 
-                if len(sample_dates) >= 2:
-                    # 为每个采样日期计算执行率
-                    sample_exec_fast = []
-                    sample_exec_slow = []
-                    sample_timestamps = []
+                sample_rows = []
+                sample_timestamps = []
+                for sample_date in sample_dates:
+                    try:
+                        features = exec_calc.get_all_features(
+                            currency,
+                            period,
+                            as_of_date=sample_date.to_pydatetime(),
+                        )
+                        sample_rows.append(features)
+                        sample_timestamps.append(sample_date)
+                    except Exception:
+                        pass
 
-                    for sd in sample_dates:
-                        try:
-                            exec_calc.clear_cache()
-                            er_fast = exec_calc.calculate_execution_rate(
-                                currency, period, fast_days, as_of_date=sd.to_pydatetime()
-                            )
-                            er_slow = exec_calc.calculate_execution_rate(
-                                currency, period, slow_days, as_of_date=sd.to_pydatetime()
-                            )
-                            sample_exec_fast.append(er_fast)
-                            sample_exec_slow.append(er_slow)
-                            sample_timestamps.append(sd)
-                        except Exception:
-                            pass
+                if not sample_rows:
+                    raise RuntimeError(
+                        f"No point-in-time execution features for "
+                        f"{currency}-{period}"
+                    )
 
-                    if len(sample_timestamps) >= 2:
-                        # 创建采样 Series 并对齐到数据时间线
-                        exec_fast_series = pd.Series(sample_exec_fast, index=sample_timestamps)
-                        exec_slow_series = pd.Series(sample_exec_slow, index=sample_timestamps)
-
-                        # 用最近邻插值对齐到原始数据时间
-                        df['exec_rate_fast'] = exec_fast_series.reindex(
-                            df['datetime'], method='ffill'
-                        ).fillna(exec_fast_series.iloc[0]).values
-                        df['exec_rate_slow'] = exec_slow_series.reindex(
-                            df['datetime'], method='ffill'
-                        ).fillna(exec_slow_series.iloc[0]).values
-                    else:
-                        # 采样点不够,回退到当前快照值
-                        exec_features = exec_calc.get_all_features(currency, period)
-                        df['exec_rate_fast'] = exec_features['exec_rate_fast']
-                        df['exec_rate_slow'] = exec_features['exec_rate_slow']
-                else:
-                    # 时间范围太短,回退
-                    exec_features = exec_calc.get_all_features(currency, period)
-                    df['exec_rate_fast'] = exec_features['exec_rate_fast']
-                    df['exec_rate_slow'] = exec_features['exec_rate_slow']
+                sample_frame = pd.DataFrame(
+                    sample_rows,
+                    index=pd.DatetimeIndex(sample_timestamps),
+                ).sort_index()
+                feature_names = [
+                    'exec_rate_fast',
+                    'exec_rate_slow',
+                    'avg_spread_profile',
+                    'avg_spread_7d',
+                    'avg_spread_30d',
+                    'avg_rate_gap_failed_profile',
+                    'avg_rate_gap_failed_7d',
+                    'avg_rate_gap_failed_30d',
+                    'exec_delay_p50',
+                    'exec_delay_p90',
+                ]
+                default_exec_rate = (
+                    0.55 if period <= 7
+                    else 0.50 if period <= 30
+                    else 0.45
+                )
+                leading_defaults = {
+                    'exec_rate_fast': default_exec_rate,
+                    'exec_rate_slow': default_exec_rate,
+                    'avg_spread_profile': 0.0,
+                    'avg_spread_7d': 0.0,
+                    'avg_spread_30d': 0.0,
+                    'avg_rate_gap_failed_profile': 0.0,
+                    'avg_rate_gap_failed_7d': 0.0,
+                    'avg_rate_gap_failed_30d': 0.0,
+                    'exec_delay_p50': 0.0,
+                    'exec_delay_p90': 0.0,
+                }
+                target_index = pd.DatetimeIndex(df['datetime'])
+                for feature_name in feature_names:
+                    feature_series = sample_frame[feature_name]
+                    df[feature_name] = (
+                        feature_series
+                        .reindex(target_index, method='ffill')
+                        .fillna(leading_defaults[feature_name])
+                        .to_numpy()
+                    )
             else:
-                exec_features = exec_calc.get_all_features(currency, period)
-                df['exec_rate_fast'] = exec_features['exec_rate_fast']
-                df['exec_rate_slow'] = exec_features['exec_rate_slow']
+                as_of_date = datetime.now()
+                exec_features = exec_calc.get_all_features(
+                    currency,
+                    period,
+                    as_of_date=as_of_date,
+                )
+                for feature_name in [
+                    'exec_rate_fast',
+                    'exec_rate_slow',
+                    'avg_spread_profile',
+                    'avg_spread_7d',
+                    'avg_spread_30d',
+                    'avg_rate_gap_failed_profile',
+                    'avg_rate_gap_failed_7d',
+                    'avg_rate_gap_failed_30d',
+                    'exec_delay_p50',
+                    'exec_delay_p90',
+                ]:
+                    df[feature_name] = exec_features[feature_name]
 
             # 兼容旧字段命名
             df['exec_rate_7d'] = df['exec_rate_fast']
             df['exec_rate_30d'] = df['exec_rate_slow']
-
-            # 以下特征仍用当前快照(非时间敏感或数据量不足以滚动)
-            exec_calc.clear_cache()
-            exec_features_snapshot = exec_calc.get_all_features(currency, period)
-
-            # 7.2 利差统计 (成交订单的平均利差)
-            df['avg_spread_profile'] = exec_features_snapshot['avg_spread_profile']
-            df['avg_spread_7d'] = exec_features_snapshot['avg_spread_7d']
-            df['avg_spread_30d'] = exec_features_snapshot['avg_spread_30d']
-
-            # 7.3 失败订单利率差距
-            df['avg_rate_gap_failed_profile'] = exec_features_snapshot['avg_rate_gap_failed_profile']
-            df['avg_rate_gap_failed_7d'] = exec_features_snapshot['avg_rate_gap_failed_7d']
-
-            # 7.4 成交延迟分布
-            df['exec_delay_p50'] = exec_features_snapshot['exec_delay_p50']
-            df['exec_delay_p90'] = exec_features_snapshot['exec_delay_p90']
 
             # 7.5 市场竞争力评分 (当前利率相对MA的位置)
             df['market_competitiveness'] = df['close_annual'] / (df['ma_1440'] + 1e-8)
@@ -428,7 +465,12 @@ class DataProcessor:
 
         # Target 4: 成交概率 (80%分位数二分类)
         future_80pct = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.8)
-        df['future_execution_prob'] = (df['close_annual'] <= future_80pct).astype(int)
+        label_ready = future_80pct.notna() & df['close_annual'].notna()
+        df['future_execution_prob'] = np.where(
+            label_ready,
+            (df['close_annual'] <= future_80pct).astype(float),
+            np.nan,
+        )
 
         # 清理 NaN (仅核心列,派生特征的 NaN 由模型自行处理)
         # 注意: 长窗口特征(如 ma_10080/robust_ma_10080, 见上方 rolling(window=10080))
@@ -513,7 +555,11 @@ class DataProcessor:
             future_to_period = {}
             for period in unique_periods:
                 period_df = df[df['period'] == period].copy()
-                future = executor.submit(self._process_single_period, period_df)
+                future = executor.submit(
+                    self._process_single_period,
+                    period_df,
+                    self.db_path,
+                )
                 future_to_period[future] = period
 
             # 收集结果
@@ -542,16 +588,20 @@ class DataProcessor:
         return output_path
 
     @staticmethod
-    def _process_single_period(period_df: pd.DataFrame) -> pd.DataFrame:
+    def _process_single_period(
+        period_df: pd.DataFrame,
+        db_path: str = None,
+    ) -> pd.DataFrame:
         """
         处理单个period的数据（静态方法用于并行化）
 
         Args:
             period_df: 单个period的DataFrame
+            db_path: 执行反馈特征使用的数据库路径
         Returns:
             处理后的DataFrame
         """
-        processor = DataProcessor()
+        processor = DataProcessor(db_path)
         return processor.add_technical_indicators(period_df)
 
 if __name__ == "__main__":

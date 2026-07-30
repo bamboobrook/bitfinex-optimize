@@ -75,11 +75,22 @@ class RetrainingScheduler:
 
     def _get_production_model_deployed_at(self) -> Optional[datetime]:
         """
-        获取当前生产模型部署时间（以最新 meta 文件的 mtime 近似）。
+        获取当前生产模型部署时间。
 
         Returns:
-            最新 meta 文件时间；若生产模型不存在或无 meta 文件则返回 None。
+            最近一次成功部署事件时间；旧历史不可用时回退到 meta mtime。
         """
+        for entry in reversed(self._load_retraining_history_entries()):
+            if entry.get('deployed') is not True:
+                continue
+            timestamp = entry.get('timestamp')
+            if not timestamp:
+                continue
+            try:
+                return datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+            except (TypeError, ValueError):
+                continue
+
         if not os.path.exists(self.production_model_dir):
             return None
 
@@ -191,6 +202,10 @@ class RetrainingScheduler:
     def _count_orders_since(self, since_dt: datetime) -> int:
         """
         统计某个时间点之后的订单结果数量，用于判断新模型观察样本是否足够。
+
+        `order_timestamp` 是预测使用的市场数据时间，可能早于模型部署/
+        订单落库时间。部署后成熟度必须按 `created_at` 归因，否则新模型
+        首轮订单会被漏计。
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -198,10 +213,36 @@ class RetrainingScheduler:
             cursor.execute(
                 """
                 SELECT COUNT(*) FROM virtual_orders
-                WHERE order_timestamp >= ?
-                  AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
+                WHERE created_at >= ?
+                  AND status IN ('EXECUTED', 'FAILED')
                 """,
                 (since_dt.strftime('%Y-%m-%d %H:%M:%S'),)
+            )
+            row = cursor.fetchone()
+            return int(row[0] or 0) if row else 0
+        finally:
+            conn.close()
+
+    def _count_long_window_orders_since(
+        self,
+        since_dt: datetime,
+        min_window_hours: int = 72,
+    ) -> int:
+        """Count uncensored outcomes from long validation windows."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM virtual_orders
+                WHERE created_at >= ?
+                  AND validation_window_hours >= ?
+                  AND status IN ('EXECUTED', 'FAILED')
+                """,
+                (
+                    since_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    int(min_window_hours),
+                ),
             )
             row = cursor.fetchone()
             return int(row[0] or 0) if row else 0
@@ -257,17 +298,18 @@ class RetrainingScheduler:
         cursor = conn.cursor()
 
         since_date = self._effective_since_dt(days=days, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
+        time_column = "created_at" if since_dt is not None else "order_timestamp"
 
         query = """
         SELECT
             COUNT(*) as total,
             SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed
         FROM virtual_orders
-        WHERE order_timestamp >= ?
+        WHERE {time_column} >= ?
           AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
         """
 
-        cursor.execute(query, (since_date,))
+        cursor.execute(query.format(time_column=time_column), (since_date,))
         result = cursor.fetchone()
         conn.close()
 
@@ -299,6 +341,7 @@ class RetrainingScheduler:
         cursor = conn.cursor()
 
         since_date = self._effective_since_dt(days=days, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
+        time_column = "created_at" if since_dt is not None else "order_timestamp"
 
         query = """
         SELECT
@@ -306,13 +349,13 @@ class RetrainingScheduler:
             COUNT(*) as total,
             SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed
         FROM virtual_orders
-        WHERE order_timestamp >= ?
+        WHERE {time_column} >= ?
           AND status IN ('EXECUTED', 'FAILED')
         GROUP BY currency, period
         HAVING COUNT(*) >= 3
         """
 
-        cursor.execute(query, (since_date,))
+        cursor.execute(query.format(time_column=time_column), (since_date,))
         rows = cursor.fetchall()
         conn.close()
 
@@ -358,18 +401,19 @@ class RetrainingScheduler:
         cursor = conn.cursor()
         try:
             since_date = self._effective_since_dt(days=7, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
+            time_column = "created_at" if since_dt is not None else "order_timestamp"
             cursor.execute("""
                 SELECT currency, period,
                        AVG(predicted_rate) as avg_pred,
                        AVG(market_median) as avg_market
                 FROM virtual_orders
-                WHERE order_timestamp >= ?
+                WHERE {time_column} >= ?
                   AND market_median IS NOT NULL
                   AND market_median > 0
                   AND predicted_rate IS NOT NULL
                 GROUP BY currency, period
                 HAVING COUNT(*) >= 3
-            """, (since_date,))
+            """.format(time_column=time_column), (since_date,))
             rows = cursor.fetchall()
         finally:
             conn.close()
@@ -391,18 +435,33 @@ class RetrainingScheduler:
         return False
 
     def _check_zero_liquidity_anomaly(self, since_dt: Optional[datetime] = None) -> list:
-        """检测某(currency, period)组合7天内虚拟订单极少(<2条)的情况。"""
+        """
+        检测“有足够成熟结果但一次都未成交”的组合。
+
+        旧实现统计的是生成订单数，并把长周期尚未到验证窗口的 PENDING
+        订单误判成零流动性；这里只看已决结果，并按 created_at 归因到
+        当前模型。没有生成订单的组合由 refresh-probe/暂停机制处理，不触发
+        重训练。
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         try:
             since_date = self._effective_since_dt(days=7, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
+            min_decided = int(
+                self.policy.get("retrain_trigger", {}).get("zero_liq_min_decided_orders", 5)
+            )
             cursor.execute("""
-                SELECT currency, period, MAX(order_timestamp) as last_order, COUNT(*) as cnt
+                SELECT
+                    currency,
+                    period,
+                    MAX(created_at) AS last_created,
+                    SUM(CASE WHEN status IN ('EXECUTED', 'FAILED') THEN 1 ELSE 0 END) AS decided,
+                    SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END) AS executed
                 FROM virtual_orders
-                WHERE order_timestamp >= ?
+                WHERE created_at >= ?
                 GROUP BY currency, period
-                HAVING cnt < 2
-            """, (since_date,))
+                HAVING decided >= ? AND executed = 0
+            """, (since_date, min_decided))
             return cursor.fetchall()
         finally:
             conn.close()
@@ -418,7 +477,24 @@ class RetrainingScheduler:
             "global_exec_high": float(cfg.get("global_exec_high", 0.60)),
             "post_deploy_grace_hours": float(cfg.get("post_deploy_grace_hours", 12.0)),
             "post_deploy_min_orders": int(cfg.get("post_deploy_min_orders", 40)),
-            "post_deploy_zero_liq_min_hours": float(cfg.get("post_deploy_zero_liq_min_hours", 24.0)),
+            "post_deploy_high_exec_grace_hours": float(
+                cfg.get("post_deploy_high_exec_grace_hours", 72.0)
+            ),
+            "post_deploy_high_exec_min_orders": int(
+                cfg.get("post_deploy_high_exec_min_orders", 120)
+            ),
+            "post_deploy_high_exec_min_72h_orders": int(
+                cfg.get("post_deploy_high_exec_min_72h_orders", 20)
+            ),
+            "post_deploy_zero_liq_min_hours": float(
+                cfg.get("post_deploy_zero_liq_min_hours", 72.0)
+            ),
+            "post_deploy_zero_liq_min_orders": int(
+                cfg.get("post_deploy_zero_liq_min_orders", 120)
+            ),
+            "zero_liq_min_decided_orders": int(
+                cfg.get("zero_liq_min_decided_orders", 5)
+            ),
         }
 
     def _compute_retrain_trigger_score(
@@ -548,11 +624,22 @@ class RetrainingScheduler:
         quality_since_dt = deployed_at
         post_deploy_age_hours = None
         post_deploy_orders = None
+        post_deploy_72h_orders = None
+        high_exec_maturity_ready = True
         if deployed_at is not None:
             post_deploy_age_hours = (datetime.now() - deployed_at).total_seconds() / 3600.0
             post_deploy_orders = self._count_orders_since(deployed_at)
+            post_deploy_72h_orders = self._count_long_window_orders_since(deployed_at)
+            high_exec_maturity_ready = (
+                post_deploy_age_hours >= th["post_deploy_high_exec_grace_hours"] and
+                post_deploy_orders >= th["post_deploy_high_exec_min_orders"] and
+                post_deploy_72h_orders >= th["post_deploy_high_exec_min_72h_orders"]
+            )
             print(f"当前生产模型部署时间: {deployed_at.strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"部署后已观察: {post_deploy_age_hours:.1f} 小时, 订单结果: {post_deploy_orders} 条")
+            print(
+                f"部署后已观察: {post_deploy_age_hours:.1f} 小时, "
+                f"订单结果: {post_deploy_orders} 条, 72h结果: {post_deploy_72h_orders} 条"
+            )
 
             if (
                 post_deploy_age_hours < th["post_deploy_grace_hours"] or
@@ -613,9 +700,16 @@ class RetrainingScheduler:
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
         if exec_rate_7d > exec_high:
-            reason = f"全局成交率过高 ({exec_rate_7d:.2%} > {exec_high:.0%}), 紧急重训练"
-            print(f"⚠️  需要重训练: {reason}")
-            return True, reason
+            if high_exec_maturity_ready:
+                reason = f"全局成交率过高 ({exec_rate_7d:.2%} > {exec_high:.0%}), 紧急重训练"
+                print(f"⚠️  需要重训练: {reason}")
+                return True, reason
+            print(
+                "⏳ 高成交率信号暂缓: 等待完整验证窗口 "
+                f"({post_deploy_age_hours:.1f}h/{th['post_deploy_high_exec_grace_hours']:.0f}h, "
+                f"{post_deploy_orders}/{th['post_deploy_high_exec_min_orders']}单, "
+                f"72h={post_deploy_72h_orders}/{th['post_deploy_high_exec_min_72h_orders']}单)"
+            )
 
         # 执行率快速下滑检测 (14d→7d 趋势漂移)
         exec_rate_14d = self.get_recent_execution_rate(days=14, since_dt=quality_since_dt)
@@ -630,20 +724,38 @@ class RetrainingScheduler:
         zero_liq_ready = (
             deployed_at is None or
             post_deploy_age_hours is None or
-            post_deploy_age_hours >= th["post_deploy_zero_liq_min_hours"]
+            (
+                post_deploy_age_hours >= th["post_deploy_zero_liq_min_hours"]
+                and post_deploy_orders >= th["post_deploy_zero_liq_min_orders"]
+            )
         )
         if zero_liq_ready:
             zero_liq = self._check_zero_liquidity_anomaly(since_dt=quality_since_dt)
             if zero_liq:
-                currencies = [(r[0], r[1]) for r in zero_liq]
-                reason = f"货币对零流动性 (7天内<2单): {currencies}"
+                currencies = [
+                    (r[0], r[1], int(r[3] or 0), int(r[4] or 0))
+                    for r in zero_liq
+                ]
+                reason = (
+                    "货币对成熟结果零成交 "
+                    f"(至少{th['zero_liq_min_decided_orders']}条已决): {currencies}"
+                )
                 print(f"⚠️  需要重训练: {reason}")
                 return True, reason
 
         # Multi-signal trigger score (execution + follow + stability + per-period anomalies).
+        score_exec_rate = exec_rate_7d
+        score_period_anomalies = period_anomalies
+        if not high_exec_maturity_ready:
+            score_exec_rate = min(exec_rate_7d, exec_high)
+            score_period_anomalies = [
+                anomaly for anomaly in period_anomalies
+                if anomaly.get("exec_rate", 0.0) <= exec_high
+            ]
+
         trigger_score, components = self._compute_retrain_trigger_score(
-            exec_rate_7d=exec_rate_7d,
-            period_anomalies=period_anomalies,
+            exec_rate_7d=score_exec_rate,
+            period_anomalies=score_period_anomalies,
             follow_metrics=follow_metrics,
         )
         print(
@@ -677,7 +789,7 @@ class RetrainingScheduler:
 
             # critical 级别的高执行率
             critical_high = [a for a in period_anomalies if a['exec_rate'] > 0.85 and a['severity'] == 'critical']
-            if critical_high:
+            if critical_high and high_exec_maturity_ready:
                 details = ", ".join(
                     f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
                     for a in critical_high
@@ -699,7 +811,7 @@ class RetrainingScheduler:
 
             # warning 级别: 高执行率 > 0.65
             warning_high = [a for a in period_anomalies if a['exec_rate'] > 0.65 and a['severity'] == 'warning']
-            if warning_high:
+            if warning_high and high_exec_maturity_ready:
                 details = ", ".join(
                     f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
                     for a in warning_high
@@ -727,11 +839,34 @@ class RetrainingScheduler:
         print(f"❌ 暂不需要重训练")
         print(f"   - 距上次训练: {days_since_last} 天 (需要 >= 7天)")
         print(f"   - 新增数据: {new_orders} 条 (需要 >= 100条)")
-        print(
-            f"   - 全局成交率: {exec_rate_7d:.2%} "
-            f"(正常范围: {th['global_exec_low']:.0%}-{th['global_exec_high']:.0%})"
+        if exec_rate_7d > exec_high and not high_exec_maturity_ready:
+            print(
+                f"   - 全局成交率: {exec_rate_7d:.2%} "
+                f"(偏高，等待 {th['post_deploy_high_exec_grace_hours']:.0f}h/"
+                f"{th['post_deploy_high_exec_min_orders']}条已决/"
+                f"{th['post_deploy_high_exec_min_72h_orders']}条72h结果后再判断)"
+            )
+        else:
+            print(
+                f"   - 全局成交率: {exec_rate_7d:.2%} "
+                f"(正常范围: {th['global_exec_low']:.0%}-{th['global_exec_high']:.0%})"
+            )
+        deferred_high_anomalies = (
+            [
+                anomaly for anomaly in period_anomalies
+                if anomaly.get("exec_rate", 0.0) > exec_high
+            ]
+            if not high_exec_maturity_ready
+            else []
         )
-        print(f"   - 分组异常: 无")
+        if deferred_high_anomalies:
+            print(
+                f"   - 分组异常: {len(deferred_high_anomalies)}条高成交率信号等待成熟"
+            )
+        elif period_anomalies:
+            print(f"   - 分组异常: {len(period_anomalies)}条，均未达到重训条件")
+        else:
+            print("   - 分组异常: 无")
         if follow_metrics["samples"] > 0:
             print(
                 f"   - 跟随误差MAE比率: {follow_metrics['follow_mae_ratio']:.2f} "
@@ -764,6 +899,7 @@ class RetrainingScheduler:
         cursor = conn.cursor()
 
         since_date = self._effective_since_dt(days=days, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
+        time_column = "created_at" if since_dt is not None else "validated_at"
 
         if "market_median" not in columns:
             conn.close()
@@ -786,7 +922,7 @@ class RetrainingScheduler:
             query = f"""
                 SELECT {", ".join(select_cols)}
                 FROM virtual_orders
-                WHERE validated_at >= ?
+                WHERE {time_column} >= ?
                   AND status IN ('EXECUTED', 'FAILED')
                   AND market_median IS NOT NULL
             """
@@ -877,10 +1013,12 @@ class RetrainingScheduler:
                 model_dir=output_dir
             )
 
-            # 训练所有模型
-            # 使用动态训练窗口：90天（3个月数据足够训练，且避免超时）
-            start_date = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')  # 最近3个月
-            end_date = datetime.now().strftime('%Y-%m-%d')
+            # 保留最近7天作为真正的 out-of-time champion/challenger 验证集。
+            # Challenger 不能先在这批数据上训练，再用同一批数据决定部署。
+            training_end = datetime.now() - timedelta(days=7)
+            training_start = training_end - timedelta(days=90)
+            start_date = training_start.strftime('%Y-%m-%d')
+            end_date = training_end.strftime('%Y-%m-%d')
 
             print(f"\n训练数据范围: {start_date} 至 {end_date}")
             print(f"输出目录: {output_dir}\n")
@@ -1044,12 +1182,31 @@ class RetrainingScheduler:
         try:
             val_data = self._prepare_champion_validation_data(days=7, warmup_days=21)
             val_rows = sum(len(df) for df in val_data.values())
-            if val_rows < 200:
-                print(f"  验证切片不足 ({val_rows} < 200),跳过性能对比,仅执行sanity check")
+            feedback_by_target = {
+                'actual_execution_binary': 0,
+                'revenue_optimized_target': 0,
+            }
+            for frame in val_data.values():
+                if not isinstance(frame, pd.DataFrame):
+                    continue
+                for target in feedback_by_target:
+                    if target in frame.columns:
+                        feedback_by_target[target] += int(
+                            frame[target].notna().sum()
+                        )
+            feedback_rows = max(feedback_by_target.values(), default=0)
+            if val_rows < 200 and feedback_rows < 40:
+                print(
+                    f"  验证切片不足 (rows={val_rows}, feedback={feedback_rows}),"
+                    "跳过性能对比,仅执行sanity check"
+                )
                 comparison['checks']['performance'] = 'skipped_insufficient_data'
                 return self._sanity_check_new_models(new_model_dir)
 
-            print(f"  验证切片样本: {val_rows} 行 (近7天)")
+            print(
+                f"  验证切片样本: {val_rows} 行, "
+                f"增强标签最多 {feedback_rows} 条 (近7天)"
+            )
 
             old_eval = self._evaluate_model_dir_on_validation(old_model_dir, val_data)
             new_eval = self._evaluate_model_dir_on_validation(new_model_dir, val_data)
@@ -1083,6 +1240,141 @@ class RetrainingScheduler:
                     print(f"  ❌ {currency} 分数下降超过5%: old={old_curr:.4f}, new={new_curr:.4f}")
                     all_pass = False
 
+            enhanced_checks = 0
+            enhanced_pass = True
+            model_gate = self.policy.get("model_gate", {})
+            min_v2_auc = float(
+                model_gate.get("min_execution_v2_auc", 0.50)
+            )
+            max_v2_brier = float(
+                model_gate.get("max_execution_v2_brier", 0.25)
+            )
+            max_revenue_mae = float(
+                model_gate.get("max_revenue_mae", 5.0)
+            )
+            for currency in ['fUSD', 'fUST']:
+                old_metrics = old_eval["metrics"].get(currency, {})
+                new_metrics = new_eval["metrics"].get(currency, {})
+
+                v2_samples = int(
+                    new_metrics.get(
+                        "model_execution_prob_v2_eligible_samples",
+                        old_metrics.get(
+                            "model_execution_prob_v2_eligible_samples",
+                            0,
+                        ),
+                    )
+                )
+                if v2_samples >= 40:
+                    new_auc = new_metrics.get("model_execution_prob_v2_auc")
+                    new_brier = new_metrics.get("model_execution_prob_v2_brier")
+                    old_auc = old_metrics.get("model_execution_prob_v2_auc")
+                    old_brier = old_metrics.get("model_execution_prob_v2_brier")
+                    if (
+                        new_auc is None
+                        or new_brier is None
+                        or not np.isfinite(float(new_auc))
+                        or not np.isfinite(float(new_brier))
+                    ):
+                        print(
+                            f"  ❌ {currency} execution_prob_v2 有 {v2_samples} 条验证样本，"
+                            "但 challenger 无有效指标"
+                        )
+                        all_pass = False
+                        enhanced_pass = False
+                    else:
+                        new_auc = float(new_auc)
+                        new_brier = float(new_brier)
+                        if old_auc is not None and not np.isfinite(float(old_auc)):
+                            old_auc = None
+                        if old_brier is not None and not np.isfinite(float(old_brier)):
+                            old_brier = None
+                        enhanced_checks += 1
+                        if new_auc < min_v2_auc:
+                            print(
+                                f"  ❌ {currency} execution_prob_v2 AUC "
+                                f"低于绝对门槛: {new_auc:.4f} < {min_v2_auc:.4f}"
+                            )
+                            all_pass = False
+                            enhanced_pass = False
+                        if new_brier > max_v2_brier:
+                            print(
+                                f"  ❌ {currency} execution_prob_v2 Brier "
+                                f"高于绝对门槛: {new_brier:.4f} > {max_v2_brier:.4f}"
+                            )
+                            all_pass = False
+                            enhanced_pass = False
+                        if old_auc is not None and new_auc < old_auc - 0.02:
+                            print(
+                                f"  ❌ {currency} execution_prob_v2 AUC 下降超过0.02: "
+                                f"old={old_auc:.4f}, new={new_auc:.4f}"
+                            )
+                            all_pass = False
+                            enhanced_pass = False
+                        if (
+                            old_brier is not None
+                            and old_brier > 0
+                            and new_brier > old_brier * 1.05
+                        ):
+                            print(
+                                f"  ❌ {currency} execution_prob_v2 Brier 退化超过5%: "
+                                f"old={old_brier:.4f}, new={new_brier:.4f}"
+                            )
+                            all_pass = False
+                            enhanced_pass = False
+
+                revenue_samples = int(
+                    new_metrics.get(
+                        "model_revenue_optimized_eligible_samples",
+                        old_metrics.get(
+                            "model_revenue_optimized_eligible_samples",
+                            0,
+                        ),
+                    )
+                )
+                if revenue_samples >= 40:
+                    new_mae = new_metrics.get("model_revenue_optimized_mae")
+                    old_mae = old_metrics.get("model_revenue_optimized_mae")
+                    if new_mae is None or not np.isfinite(float(new_mae)):
+                        print(
+                            f"  ❌ {currency} revenue_optimized 有 {revenue_samples} 条验证样本，"
+                            "但 challenger 无有效指标"
+                        )
+                        all_pass = False
+                        enhanced_pass = False
+                    else:
+                        new_mae = float(new_mae)
+                        if old_mae is not None and not np.isfinite(float(old_mae)):
+                            old_mae = None
+                        enhanced_checks += 1
+                        if new_mae > max_revenue_mae:
+                            print(
+                                f"  ❌ {currency} revenue_optimized MAE "
+                                f"高于绝对门槛: {new_mae:.4f} > "
+                                f"{max_revenue_mae:.4f}"
+                            )
+                            all_pass = False
+                            enhanced_pass = False
+                        if (
+                            old_mae is not None
+                            and old_mae > 0
+                            and new_mae > old_mae * 1.05
+                        ):
+                            print(
+                                f"  ❌ {currency} revenue_optimized MAE 退化超过5%: "
+                                f"old={old_mae:.4f}, new={new_mae:.4f}"
+                            )
+                            all_pass = False
+                            enhanced_pass = False
+
+            comparison['checks']['enhanced_performance'] = (
+                'passed'
+                if enhanced_checks and enhanced_pass
+                else 'degraded'
+                if not enhanced_pass
+                else 'skipped_insufficient_data'
+            )
+
             # Sanity check: 验证新模型基本可用
             sanity_ok = self._sanity_check_new_models(new_model_dir)
             if not sanity_ok:
@@ -1114,47 +1406,68 @@ class RetrainingScheduler:
 
     def _prepare_champion_validation_data(self, days: int = 7, warmup_days: int = 21) -> Dict[str, pd.DataFrame]:
         """
-        Build a shared validation slice for old/new model comparison.
+        Build one shared OOT slice for traditional and feedback models.
+
+        Dense market rows provide forward market targets. Sparse order rows
+        provide execution/revenue outcomes, with technical features copied from
+        their backward-matched market snapshot.
         """
         now = datetime.now()
-        start = (now - timedelta(days=days + warmup_days)).strftime('%Y-%m-%d')
-        end = now.strftime('%Y-%m-%d')
+        start_dt = now - timedelta(days=days + warmup_days)
         since_dt = now - timedelta(days=days)
+        start = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+        end = now.strftime('%Y-%m-%d %H:%M:%S')
+
+        from ml_engine.model_trainer_v2 import (
+            EnhancedModelTrainer,
+            add_training_technical_features,
+        )
+        from ml_engine.training_data_builder import TrainingDataBuilder
+
+        processor = DataProcessor(self.db_path)
+        builder = TrainingDataBuilder(self.db_path)
+        market_data = builder.load_market_data(start, end)
+        execution_results = builder.load_execution_results(start, end)
+        combined = builder.merge_market_and_execution(
+            market_data,
+            execution_results,
+        )
+        if combined.empty:
+            return {}
+
+        featured = add_training_technical_features(combined, processor)
+        featured = EnhancedModelTrainer._add_traditional_targets(featured)
+        if 'path_terminal_value' in featured.columns:
+            featured['revenue_optimized_target'] = featured['path_terminal_value']
+        elif 'revenue_reward' in featured.columns:
+            featured['revenue_optimized_target'] = (
+                featured['close_annual'] * featured['revenue_reward']
+            )
+        else:
+            featured['revenue_optimized_target'] = np.nan
+
+        roles = featured.get(
+            '_sample_role',
+            pd.Series('market_dense', index=featured.index),
+        )
+        market_times = pd.to_datetime(featured['datetime'], errors='coerce')
+        order_times = pd.to_datetime(
+            featured.get('order_timestamp'),
+            errors='coerce',
+        )
+        market_validation = roles.eq('market_dense') & (market_times >= since_dt)
+        order_validation = roles.eq('order_supervision') & (order_times >= since_dt)
+        if '_exploit_quality' in featured.columns:
+            order_validation &= featured['_exploit_quality'].fillna(False)
+        validation_frame = featured.loc[
+            market_validation | order_validation
+        ].copy()
 
         data_by_currency: Dict[str, pd.DataFrame] = {}
-        processor = DataProcessor(self.db_path)
-
         for currency in ['fUSD', 'fUST']:
-            df = processor.load_data(currency)
-            if df.empty:
-                continue
-            df = df[df['datetime'] >= pd.to_datetime(start)].copy()
-            if df.empty:
-                continue
-            df_feat = df.groupby('period', group_keys=False).apply(processor.add_technical_indicators)
-            df_feat = df_feat.sort_values(['currency', 'period', 'datetime'])
-
-            # Traditional targets — 与 model_trainer_v2.py 保持一致，消除前向偏差
-            def _compute_targets(group: pd.DataFrame) -> pd.DataFrame:
-                group = group.copy()
-                low_shifted = group['low_annual'].shift(-120)
-                close_shifted_60 = group['close_annual'].shift(-60)
-                group['future_conservative'] = low_shifted.rolling(window=60, min_periods=1).quantile(0.3)
-                group['future_aggressive'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.6)
-                group['future_balanced'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.7)
-                fut80 = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.8)
-                group['future_execution_prob'] = (group['close_annual'] <= fut80).astype(float)
-                return group
-
-            df_feat = df_feat.groupby(['currency', 'period'], group_keys=False).apply(_compute_targets)
-
-            val_df = df_feat[df_feat['datetime'] >= since_dt].copy()
-            val_df = val_df.dropna(subset=[
-                'future_conservative',
-                'future_aggressive',
-                'future_balanced',
-                'future_execution_prob',
-            ])
+            val_df = validation_frame[
+                validation_frame['currency'] == currency
+            ].copy()
             if not val_df.empty:
                 data_by_currency[currency] = val_df
 
@@ -1171,9 +1484,18 @@ class RetrainingScheduler:
         n_neg = int((y_true == 0).sum())
         if n_pos == 0 or n_neg == 0:
             return 0.5
-        order = np.argsort(y_score)
-        ranks = np.empty_like(order, dtype=float)
-        ranks[order] = np.arange(1, len(y_score) + 1, dtype=float)
+        order = np.argsort(y_score, kind='mergesort')
+        sorted_scores = y_score[order]
+        ranks = np.empty(len(y_score), dtype=float)
+        start = 0
+        while start < len(sorted_scores):
+            end = start + 1
+            while end < len(sorted_scores) and sorted_scores[end] == sorted_scores[start]:
+                end += 1
+            # Mann-Whitney AUC requires average ranks for tied predictions.
+            average_rank = ((start + 1) + end) / 2.0
+            ranks[order[start:end]] = average_rank
+            start = end
         pos_rank_sum = ranks[y_true == 1].sum()
         auc = (pos_rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
         return float(max(0.0, min(1.0, auc)))
@@ -1195,13 +1517,21 @@ class RetrainingScheduler:
             ('model_conservative', 'future_conservative', 'regression', 0.20),
             ('model_aggressive', 'future_aggressive', 'regression', 0.20),
             ('model_balanced', 'future_balanced', 'regression', 0.35),
+            ('model_execution_prob_v2', 'actual_execution_binary', 'classification', 0.25),
+            ('model_revenue_optimized', 'revenue_optimized_target', 'regression', 0.25),
         ]
 
         for currency, df in val_data.items():
             metric_vals: Dict[str, float] = {}
             score_parts = []
+            evaluated_weight = 0.0
 
             for model_type, target, task_type, weight in tasks:
+                if target not in df.columns:
+                    metric_vals[f"{model_type}_eligible_samples"] = 0
+                    continue
+                eligible_rows = int(df[target].notna().sum())
+                metric_vals[f"{model_type}_eligible_samples"] = eligible_rows
                 if currency not in predictor.meta_info or model_type not in predictor.meta_info[currency]:
                     continue
                 feature_cols = predictor.meta_info[currency][model_type]['feature_cols']
@@ -1215,19 +1545,32 @@ class RetrainingScheduler:
                 X = subset[feature_cols].copy()
                 y = subset[target].values.astype(float)
                 y_pred = predictor.predict_with_ensemble(X, currency, model_type)
+                y_pred = np.asarray(y_pred, dtype=float)
+                if (
+                    len(y_pred) != len(y)
+                    or not np.isfinite(y).all()
+                    or not np.isfinite(y_pred).all()
+                ):
+                    metric_vals[f"{model_type}_invalid_predictions"] = 1
+                    continue
 
                 if task_type == 'classification':
                     auc = self._safe_auc(y, y_pred)
+                    brier = float(np.mean(np.square(y_pred - y)))
                     metric_vals[f"{model_type}_auc"] = float(auc)
+                    metric_vals[f"{model_type}_brier"] = brier
                     score_parts.append(weight * auc)
                 else:
                     mae = float(np.mean(np.abs(y_pred - y)))
                     metric_vals[f"{model_type}_mae"] = mae
                     # Convert MAE to score in (0,1], higher is better.
                     score_parts.append(weight * (1.0 / (1.0 + mae)))
+                evaluated_weight += weight
 
-            if score_parts:
-                currency_scores[currency] = float(sum(score_parts) / sum(w for _, _, _, w in tasks))
+            if score_parts and evaluated_weight > 0:
+                currency_scores[currency] = float(
+                    sum(score_parts) / evaluated_weight
+                )
             else:
                 currency_scores[currency] = 0.0
             details[currency] = metric_vals
@@ -1268,6 +1611,57 @@ class RetrainingScheduler:
 
         return passed, output
 
+    @staticmethod
+    def _check_model_artifact_set(
+        model_dir: str,
+        model_prefix: str,
+    ) -> Tuple[bool, str]:
+        """Validate every positively weighted ensemble component on disk."""
+        meta_path = os.path.join(model_dir, f"{model_prefix}_meta.json")
+        if not os.path.exists(meta_path):
+            return False, f"缺少 {model_prefix}_meta.json"
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as meta_file:
+                meta = json.load(meta_file)
+        except Exception as exc:
+            return False, f"{model_prefix} meta无法读取: {exc}"
+
+        weights = meta.get('weights')
+        if not isinstance(weights, dict) or not weights:
+            return False, f"{model_prefix} weights无效"
+        suffixes = {
+            'xgb': '_xgb.json',
+            'lgb': '_lgb.txt',
+            'cat': '_cat.cbm',
+        }
+        positive_components = 0
+        for algorithm, raw_weight in weights.items():
+            try:
+                weight = float(raw_weight)
+            except (TypeError, ValueError):
+                return False, f"{model_prefix} {algorithm}权重无效"
+            if not np.isfinite(weight) or weight < 0:
+                return False, f"{model_prefix} {algorithm}权重无效"
+            if weight <= 1e-12:
+                continue
+            positive_components += 1
+            suffix = suffixes.get(algorithm)
+            if suffix is None:
+                return False, f"{model_prefix} 未知组件 {algorithm}"
+            component_path = os.path.join(
+                model_dir,
+                f"{model_prefix}{suffix}",
+            )
+            if (
+                not os.path.exists(component_path)
+                or os.path.getsize(component_path) <= 0
+            ):
+                return False, f"{model_prefix} 缺少正权重组件 {algorithm}"
+
+        if positive_components == 0:
+            return False, f"{model_prefix} 没有正权重组件"
+        return True, ""
+
     def _sanity_check_new_models(self, model_dir: str) -> bool:
         """
         验证新模型基本可用: 文件完整、预测输出合理
@@ -1281,18 +1675,28 @@ class RetrainingScheduler:
         print(f"\n  🔍 Sanity check: 验证新模型基本可用")
 
         try:
-            # 检查每个币种的4个必要模型
+            required_types = [
+                'model_execution_prob',
+                'model_conservative',
+                'model_aggressive',
+                'model_balanced',
+                'model_execution_prob_v2',
+                'model_revenue_optimized',
+            ]
+
+            # 检查每个币种的核心与增强模型
             for currency in ['fUSD', 'fUST']:
                 required_models = [
-                    f'{currency}_model_execution_prob',
-                    f'{currency}_model_conservative',
-                    f'{currency}_model_aggressive',
-                    f'{currency}_model_balanced',
+                    f'{currency}_{model_type}'
+                    for model_type in required_types
                 ]
                 for model_prefix in required_models:
-                    meta_file = os.path.join(model_dir, f"{model_prefix}_meta.json")
-                    if not os.path.exists(meta_file):
-                        print(f"  ❌ sanity check失败: 缺少模型文件 {model_prefix}")
+                    complete, reason = self._check_model_artifact_set(
+                        model_dir,
+                        model_prefix,
+                    )
+                    if not complete:
+                        print(f"  ❌ sanity check失败: {reason}")
                         return False
 
             # 加载新模型并做简单预测验证
@@ -1305,32 +1709,27 @@ class RetrainingScheduler:
                     print(f"  ❌ sanity check失败: {currency} 模型加载失败")
                     return False
 
-                # 检查所有4个必要模型类型都加载成功
-                required_types = ['model_execution_prob', 'model_conservative',
-                                  'model_aggressive', 'model_balanced']
+                # 检查所有必要模型类型都加载成功
                 for mt in required_types:
                     if mt not in test_predictor.models[currency]:
                         print(f"  ❌ sanity check失败: {currency} 缺少 {mt}")
                         return False
 
-                # 用最新数据做一组预测
-                meta = test_predictor.meta_info[currency].get('model_conservative')
-                if not meta:
-                    print(f"  ❌ sanity check失败: {currency} meta信息缺失")
-                    return False
-
-                feature_cols = meta['feature_cols']
-                # Filter out internal training columns that don't exist in market data
-                internal_cols = {'_order_match_minutes', '_execution_label_eligible', '_exploit_quality'}
-                feature_cols = [c for c in feature_cols if c not in internal_cols]
                 df = test_predictor.processor.load_data(currency)
                 if df.empty:
                     print(f"  ⚠️  sanity check: {currency} 无数据,跳过预测验证")
                     continue
 
                 # 取一个period的最新数据
-                df_feat = df.groupby('period', group_keys=False).apply(
-                    test_predictor.processor.add_technical_indicators
+                df = df.sort_values(['period', 'datetime'], kind='mergesort')
+                feature_groups = [
+                    test_predictor.processor.add_technical_indicators(group)
+                    for _, group in df.groupby('period', sort=False)
+                ]
+                df_feat = pd.concat(
+                    feature_groups,
+                    ignore_index=True,
+                    sort=False,
                 )
                 sample = df_feat.groupby('period').tail(1).head(3)
 
@@ -1339,29 +1738,64 @@ class RetrainingScheduler:
                     continue
 
                 for _, row in sample.iterrows():
-                    try:
-                        X_single = pd.DataFrame([{col: row[col] for col in feature_cols}])
-                        pred_cons = test_predictor.predict_with_ensemble(
-                            X_single, currency, 'model_conservative'
-                        )[0]
-                        pred_bal = test_predictor.predict_with_ensemble(
-                            X_single, currency, 'model_balanced'
-                        )[0]
-
-                        # 检查预测值非NaN
-                        if np.isnan(pred_cons) or np.isnan(pred_bal):
-                            print(f"  ❌ sanity check失败: {currency} period={int(row['period'])} 预测输出NaN")
-                            return False
-
-                        # 检查预测范围合理 (0.5-50.0)
-                        for pred_val, pred_name in [(pred_cons, 'conservative'), (pred_bal, 'balanced')]:
-                            if pred_val < 0.5 or pred_val > 50.0:
-                                print(f"  ❌ sanity check失败: {currency} period={int(row['period'])} {pred_name}={pred_val:.4f} 超出合理范围[0.5, 50.0]")
+                    for model_type in required_types:
+                        try:
+                            meta = test_predictor.meta_info[currency].get(
+                                model_type
+                            )
+                            if not meta:
+                                print(
+                                    f"  ❌ sanity check失败: {currency} "
+                                    f"{model_type} meta信息缺失"
+                                )
+                                return False
+                            feature_cols = meta['feature_cols']
+                            missing = [
+                                col for col in feature_cols
+                                if col not in row.index
+                            ]
+                            if missing:
+                                print(
+                                    f"  ❌ sanity check失败: {currency} "
+                                    f"{model_type} 缺少特征 {missing[:5]}"
+                                )
+                                return False
+                            X_single = pd.DataFrame(
+                                [{col: row[col] for col in feature_cols}]
+                            )
+                            pred_val = float(
+                                test_predictor.predict_with_ensemble(
+                                    X_single,
+                                    currency,
+                                    model_type,
+                                )[0]
+                            )
+                            if not np.isfinite(pred_val):
+                                print(
+                                    f"  ❌ sanity check失败: {currency} "
+                                    f"period={int(row['period'])} "
+                                    f"{model_type} 输出非有限值"
+                                )
                                 return False
 
-                    except Exception as e:
-                        print(f"  ❌ sanity check失败: {currency} 预测异常: {e}")
-                        return False
+                            if 'execution_prob' in model_type:
+                                lower, upper = 0.0, 1.0
+                            else:
+                                lower, upper = 0.5, 50.0
+                            if pred_val < lower or pred_val > upper:
+                                print(
+                                    f"  ❌ sanity check失败: {currency} "
+                                    f"period={int(row['period'])} "
+                                    f"{model_type}={pred_val:.4f} "
+                                    f"超出合理范围[{lower}, {upper}]"
+                                )
+                                return False
+                        except Exception as e:
+                            print(
+                                f"  ❌ sanity check失败: {currency} "
+                                f"{model_type} 预测异常: {e}"
+                            )
+                            return False
 
             print(f"  ✅ sanity check通过: 模型文件完整、预测输出合理")
             return True

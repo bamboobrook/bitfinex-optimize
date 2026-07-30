@@ -23,7 +23,120 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from training_data_builder import TrainingDataBuilder
+try:
+    from ml_engine.training_data_builder import TrainingDataBuilder
+except ModuleNotFoundError:
+    # Keep direct `python ml_engine/model_trainer_v2.py` execution compatible.
+    from training_data_builder import TrainingDataBuilder
+
+
+TRADITIONAL_TARGET_COLUMNS = (
+    'future_conservative',
+    'future_aggressive',
+    'future_balanced',
+    'future_execution_prob',
+)
+
+
+def add_training_technical_features(
+    df: pd.DataFrame,
+    processor,
+) -> pd.DataFrame:
+    """
+    Engineer rolling features on the dense market timeline only.
+
+    Order-supervision rows reuse the exact backward-matched market snapshot.
+    Inserting those sparse rows into rolling/shift operations would duplicate
+    timestamps, distort windows, and expose late-market values to old orders.
+    """
+    if df.empty:
+        return df.copy()
+
+    frame = df.copy()
+    if '_sample_role' not in frame.columns:
+        frame['_sample_role'] = 'market_dense'
+
+    market_mask = frame['_sample_role'].eq('market_dense')
+    market_frame = frame.loc[market_mask].copy()
+    order_frame = frame.loc[~market_mask].copy()
+    if market_frame.empty:
+        return frame
+
+    sort_cols = [
+        col for col in ('currency', 'period', 'datetime')
+        if col in market_frame.columns
+    ]
+    if sort_cols:
+        market_frame = market_frame.sort_values(
+            sort_cols,
+            kind='mergesort',
+        )
+
+    group_cols = [
+        col for col in ('currency', 'period')
+        if col in market_frame.columns
+    ]
+    if group_cols:
+        engineered_groups = []
+        for _, group in market_frame.groupby(
+            group_cols,
+            sort=False,
+            dropna=False,
+        ):
+            if 'datetime' in group.columns:
+                group = group.sort_values('datetime', kind='mergesort')
+            engineered_groups.append(processor.add_technical_indicators(group))
+        engineered_market = pd.concat(
+            engineered_groups,
+            ignore_index=True,
+            sort=False,
+        )
+    else:
+        engineered_market = processor.add_technical_indicators(market_frame)
+
+    if order_frame.empty:
+        return engineered_market.reset_index(drop=True)
+
+    original_columns = set(frame.columns)
+    generated_feature_cols = [
+        col
+        for col in engineered_market.columns
+        if col not in original_columns
+        and col not in TRADITIONAL_TARGET_COLUMNS
+        and not col.startswith('future_')
+    ]
+    join_cols = [
+        col for col in ('currency', 'period', 'datetime')
+        if col in engineered_market.columns and col in order_frame.columns
+    ]
+    if generated_feature_cols and len(join_cols) == 3:
+        snapshots = (
+            engineered_market[join_cols + generated_feature_cols]
+            .drop_duplicates(join_cols, keep='last')
+        )
+        order_frame = order_frame.merge(
+            snapshots,
+            on=join_cols,
+            how='left',
+            validate='many_to_one',
+        )
+
+    combined = pd.concat(
+        [engineered_market, order_frame],
+        ignore_index=True,
+        sort=False,
+    )
+    combined_sort_cols = [
+        col for col in ('currency', 'period', 'datetime', '_sample_role')
+        if col in combined.columns
+    ]
+    if combined_sort_cols:
+        combined = combined.sort_values(
+            combined_sort_cols,
+            kind='mergesort',
+            na_position='last',
+        )
+    return combined.reset_index(drop=True)
 
 
 def _atomic_save_model(target_path: str, save_fn):
@@ -129,11 +242,52 @@ class EnhancedModelTrainer:
         }
         print(f"硬件并行配置: CPU threads={self.cpu_threads}")
 
+    @staticmethod
+    def _calculate_ensemble_weights(scores: dict, task_type: str) -> dict:
+        """Convert validation scores into normalized ensemble weights."""
+        if not scores:
+            return {}
+
+        if task_type == 'regression':
+            raw_weights = {
+                name: 1.0 / max(float(score), 1e-12)
+                if np.isfinite(score)
+                else 0.0
+                for name, score in scores.items()
+            }
+        else:
+            # A classifier below random ranking should not dilute stronger members.
+            raw_weights = {
+                name: max(float(score) - 0.5, 0.0)
+                if np.isfinite(score)
+                else 0.0
+                for name, score in scores.items()
+            }
+            if sum(raw_weights.values()) <= 1e-12:
+                finite_scores = {
+                    name: float(score)
+                    for name, score in scores.items()
+                    if np.isfinite(score)
+                }
+                if finite_scores:
+                    best_name = max(finite_scores, key=finite_scores.get)
+                    raw_weights[best_name] = 1.0
+
+        total_weight = sum(raw_weights.values())
+        if total_weight <= 1e-12:
+            equal_weight = 1.0 / len(scores)
+            return {name: equal_weight for name in scores}
+        return {
+            name: weight / total_weight
+            for name, weight in raw_weights.items()
+        }
+
     def prepare_training_data(
         self,
         start_date: str,
         end_date: str,
-        use_execution_feedback: bool = True
+        use_execution_feedback: bool = True,
+        engineer_features: bool = False,
     ) -> pd.DataFrame:
         """
         准备训练数据
@@ -158,12 +312,51 @@ class EnhancedModelTrainer:
             include_execution_results=use_execution_feedback
         )
 
+        if engineer_features:
+            from ml_engine.data_processor import DataProcessor
+
+            processor = DataProcessor(self.db_path)
+            df = add_training_technical_features(df, processor)
+
         # 添加传统训练目标
         df = self._add_traditional_targets(df)
 
         return df
 
-    def _add_traditional_targets(self, df: pd.DataFrame) -> pd.DataFrame:
+    @staticmethod
+    def _compute_traditional_targets(group: pd.DataFrame) -> pd.DataFrame:
+        """Compute forward-looking market targets for one currency/period group."""
+        group = group.copy()
+
+        # Fix3: 用 shift + 后向滚动窗口替代 FixedForwardWindowIndexer，消除前向偏差（数据泄露）
+        # shift(-120): 将序列向未来偏移120步，再用后向窗口取60步分布
+        # 确保标签反映"未来时段的统计分布"，不从当前时刻开始计算
+        low_shifted = group['low_annual'].shift(-120)
+        close_shifted_60 = group['close_annual'].shift(-60)
+
+        # Target 1: 保守利率 (30%分位数)
+        group['future_conservative'] = low_shifted.rolling(window=60, min_periods=1).quantile(0.3)
+
+        # Target 2: 激进利率 (60%分位数)
+        group['future_aggressive'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.6)
+
+        # Target 3: 平衡利率 (70%分位数)
+        group['future_balanced'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.7)
+
+        # Target 4: 成交概率 (二分类标签)。未来窗口不可用时必须保留 NaN；
+        # 将 NaN 与当前利率比较会得到 False，进而把未知样本误标成失败。
+        future_80pct = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.8)
+        label_ready = future_80pct.notna() & group['close_annual'].notna()
+        group['future_execution_prob'] = np.where(
+            label_ready,
+            (group['close_annual'] <= future_80pct).astype(float),
+            np.nan,
+        )
+
+        return group
+
+    @classmethod
+    def _add_traditional_targets(cls, df: pd.DataFrame) -> pd.DataFrame:
         """
         添加传统训练目标
 
@@ -184,12 +377,7 @@ class EnhancedModelTrainer:
         if '_sample_role' not in df.columns:
             df['_sample_role'] = 'market_dense'
 
-        traditional_targets = [
-            'future_conservative',
-            'future_aggressive',
-            'future_balanced',
-            'future_execution_prob',
-        ]
+        traditional_targets = list(TRADITIONAL_TARGET_COLUMNS)
         for target in traditional_targets:
             if target not in df.columns:
                 df[target] = np.nan
@@ -201,32 +389,31 @@ class EnhancedModelTrainer:
         # 按 currency + period 分组计算
         market_df = market_df.sort_values(['currency', 'period', 'datetime'])
 
-        def compute_targets(group):
-            # Fix3: 用 shift + 后向滚动窗口替代 FixedForwardWindowIndexer，消除前向偏差（数据泄露）
-            # shift(-120): 将序列向未来偏移120步，再用后向窗口取60步分布
-            # 确保标签反映"未来时段的统计分布"，不从当前时刻开始计算
-            low_shifted = group['low_annual'].shift(-120)
-            close_shifted_60 = group['close_annual'].shift(-60)
-
-            # Target 1: 保守利率 (30%分位数)
-            group['future_conservative'] = low_shifted.rolling(window=60, min_periods=1).quantile(0.3)
-
-            # Target 2: 激进利率 (60%分位数)
-            group['future_aggressive'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.6)
-
-            # Target 3: 平衡利率 (70%分位数)
-            group['future_balanced'] = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.7)
-
-            # Target 4: 成交概率 (二分类标签)
-            future_80pct = close_shifted_60.rolling(window=60, min_periods=1).quantile(0.8)
-            group['future_execution_prob'] = (group['close_annual'] <= future_80pct).astype(int)
-
-            return group
-
         if len(market_df) > 0:
-            market_df = market_df.groupby(['currency', 'period'], group_keys=False).apply(compute_targets)
+            labeled_groups = []
+            for _, group in market_df.groupby(
+                ['currency', 'period'],
+                sort=False,
+                dropna=False,
+            ):
+                labeled_groups.append(cls._compute_traditional_targets(group))
+            market_df = pd.concat(
+                labeled_groups,
+                ignore_index=True,
+                sort=False,
+            )
 
         df = pd.concat([market_df, other_df], ignore_index=True, sort=False)
+        sort_cols = [
+            col for col in ('currency', 'period', 'datetime', '_sample_role')
+            if col in df.columns
+        ]
+        if sort_cols:
+            df = df.sort_values(
+                sort_cols,
+                kind='mergesort',
+                na_position='last',
+            ).reset_index(drop=True)
 
         # 清理传统目标 NaN，但保留订单监督行给 v2 执行反馈模型。
         initial_rows = len(df)
@@ -280,6 +467,8 @@ class EnhancedModelTrainer:
             'decision_mode',
             'data_quality_label',
             'validation_label',
+            'validated_at',
+            'validation_window_hours',
             'realized_terminal_mode',
             'realized_terminal_value',
             'realized_wait_hours',
@@ -465,6 +654,26 @@ class EnhancedModelTrainer:
 
         print(f"有效样本: {len(valid_df):,}")
 
+        # 训练切分必须按真实时间进行。上游数据通常按 currency/period 分块，
+        # 直接 iloc 会把某些期限块误当成验证集，失去时间序列验证意义。
+        if 'datetime' in valid_df.columns:
+            valid_df = valid_df.copy()
+            valid_df['_sort_datetime'] = pd.to_datetime(
+                valid_df['datetime'],
+                errors='coerce',
+            )
+            sort_cols = ['_sort_datetime']
+            sort_cols.extend(
+                col for col in ('currency', 'period')
+                if col in valid_df.columns
+            )
+            valid_df = (
+                valid_df
+                .sort_values(sort_cols, kind='mergesort', na_position='last')
+                .drop(columns='_sort_datetime')
+                .reset_index(drop=True)
+            )
+
         # S4: 计算时间衰减权重 (动态半衰期：高波动→短半衰期，低波动→长半衰期)
         sample_weights = None
         if 'datetime' in valid_df.columns:
@@ -541,14 +750,119 @@ class EnhancedModelTrainer:
                 )
                 return None
 
-        # 时间序列划分 (90/10)
+        # 时间序列划分 (90/10)。同一时间戳不得跨越训练/验证边界。
         split_idx = int(len(valid_df) * 0.9)
-        X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+        train_indices = np.arange(split_idx)
+        val_indices = np.arange(split_idx, len(valid_df))
+        split_cutoff = None
+        if 'datetime' in valid_df.columns and split_idx < len(valid_df):
+            datetimes = pd.to_datetime(valid_df['datetime'], errors='coerce')
+            cutoff = datetimes.iloc[split_idx]
+            if pd.notna(cutoff):
+                split_cutoff = cutoff
+                train_indices = np.flatnonzero((datetimes < cutoff).to_numpy())
+                val_indices = np.flatnonzero((datetimes >= cutoff).to_numpy())
+
+        # 传统目标最多前视每个期限的120行。剔除训练段各组合尾部，
+        # 防止训练标签读取验证期行情。
+        if target_name in {
+            'future_conservative',
+            'future_aggressive',
+            'future_balanced',
+            'future_execution_prob',
+        } and len(train_indices):
+            train_frame = valid_df.iloc[train_indices]
+            group_cols = [
+                col for col in ('currency', 'period')
+                if col in train_frame.columns
+            ]
+            if group_cols:
+                purge_indices = (
+                    train_frame
+                    .groupby(group_cols, group_keys=False)
+                    .tail(120)
+                    .index
+                    .to_numpy()
+                )
+            else:
+                purge_indices = train_frame.tail(120).index.to_numpy()
+            train_indices = np.setdiff1d(
+                train_indices,
+                purge_indices,
+                assume_unique=False,
+            )
+            print(f"时间边界 purge: 移除 {len(purge_indices):,} 条前视标签样本")
+
+        # Execution/revenue labels become observable at validation time, not at
+        # order time. Remove training rows whose outcome resolves in or after
+        # the validation slice.
+        if (
+            target_name in {'actual_execution_binary', 'revenue_optimized_target'}
+            and len(train_indices)
+            and split_cutoff is not None
+        ):
+            train_frame = valid_df.iloc[train_indices]
+            resolved_at = pd.Series(
+                pd.NaT,
+                index=train_frame.index,
+                dtype='datetime64[ns]',
+            )
+            if 'validated_at' in train_frame.columns:
+                resolved_at = pd.to_datetime(
+                    train_frame['validated_at'],
+                    errors='coerce',
+                )
+
+            if 'order_timestamp' in train_frame.columns:
+                order_times = pd.to_datetime(
+                    train_frame['order_timestamp'],
+                    errors='coerce',
+                )
+            else:
+                order_times = pd.to_datetime(
+                    train_frame.get('datetime'),
+                    errors='coerce',
+                )
+            if 'validation_window_hours' in train_frame.columns:
+                window_hours = pd.to_numeric(
+                    train_frame['validation_window_hours'],
+                    errors='coerce',
+                ).fillna(72.0)
+            else:
+                window_hours = pd.Series(
+                    72.0,
+                    index=train_frame.index,
+                )
+            fallback_resolved_at = order_times + pd.to_timedelta(
+                window_hours.clip(lower=0.0),
+                unit='h',
+            )
+            resolved_at = resolved_at.fillna(fallback_resolved_at)
+            observable_mask = resolved_at.notna() & (resolved_at < split_cutoff)
+            embargo_indices = train_frame.index[~observable_mask].to_numpy()
+            train_indices = np.setdiff1d(
+                train_indices,
+                embargo_indices,
+                assume_unique=False,
+            )
+            print(
+                f"执行标签 embargo: 移除 {len(embargo_indices):,} 条 "
+                "在验证期才可观测的样本"
+            )
+
+        if len(train_indices) < 100 or len(val_indices) < 10:
+            print(
+                f"⚠️  时间切分后样本不足 "
+                f"(train={len(train_indices)}, val={len(val_indices)}),跳过"
+            )
+            return None
+
+        X_train, X_val = X.iloc[train_indices], X.iloc[val_indices]
+        y_train, y_val = y.iloc[train_indices], y.iloc[val_indices]
 
         # S4: Split sample weights accordingly
-        w_train = sample_weights[:split_idx] if sample_weights is not None else None
-        w_val = sample_weights[split_idx:] if sample_weights is not None else None
+        w_train = sample_weights[train_indices] if sample_weights is not None else None
+        w_val = sample_weights[val_indices] if sample_weights is not None else None
 
         print(f"训练集: {len(X_train):,}, 验证集: {len(X_val):,}")
 
@@ -643,14 +957,8 @@ class EnhancedModelTrainer:
             self.lgb_params['n_jobs'] = _orig_lgb_threads or self.cpu_threads
             self.catboost_params['thread_count'] = _orig_cat_threads or self.cpu_threads
 
-        # 计算集成权重
-        if task_type == 'regression':
-            weights = {k: 1.0 / v for k, v in scores.items()}
-        else:
-            weights = scores.copy()
-
-        total_weight = sum(weights.values())
-        normalized_weights = {k: v / total_weight for k, v in weights.items()}
+        # 分类模型只按高于随机基线的 AUC 增益分配权重，避免弱基模稀释集成。
+        normalized_weights = self._calculate_ensemble_weights(scores, task_type)
 
         print(f"\n集成权重: {normalized_weights}")
 
@@ -730,22 +1038,13 @@ class EnhancedModelTrainer:
 
         # 准备训练数据
         _t_prep = _time_all.time()
-        df = self.prepare_training_data(start_date, end_date, use_execution_feedback)
+        df = self.prepare_training_data(
+            start_date,
+            end_date,
+            use_execution_feedback,
+            engineer_features=True,
+        )
         print(f"📊 数据准备耗时: {_time_all.time() - _t_prep:.1f}s")
-
-        # 特征工程: 添加技术指标 (P0)
-        _t_fe = _time_all.time()
-        try:
-            from ml_engine.data_processor import DataProcessor
-            dp = DataProcessor(self.db_path)
-            df = df.groupby(['currency', 'period'], group_keys=False).apply(
-                dp.add_technical_indicators
-            )
-            print(f"📊 特征工程耗时: {_time_all.time() - _t_fe:.1f}s (新增 {len(df.columns)} 列)")
-        except Exception as e:
-            print(f"⚠️  特征工程失败,使用原始特征: {e}")
-            import traceback
-            traceback.print_exc()
 
         # 训练前断言：确保数据非空
         if len(df) == 0:

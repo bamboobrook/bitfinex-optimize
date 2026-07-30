@@ -14,6 +14,7 @@ curl -X POST http://localhost:5000/update    # 触发完整 pipeline
 curl -X POST "http://localhost:5000/retrain?force=true"
 curl http://localhost:5000/status && curl http://localhost:5000/result
 rg -n "Step [1-6]|紧急重训练|stale_data|ERROR|✅" log/ml_optimizer.log | tail -40
+python scripts/evaluate_recent_optimization.py --days 7
 ```
 
 ## 3) 关键文件
@@ -40,9 +41,9 @@ rg -n "Step [1-6]|紧急重训练|stale_data|ERROR|✅" log/ml_optimizer.log | t
 1. **14天 + 20条** → 超时强制重训
 2. **7天 + 100条** → 定期重训
 3. **exec_rate < 30%** → 全局成交率过低（简单直接触发，无需样本积累）
-4. **exec_rate > 60%** → 过高触发
+4. **exec_rate > 60%** → 过高触发（需部署后满72小时且至少120条已决订单）
 5. **14d→7d drift > 15%** → 执行率快速下滑
-6. **某 (currency,period) 7天内 < 2单** → 零流动性检测
+6. **某 (currency,period) 至少5条已决且0成交** → 零流动性检测（部署后满72小时且至少120条已决才启用）
 7. 多信号 score >= 0.5
 8. 单 period critical/warning 异常
 
@@ -51,6 +52,16 @@ rg -n "Step [1-6]|紧急重训练|stale_data|ERROR|✅" log/ml_optimizer.log | t
 ## 6) 重要策略 (config/system_policy.json)
 - `score_threshold`: 0.5
 - `global_exec_low/high`: 0.30 / 0.60
+- 高成交率重训成熟门槛: 72小时 / 120条已决 / 至少20条72h结果；低成交率保护仍使用12小时 / 40条
+- 零流动性按已决结果判断，不把长周期 `PENDING` 当作无流动性
+- `virtual_orders` / `prediction_history` 使用 `model_YYYYMMDD_HHMMSS` 追踪生产模型版本
+- 部署后 cohort 必须按 `created_at` 归因；`order_timestamp` 是市场数据时间
+- Challenger 训练保留最近7天作 OOT 门禁，并 purge 各期限边界120行前视标签
+- 执行反馈标签以 `validated_at` 为可观测时间：训练截止和内部验证切分均做 embargo
+- 历史执行率/价差/gap/延迟特征必须同时满足 `order_timestamp <= as_of` 与 `validated_at <= as_of`，禁止把当前快照广播到历史行
+- 分类集成按 `max(AUC - 0.5, 0)` 分配权重，低于随机的基模权重为0
+- Challenger 门禁同时评估传统模型、execution_prob_v2 AUC/Brier、revenue_optimized MAE；AUC 并列分数使用平均秩
+- 增强模型绝对门槛: v2 AUC>=0.50、Brier<=0.25、revenue MAE<=5.0；正权重 xgb/lgb/cat 组件必须完整
 - `step_caps_pct`: 60d=8%, 90d=6%, 120d=5%（短周期无 cap）
 - `stale_data_hard_minutes`: 120（fUST 单独 900min）
 - `_check_db_data_freshness`: fUSD<240min 或 fUST<1440min 任一新鲜即继续

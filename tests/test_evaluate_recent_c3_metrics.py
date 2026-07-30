@@ -5,11 +5,19 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.evaluate_recent_optimization import fetch_freshness, fetch_path_metrics
+from scripts.evaluate_recent_optimization import (
+    WindowMetric,
+    build_combo_delta,
+    fetch_deployment_cohort_metrics,
+    fetch_freshness,
+    fetch_path_metrics,
+)
 from test_predictor_rank6 import EnsemblePredictor, _make_prediction
 
 
@@ -70,6 +78,162 @@ def test_fetch_path_metrics_reports_label_coverage_and_terminal_matrix(tmp_path)
     assert metrics["avg_realized_terminal_value"] == 10.0
     assert metrics["terminal_mode_matrix"]["stage1_fixed->FIXED"] == 1
     assert metrics["terminal_mode_matrix"]["stage2_frr->FRR_PROXY"] == 1
+
+
+def test_fetch_deployment_cohort_metrics_uses_created_at_and_reports_calibration(tmp_path):
+    db_path = tmp_path / "metrics.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                status TEXT,
+                validation_window_hours INTEGER,
+                predicted_rate REAL,
+                market_median REAL,
+                path_value_score REAL,
+                realized_terminal_value REAL,
+                update_cycle_id TEXT,
+                currency TEXT,
+                period INTEGER,
+                candidate_id TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE prediction_history (
+                update_cycle_id TEXT,
+                currency TEXT,
+                period INTEGER,
+                candidate_id TEXT,
+                execution_probability REAL,
+                calibrated_execution_probability REAL
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "EXECUTED", 24, 10.0, 9.0, 10.0, 9.5,
+                    "cycle-1", "fUSD", 2, "fUSD-2-main", "2026-04-01 10:05:00",
+                ),
+                (
+                    "FAILED", 24, 9.0, 8.0, 8.0, 8.5,
+                    "cycle-1", "fUSD", 3, "fUSD-3-main", "2026-04-01 10:06:00",
+                ),
+                (
+                    "PENDING", 48, 11.0, None, 9.0, None,
+                    "cycle-1", "fUSD", 30, "fUSD-30-main", "2026-04-01 10:07:00",
+                ),
+                (
+                    "EXECUTED", 24, 7.0, 7.0, 7.0, 7.0,
+                    "old-cycle", "fUSD", 2, "old", "2026-04-01 09:59:00",
+                ),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO prediction_history VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("cycle-1", "fUSD", 2, "fUSD-2-main", 0.9, 0.8),
+                ("cycle-1", "fUSD", 3, "fUSD-3-main", 0.8, 0.2),
+                ("cycle-1", "fUSD", 30, "fUSD-30-main", 0.7, 0.6),
+            ],
+        )
+
+        metrics = fetch_deployment_cohort_metrics(
+            conn,
+            datetime(2026, 4, 1, 10, 0, 0),
+        )
+
+    assert metrics["total"] == 3
+    assert metrics["decided"] == 2
+    assert metrics["pending"] == 1
+    assert metrics["execution_rate"] == 0.5
+    assert metrics["maturity_by_window"][24] == {"total": 2, "decided": 2}
+    assert metrics["maturity_by_window"][48] == {"total": 1, "decided": 0}
+    assert metrics["raw_probability"]["auc"] == 1.0
+    assert metrics["raw_probability"]["brier"] == pytest.approx(0.325)
+    assert metrics["calibrated_probability"]["brier"] == pytest.approx(0.04)
+    assert metrics["realized_premium_vs_market"] == pytest.approx(0.5)
+    assert metrics["path_mae"] == pytest.approx(0.5)
+
+
+def test_deployment_metrics_deduplicate_history_and_report_candidate_probability(tmp_path):
+    db_path = tmp_path / "deduplicated_metrics.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                status TEXT,
+                validation_window_hours INTEGER,
+                predicted_rate REAL,
+                market_median REAL,
+                path_value_score REAL,
+                realized_terminal_value REAL,
+                update_cycle_id TEXT,
+                currency TEXT,
+                period INTEGER,
+                candidate_id TEXT,
+                created_at TEXT,
+                stage1_fill_probability REAL,
+                model_version TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE prediction_history (
+                update_cycle_id TEXT,
+                currency TEXT,
+                period INTEGER,
+                candidate_id TEXT,
+                execution_probability REAL,
+                calibrated_execution_probability REAL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "EXECUTED", 24, 10.0, 9.0, 10.0, 9.5,
+                "cycle-1", "fUSD", 2, "candidate-1",
+                "2026-04-01 10:05:00", 0.8, "model_20260401_100000",
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO prediction_history VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("cycle-1", "fUSD", 2, "candidate-1", 0.1, 0.2),
+                ("cycle-1", "fUSD", 2, "candidate-1", 0.9, 0.7),
+            ],
+        )
+
+        metrics = fetch_deployment_cohort_metrics(
+            conn,
+            datetime(2026, 4, 1, 10, 0, 0),
+        )
+
+    assert metrics["total"] == 1
+    assert metrics["raw_probability"]["mean"] == pytest.approx(0.9)
+    assert metrics["calibrated_probability"]["mean"] == pytest.approx(0.7)
+    assert metrics["stage1_probability"]["mean"] == pytest.approx(0.8)
+    assert metrics["model_versions"] == {"model_20260401_100000": 1}
+
+
+def test_combo_delta_ignores_immature_one_sided_windows():
+    recent = {
+        "fUSD-2d": WindowMetric(total=6, executed=5),
+    }
+    previous = {
+        "fUSD-2d": WindowMetric(total=6, executed=4),
+        "fUSD-90d": WindowMetric(total=8, executed=8),
+    }
+
+    deltas = build_combo_delta(recent, previous, min_total=5)
+
+    assert [item["combo"] for item in deltas] == ["fUSD-2d"]
 
 
 def test_fetch_freshness_ignores_unsupported_periods(tmp_path):

@@ -39,6 +39,9 @@ class EnsemblePredictor:
     # 类常量配置
     COLD_START_THRESHOLD = 10  # 冷启动数据点阈值
     STALE_DATA_THRESHOLD_HOURS = 2  # 陈旧数据阈值(小时)
+    RATE_OUTLIER_MIN_RATIO = 0.10
+    RATE_OUTLIER_MAX_RATIO = 10.0
+    RATE_OUTLIER_REFERENCE_SAMPLES = 3
 
     def __init__(self, model_dir=None, max_workers=None):
         # Use absolute path for models directory
@@ -56,6 +59,7 @@ class EnsemblePredictor:
         self._timestamp_deprecation_warned = False  # 废弃警告标志
         self.policy = load_system_policy()
         self.policy_version = get_policy_version(self.policy)
+        self.model_version = self._derive_model_version()
         self.db_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
             "data", "lending_history.db"
@@ -83,6 +87,54 @@ class EnsemblePredictor:
 
         # 加载所有模型
         self.load_all_models()
+
+    def _derive_model_version(self) -> str:
+        """Build a stable identifier from the latest successful deployment."""
+        try:
+            history_path = os.path.join(
+                os.path.dirname(self.model_dir),
+                "retraining_history.json",
+            )
+            if os.path.exists(history_path):
+                with open(history_path, "r", encoding="utf-8") as history_file:
+                    raw_history = json.load(history_file)
+                entries = (
+                    raw_history
+                    if isinstance(raw_history, list)
+                    else list(raw_history.values())
+                    if isinstance(raw_history, dict)
+                    else []
+                )
+                deployed_times = []
+                for entry in entries:
+                    if not isinstance(entry, dict) or entry.get("deployed") is not True:
+                        continue
+                    try:
+                        deployed_times.append(
+                            datetime.strptime(
+                                entry.get("timestamp", ""),
+                                "%Y-%m-%d %H:%M:%S",
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                if deployed_times:
+                    stamp = max(deployed_times).strftime("%Y%m%d_%H%M%S")
+                    return f"model_{stamp}"
+
+            meta_files = [
+                os.path.join(self.model_dir, name)
+                for name in os.listdir(self.model_dir)
+                if name.endswith("_meta.json")
+            ]
+            if not meta_files:
+                return "model_unknown"
+            newest_mtime = max(os.path.getmtime(path) for path in meta_files)
+            stamp = datetime.fromtimestamp(newest_mtime).strftime("%Y%m%d_%H%M%S")
+            return f"model_{stamp}"
+        except Exception as e:
+            logger.warning(f"Unable to derive model version from {self.model_dir}: {e}")
+            return "model_unknown"
 
     def _connect_db(self, read_only: bool = False):
         busy_timeout_seconds = float(os.getenv("PREDICT_SQLITE_BUSY_TIMEOUT", "2.0"))
@@ -207,13 +259,22 @@ class EnsemblePredictor:
 
         models = self.models[currency][model_type]
         meta = self.meta_info[currency][model_type]
-        weights = meta['weights']
-
-        # B3 FIX: Validate weights for NaN, fallback to equal weights
-        if any(np.isnan(v) for v in weights.values()):
-            logger.warning(f"NaN detected in ensemble weights for {currency}-{model_type}, using equal weights")
-            n_algos = len(weights)
-            weights = {k: 1.0 / n_algos for k in weights}
+        try:
+            weights = {
+                algorithm: float(weight)
+                for algorithm, weight in meta['weights'].items()
+            }
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid ensemble weights for {currency}-{model_type}"
+            ) from exc
+        if (
+            not weights
+            or any(not np.isfinite(weight) or weight < 0 for weight in weights.values())
+        ):
+            raise ValueError(
+                f"Invalid ensemble weights for {currency}-{model_type}"
+            )
 
         # 获取各模型预测
         predictions = {}
@@ -234,15 +295,37 @@ class EnsemblePredictor:
             else:
                 predictions['cat'] = models['cat'].predict(X, thread_count=self.infer_threads)
 
+        positive_algorithms = {
+            algorithm
+            for algorithm, weight in weights.items()
+            if weight > 1e-12
+        }
+        missing_algorithms = positive_algorithms.difference(predictions)
+        if missing_algorithms:
+            raise ValueError(
+                f"Incomplete ensemble for {currency}-{model_type}: "
+                f"missing {sorted(missing_algorithms)}"
+            )
+        available_weight = sum(
+            weights.get(algorithm, 0.0)
+            for algorithm in predictions
+        )
+        if available_weight <= 1e-12:
+            raise ValueError(
+                f"Ensemble has no positive weight for {currency}-{model_type}"
+            )
+
         # 加权集成
         ensemble_pred = np.zeros(len(X))
         for algo, pred in predictions.items():
-            ensemble_pred += pred * weights.get(algo, 0.0)
+            ensemble_pred += pred * (
+                weights.get(algo, 0.0) / available_weight
+            )
 
         return ensemble_pred
 
     def get_latest_rate_from_db(self, currency: str, period: int) -> tuple:
-        """Query database directly for the most recent rate"""
+        """Return the latest rate, replacing only isolated extreme ticks."""
         conn = self._connect_db(read_only=True)
         cursor = conn.cursor()
 
@@ -254,14 +337,54 @@ class EnsemblePredictor:
               AND close_annual > 0
               AND close_annual <= 50
             ORDER BY datetime DESC
-            LIMIT 1
+            LIMIT 9
             """
             cursor.execute(query, (currency, period))
-            result = cursor.fetchone()
+            rows = cursor.fetchall()
 
-            if result:
-                return float(result[0]), result[1]
-            return None, None
+            if not rows:
+                return None, None
+
+            latest_rate = float(rows[0][0])
+            latest_timestamp = rows[0][1]
+            try:
+                latest_dt = (
+                    latest_timestamp
+                    if isinstance(latest_timestamp, datetime)
+                    else datetime.strptime(str(latest_timestamp)[:19], '%Y-%m-%d %H:%M:%S')
+                )
+            except (TypeError, ValueError):
+                return latest_rate, latest_timestamp
+
+            _, hard_minutes = self._freshness_thresholds_minutes(currency, period)
+            reference_window_minutes = max(float(hard_minutes), 360.0)
+            reference_rows = []
+            for rate, timestamp in rows[1:]:
+                try:
+                    row_dt = (
+                        timestamp
+                        if isinstance(timestamp, datetime)
+                        else datetime.strptime(str(timestamp)[:19], '%Y-%m-%d %H:%M:%S')
+                    )
+                except (TypeError, ValueError):
+                    continue
+                age_minutes = (latest_dt - row_dt).total_seconds() / 60.0
+                if 0.0 <= age_minutes <= reference_window_minutes:
+                    reference_rows.append((float(rate), timestamp))
+
+            if len(reference_rows) >= self.RATE_OUTLIER_REFERENCE_SAMPLES:
+                reference_median = float(np.median([row[0] for row in reference_rows]))
+                ratio = latest_rate / reference_median if reference_median > 0 else 1.0
+                if ratio < self.RATE_OUTLIER_MIN_RATIO or ratio > self.RATE_OUTLIER_MAX_RATIO:
+                    effective_timestamp = reference_rows[0][1]
+                    logger.warning(
+                        f"ISOLATED RATE OUTLIER for {currency}-{period}: "
+                        f"latest={latest_rate:.4f}, recent_median={reference_median:.4f}, "
+                        f"ratio={ratio:.4f}; using recent median"
+                    )
+                    return reference_median, effective_timestamp
+
+            return latest_rate, latest_timestamp
         finally:
             conn.close()
 
@@ -312,6 +435,7 @@ class EnsemblePredictor:
                         aggressive_rate,
                         trend_factor,
                         current_market_rate,
+                        calibrated_execution_probability,
                         liquidity_score
                     FROM prediction_history
                     WHERE currency = ?
@@ -346,6 +470,11 @@ class EnsemblePredictor:
             "current_rate": float(row["current_market_rate"] or 0.0),
             "predicted_rate": float(row["predicted_rate"] or 0.0),
             "execution_probability": float(row["execution_probability"] or 0.0),
+            "calibrated_execution_prob": float(
+                row["calibrated_execution_probability"]
+                if row["calibrated_execution_probability"] is not None
+                else row["execution_probability"] or 0.0
+            ),
             "conservative_rate": float(row["conservative_rate"] or 0.0),
             "aggressive_rate": float(row["aggressive_rate"] or 0.0),
             "balanced_rate": float(row["balanced_rate"] or 0.0),
@@ -1301,9 +1430,14 @@ class EnsemblePredictor:
         return {
             "currency": currency,
             "period": int(row_data['period']),
+            "model_version": self.model_version,
             "current_rate": current_rate,
             "predicted_rate": float(final_rate),
             "execution_probability": prob,
+            "traditional_execution_probability": float(pred_execution_prob),
+            "v2_execution_probability": (
+                float(v2_execution_prob) if v2_execution_prob is not None else None
+            ),
             "calibrated_execution_prob": float(calibrated_prob),  # exec_rate校准后的成交概率（反映真实流动性）
             "exec_rate_raw": float(exec_rate_fast),  # 原始历史成交率（用于流动性评分，不受模型滞后影响）
             "liquidity_score": liq_score,
@@ -2238,6 +2372,9 @@ class EnsemblePredictor:
                 "candidate_id": "TEXT",
                 "decision_mode": "TEXT",
                 "expected_terminal_mode": "TEXT",
+                "model_version": "TEXT",
+                "traditional_execution_probability": "REAL",
+                "v2_execution_probability": "REAL",
             }
             for column, col_type in required_columns.items():
                 if column not in existing:
@@ -2447,8 +2584,11 @@ class EnsemblePredictor:
 
     def _enrich_prediction_identity(self, ranked_predictions: list, update_cycle_id: Optional[str] = None):
         cycle_id = update_cycle_id or datetime.now().strftime('%Y%m%d_%H%M%S')
+        model_version = getattr(self, "model_version", "model_unknown")
 
         for rank, pred in enumerate(ranked_predictions, start=1):
+            if not pred.get("model_version"):
+                pred["model_version"] = model_version
             if not pred.get("update_cycle_id"):
                 pred["update_cycle_id"] = cycle_id
             if pred.get("decision_mode") == "probe":
@@ -2599,6 +2739,17 @@ class EnsemblePredictor:
                 pred.get("currency_regime_state"),
                 float(pred.get("final_rank_score", pred.get("weighted_score", 0.0)) or 0.0),
                 pred.get("expected_terminal_mode"),
+                pred.get("model_version", getattr(self, "model_version", "model_unknown")),
+                (
+                    float(pred["traditional_execution_probability"])
+                    if pred.get("traditional_execution_probability") is not None
+                    else None
+                ),
+                (
+                    float(pred["v2_execution_probability"])
+                    if pred.get("v2_execution_probability") is not None
+                    else None
+                ),
             ))
 
         with self._connect_db(read_only=False) as conn:
@@ -2615,8 +2766,10 @@ class EnsemblePredictor:
                     market_follow_error, stale_data, path_value_score,
                     stage1_fill_probability, frr_proxy_rate, frr_fallback_value,
                     rank6_fallback_penalty, fast_liquidity_score,
-                    currency_regime_state, final_rank_score, expected_terminal_mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    currency_regime_state, final_rank_score, expected_terminal_mode,
+                    model_version, traditional_execution_probability,
+                    v2_execution_probability
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows
             )
@@ -2959,6 +3112,10 @@ class EnsemblePredictor:
 
         # Build the recommendations list
         for i, pred in enumerate(recommendations_to_add[:6]):
+            raw_execution_probability = float(pred.get('execution_probability', 0.0) or 0.0)
+            calibrated_execution_probability = float(
+                pred.get('calibrated_execution_prob', raw_execution_probability) or 0.0
+            )
             result["recommendations"].append({
                 "rank": i + 1,
                 "type": "optimal" if i == 0 else "alternative",
@@ -2970,7 +3127,9 @@ class EnsemblePredictor:
                 "liquidity_level": pred.get('liquidity_level'),
                 "details": {
                     "current": round(pred['current_rate'], 4),
-                    "execution_probability": round(pred['execution_probability'], 4),
+                    "execution_probability": round(calibrated_execution_probability, 4),
+                    "calibrated_execution_probability": round(calibrated_execution_probability, 4),
+                    "raw_execution_probability": round(raw_execution_probability, 4),
                     "conservative_floor": round(pred['conservative_rate'], 4),
                     "aggressive_target": round(pred['aggressive_rate'], 4),
                     "balanced_target": round(pred['balanced_rate'], 4),
