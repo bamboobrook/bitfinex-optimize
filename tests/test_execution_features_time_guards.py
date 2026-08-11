@@ -150,6 +150,34 @@ def test_cold_start_query_does_not_count_orders_after_as_of_date(tmp_path):
     assert rate == pytest.approx(0.55)
 
 
+def test_failed_gap_prefers_stage1_and_reconstructs_legacy_max_market(tmp_path):
+    db_path = tmp_path / "stage1-gap.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                currency TEXT, period INTEGER, order_timestamp TEXT,
+                validated_at TEXT, status TEXT, predicted_rate REAL,
+                max_market_rate REAL, rate_gap REAL, stage1_rate_gap REAL
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("fUSD", 30, "2026-01-01 00:00:00", "2026-01-02 00:00:00", "FAILED", 10.0, 8.0, 9.0, 1.0),
+                ("fUSD", 30, "2026-01-01 01:00:00", "2026-01-02 00:00:00", "FAILED", 9.0, 7.0, 8.0, None),
+            ],
+        )
+
+    features = ExecutionFeatures(str(db_path))
+    gap = features.calculate_avg_rate_gap(
+        "fUSD", 30, 7, as_of_date=datetime(2026, 1, 3)
+    )
+
+    assert gap == pytest.approx(1.5)
+
+
 def test_data_processor_does_not_broadcast_current_execution_snapshot(tmp_path):
     db_path = tmp_path / "orders.sqlite"
     _seed_orders(db_path)

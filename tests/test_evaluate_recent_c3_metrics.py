@@ -265,6 +265,12 @@ def test_fetch_freshness_ignores_unsupported_periods(tmp_path):
 
     pairs = {(item["currency"], item["period"]) for item in freshness}
     assert pairs == {("fUSD", 2), ("fUST", 15)}
+    targets = {
+        (item["currency"], item["period"]): item["hard_minutes"]
+        for item in freshness
+    }
+    assert targets[("fUSD", 2)] == 300.0
+    assert targets[("fUST", 15)] == 2880.0
 
 
 def test_fetch_path_metrics_handles_legacy_schema_without_path_columns(tmp_path):

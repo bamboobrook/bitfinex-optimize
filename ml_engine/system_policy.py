@@ -144,6 +144,54 @@ def get_step_cap_pct(policy: Dict[str, Any], period: int) -> Optional[float]:
     return cap
 
 
+def get_freshness_thresholds_minutes(
+    policy: Dict[str, Any],
+    currency: str = "",
+    period: int = 0,
+) -> tuple[float, float]:
+    """Resolve the shared currency/period-aware freshness policy."""
+    automation = policy.get("automation", {})
+    warn_minutes = float(automation.get("stale_data_warn_minutes", 60))
+    hard_minutes = float(automation.get("stale_data_hard_minutes", 120))
+    is_fust = currency.upper() == "FUST"
+
+    if is_fust:
+        if automation.get("stale_data_warn_minutes_fUST") is not None:
+            warn_minutes = float(automation["stale_data_warn_minutes_fUST"])
+        if automation.get("stale_data_hard_minutes_fUST") is not None:
+            hard_minutes = float(automation["stale_data_hard_minutes_fUST"])
+    elif currency:
+        override = automation.get(f"stale_data_hard_minutes_{currency}")
+        if override is not None:
+            hard_minutes = float(override)
+
+    if period > 0:
+        tier_key = (
+            "stale_data_hard_minutes_fUST_by_period_tier"
+            if is_fust
+            else "stale_data_hard_minutes_by_period_tier"
+        )
+        tier_config = automation.get(tier_key)
+        if isinstance(tier_config, dict):
+            if period >= 30:
+                tier_hard = tier_config.get("long")
+            elif period >= 10:
+                tier_hard = tier_config.get(
+                    "sparse_medium" if is_fust else "medium",
+                    tier_config.get("medium"),
+                )
+            elif period >= 6:
+                tier_hard = tier_config.get("medium")
+            else:
+                tier_hard = tier_config.get("short")
+            if tier_hard is not None:
+                hard_minutes = max(hard_minutes, float(tier_hard))
+
+    if hard_minutes <= warn_minutes:
+        hard_minutes = warn_minutes + 30.0
+    return warn_minutes, hard_minutes
+
+
 def get_policy_version(policy: Dict[str, Any]) -> str:
     value = policy.get("policy_version")
     if value is None:

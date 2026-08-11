@@ -1422,3 +1422,67 @@ def test_log_retraining_event_keeps_multiple_same_day_entries(tmp_path, schedule
     assert len(history) == 2
     assert history[0]["trigger"] == "first"
     assert history[1]["trigger"] == "second"
+
+
+def test_training_label_snapshot_tracks_only_mature_training_window_labels(
+    tmp_path, scheduler_module
+):
+    db_path = tmp_path / "labels.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                order_id TEXT, order_timestamp TEXT, validated_at TEXT,
+                status TEXT, decision_mode TEXT, data_quality_label TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("a", "2026-01-10 00:00:00", "2026-01-11 00:00:00", "EXECUTED", "exploit", "STRONG"),
+                ("b", "2026-01-12 00:00:00", "2026-01-13 00:00:00", "FAILED", "exploit", "WEAK_PROXY"),
+                ("future", "2026-01-14 00:00:00", "2026-02-02 00:00:00", "FAILED", "exploit", "WEAK_PROXY"),
+                ("probe", "2026-01-15 00:00:00", "2026-01-16 00:00:00", "FAILED", "probe", "WEAK_PROXY"),
+                ("censored", "2026-01-16 00:00:00", "2026-01-17 00:00:00", "FAILED", "exploit", "CENSORED"),
+            ],
+        )
+
+    scheduler = scheduler_module.RetrainingScheduler(
+        db_path=str(db_path),
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    training_end = __import__("datetime").datetime(2026, 2, 1, 0, 0, 0)
+
+    first = scheduler.get_training_label_snapshot(training_end)
+    second = scheduler.get_training_label_snapshot(training_end)
+
+    assert first["label_count"] == 2
+    assert first["positive_count"] == 1
+    assert first["negative_count"] == 1
+    assert first["fingerprint"] == second["fingerprint"]
+
+
+def test_cleanup_preserves_latest_rejected_challenger(tmp_path, scheduler_module):
+    model_root = tmp_path / "data"
+    production = model_root / "models"
+    old_challenger = model_root / "models_retrained_old"
+    latest_challenger = model_root / "models_retrained_latest"
+    production.mkdir(parents=True)
+    old_challenger.mkdir()
+    latest_challenger.mkdir()
+
+    scheduler = scheduler_module.RetrainingScheduler(
+        db_path=str(tmp_path / "db.sqlite"),
+        production_model_dir=str(production),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    scheduler.cleanup_old_artifacts(
+        str(latest_challenger), preserve_retrained=True
+    )
+
+    assert latest_challenger.exists()
+    assert not old_challenger.exists()

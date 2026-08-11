@@ -360,8 +360,21 @@ class ExecutionFeatures:
         cursor = conn.cursor()
 
         try:
-            query = """
-            SELECT AVG(rate_gap) as avg_gap
+            cursor.execute("PRAGMA table_info(virtual_orders)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "stage1_rate_gap" in columns:
+                gap_expr = (
+                    "COALESCE(stage1_rate_gap, "
+                    "CASE WHEN max_market_rate IS NOT NULL "
+                    "THEN predicted_rate - max_market_rate END)"
+                )
+            elif "max_market_rate" in columns:
+                gap_expr = "predicted_rate - max_market_rate"
+            else:
+                gap_expr = "rate_gap"
+
+            query = f"""
+            SELECT AVG({gap_expr}) as avg_gap
             FROM virtual_orders
             WHERE currency = ?
               AND period = ?
@@ -370,7 +383,7 @@ class ExecutionFeatures:
               AND order_timestamp <= ?
               AND validated_at IS NOT NULL
               AND validated_at <= ?
-              AND rate_gap IS NOT NULL
+              AND {gap_expr} IS NOT NULL
             """
 
             cursor.execute(

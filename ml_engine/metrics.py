@@ -45,8 +45,9 @@ class MetricsCollector:
 
         total = len(predictions)
         clipped_count = 0
-        total_reduction = 0.0
+        total_change_pct = 0.0
         strategy_counts = {'aggressive': 0, 'balanced': 0, 'conservative': 0}
+        direction_counts = {'up': 0, 'down': 0, 'none': 0}
 
         for pred in predictions:
             # 统计 clipping 策略分布
@@ -57,29 +58,23 @@ class MetricsCollector:
             # 统计被削减的预测
             if pred.get('was_clipped', False):
                 clipped_count += 1
-
-                # 尝试计算削减幅度（如果有原始预测值）
-                # 注意: 当前返回值中没有存储原始预测，这里从边界估算
-                final_rate = pred.get('predicted_rate', 0)
-                bounds = pred.get('clipping_bounds', {})
-                max_bound = bounds.get('max', 0)
-                min_bound = bounds.get('min', 0)
-
-                # 估算削减幅度（假设原始值超出边界）
-                if final_rate == max_bound and max_bound > 0:
-                    # 被上限削减，估算原始值至少超出 10%
-                    estimated_reduction = 10.0
-                    total_reduction += estimated_reduction
-                elif final_rate == min_bound and min_bound > 0:
-                    # 被下限削减
-                    estimated_reduction = 10.0
-                    total_reduction += estimated_reduction
+                direction = pred.get('clipping_direction', 'none')
+                if direction not in direction_counts:
+                    direction = 'none'
+                direction_counts[direction] += 1
+                before = float(pred.get('pre_clipping_rate', 0.0) or 0.0)
+                after = float(pred.get('post_clipping_rate', pred.get('predicted_rate', 0.0)) or 0.0)
+                if before > 0:
+                    total_change_pct += abs(after - before) / before * 100.0
+            else:
+                direction_counts['none'] += 1
 
         return {
             'clipping_rate': f"{clipped_count / total * 100:.1f}%" if total > 0 else "0%",
             'clipped_count': clipped_count,
             'total_predictions': total,
-            'avg_clip_reduction': f"{total_reduction / clipped_count:.1f}%" if clipped_count > 0 else "0%",
+            'avg_clip_reduction': f"{total_change_pct / clipped_count:.1f}%" if clipped_count > 0 else "0%",
+            'clipping_direction': direction_counts,
             'strategy_distribution': {
                 k: f"{v / total * 100:.1f}%" for k, v in strategy_counts.items()
             }
@@ -99,6 +94,8 @@ class MetricsCollector:
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(virtual_orders)")
+            columns = {row[1] for row in cursor.fetchall()}
 
             # 1. 执行率统计（包含 EXPIRED，基于有效闭合订单）
             cursor.execute("""
@@ -108,19 +105,45 @@ class MetricsCollector:
             """)
             status_counts = dict(cursor.fetchall())
 
-            total_closed = (status_counts.get('EXECUTED', 0)
-                            + status_counts.get('FAILED', 0)
-                            + status_counts.get('EXPIRED', 0))
-            exec_rate = status_counts.get('EXECUTED', 0) / total_closed * 100 if total_closed > 0 else 0
+            cursor.execute("""
+                SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END)
+                FROM virtual_orders
+                WHERE order_timestamp >= datetime('now', '-7 days')
+                  AND status IN ('EXECUTED', 'FAILED')
+            """)
+            recent_total, recent_executed = cursor.fetchone()
+            recent_total = int(recent_total or 0)
+            recent_executed = int(recent_executed or 0)
+            exec_rate = recent_executed / recent_total * 100 if recent_total > 0 else 0
+
+            all_time_decided = (
+                status_counts.get('EXECUTED', 0) + status_counts.get('FAILED', 0)
+            )
+            all_time_exec_rate = (
+                status_counts.get('EXECUTED', 0) / all_time_decided * 100
+                if all_time_decided > 0 else 0
+            )
 
             # 2. FAILED 订单的平均 rate gap
-            cursor.execute("""
-                SELECT AVG(rate_gap) as avg_gap
+            if 'stage1_rate_gap' in columns:
+                gap_expr = (
+                    "COALESCE(stage1_rate_gap, "
+                    "CASE WHEN max_market_rate IS NOT NULL "
+                    "THEN predicted_rate - max_market_rate END)"
+                )
+            elif 'max_market_rate' in columns:
+                gap_expr = "predicted_rate - max_market_rate"
+            else:
+                gap_expr = "rate_gap"
+            cursor.execute(f"""
+                SELECT AVG({gap_expr}) as avg_gap
                 FROM virtual_orders
                 WHERE status='FAILED'
             """)
             avg_gap_row = cursor.fetchone()
-            avg_gap = avg_gap_row[0] if avg_gap_row[0] is not None else 0
+            avg_gap = avg_gap_row[0]
 
             # 3. Cold start 覆盖率统计
             # 查询每个 currency-period 组合的订单数
@@ -143,11 +166,15 @@ class MetricsCollector:
 
             return {
                 'execution_rate': f"{exec_rate:.1f}%",
+                'execution_window_days': 7,
+                'window_total_decided': recent_total,
+                'window_executed': recent_executed,
+                'all_time_execution_rate': f"{all_time_exec_rate:.1f}%",
                 'total_executed': status_counts.get('EXECUTED', 0),
                 'total_failed': status_counts.get('FAILED', 0),
                 'total_expired': status_counts.get('EXPIRED', 0),
                 'total_pending': status_counts.get('PENDING', 0),
-                'avg_rate_gap_failed': f"{avg_gap:.4f}%" if avg_gap > 0 else "N/A",
+                'avg_rate_gap_failed': f"{avg_gap:.4f}%" if avg_gap is not None else "N/A",
                 'cold_start_coverage': f"{cold_start_pct:.1f}%",
                 'cold_start_combos': cold_start_combos,
                 'total_combos': total_combos
@@ -298,6 +325,7 @@ class MetricsCollector:
             clip_metrics = metrics['clipping_metrics']
             logger.info(f"Rate Clipping Rate: {clip_metrics.get('clipping_rate', 'N/A')} "
                        f"({clip_metrics.get('clipped_count', 0)}/{clip_metrics.get('total_predictions', 0)} predictions)")
+            logger.info(f"Clipping Direction: {clip_metrics.get('clipping_direction', {})}")
             logger.info(f"Strategy Distribution: {clip_metrics.get('strategy_distribution', {})}")
 
         # 跟随/稳定指标

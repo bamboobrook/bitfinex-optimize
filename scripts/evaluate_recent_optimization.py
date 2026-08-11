@@ -15,16 +15,25 @@ import argparse
 import json
 import math
 import sqlite3
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "lending_history.db"
-DEFAULT_RESULT = Path(__file__).resolve().parent.parent / "data" / "optimal_combination.json"
-DEFAULT_MODEL_DIR = Path(__file__).resolve().parent.parent / "data" / "models"
-FRESHNESS_TARGETS = {"fUSD": 300.0, "fUST": 900.0}
+from ml_engine.system_policy import (
+    get_freshness_thresholds_minutes,
+    load_system_policy,
+)
+
+
+DEFAULT_DB = PROJECT_ROOT / "data" / "lending_history.db"
+DEFAULT_RESULT = PROJECT_ROOT / "data" / "optimal_combination.json"
+DEFAULT_MODEL_DIR = PROJECT_ROOT / "data" / "models"
 SUPPORTED_CURRENCIES = {"fUSD", "fUST"}
 SUPPORTED_PERIODS = {2, 3, 4, 5, 6, 7, 10, 14, 15, 20, 30, 60, 90, 120}
 
@@ -178,6 +187,11 @@ def fetch_deployment_cohort_metrics(
         if "current_market_rate" in prediction_columns
         else "v.market_median"
     )
+    realized_value_select = (
+        _net_terminal_value_expression(virtual_columns, prefix="v.")
+        if "realized_terminal_value" in virtual_columns
+        else "NULL"
+    )
     rows = conn.execute(
         f"""
         SELECT
@@ -186,7 +200,7 @@ def fetch_deployment_cohort_metrics(
             v.predicted_rate,
             {order_market_select} AS order_market_rate,
             v.path_value_score,
-            v.realized_terminal_value,
+            {realized_value_select} AS realized_terminal_value_net_wait,
             p.execution_probability,
             COALESCE(
                 p.calibrated_execution_probability,
@@ -351,14 +365,15 @@ def format_num(value: float | None, digits: int = 2) -> str:
 
 
 def fetch_window_metric(conn: sqlite3.Connection, start: datetime, end: datetime) -> WindowMetric:
+    gap_expr = _failed_gap_expression(_get_virtual_order_columns(conn))
     row = conn.execute(
-        """
+        f"""
         SELECT
-            COUNT(*) AS total,
+            SUM(CASE WHEN status IN ('EXECUTED', 'FAILED') THEN 1 ELSE 0 END) AS total,
             SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) AS executed,
             SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed,
             SUM(CASE WHEN status='EXPIRED' THEN 1 ELSE 0 END) AS expired,
-            AVG(CASE WHEN status='FAILED' THEN rate_gap END) AS avg_failed_gap
+            AVG(CASE WHEN status='FAILED' THEN {gap_expr} END) AS avg_failed_gap
         FROM virtual_orders
         WHERE order_timestamp >= ?
           AND order_timestamp < ?
@@ -386,13 +401,14 @@ def fetch_group_metrics(conn: sqlite3.Connection, start: datetime, end: datetime
         select_expr = "currency || '-' || period || 'd'"
         group_expr = "currency, period"
 
+    gap_expr = _failed_gap_expression(_get_virtual_order_columns(conn))
     rows = conn.execute(
         f"""
         SELECT
             {select_expr} AS grp,
-            COUNT(*) AS total,
+            SUM(CASE WHEN status IN ('EXECUTED', 'FAILED') THEN 1 ELSE 0 END) AS total,
             SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) AS executed,
-            AVG(CASE WHEN status='FAILED' THEN rate_gap END) AS avg_failed_gap
+            AVG(CASE WHEN status='FAILED' THEN {gap_expr} END) AS avg_failed_gap
         FROM virtual_orders
         WHERE order_timestamp >= ?
           AND order_timestamp < ?
@@ -429,6 +445,7 @@ def fetch_freshness(conn: sqlite3.Connection) -> list[dict]:
     ).fetchall()
 
     now = datetime.now()
+    policy = load_system_policy()
     report = []
     for currency, period, latest_dt in rows:
         age_minutes = None
@@ -436,12 +453,16 @@ def fetch_freshness(conn: sqlite3.Connection) -> list[dict]:
         if latest_dt:
             latest = datetime.strptime(latest_dt, "%Y-%m-%d %H:%M:%S")
             age_minutes = max(0.0, (now - latest).total_seconds() / 60.0)
-            status = "fresh" if age_minutes <= FRESHNESS_TARGETS.get(currency, 300.0) else "stale"
+            _, hard_minutes = get_freshness_thresholds_minutes(
+                policy, currency, int(period)
+            )
+            status = "fresh" if age_minutes <= hard_minutes else "stale"
         report.append({
             "currency": currency,
             "period": int(period),
             "latest": latest_dt,
             "age_minutes": age_minutes,
+            "hard_minutes": hard_minutes if latest_dt else None,
             "status": status,
         })
     return report
@@ -476,6 +497,31 @@ def _get_virtual_order_columns(conn: sqlite3.Connection) -> set[str]:
     return {row[1] for row in conn.execute("PRAGMA table_info(virtual_orders)").fetchall()}
 
 
+def _failed_gap_expression(columns: set[str]) -> str:
+    if "stage1_rate_gap" in columns:
+        return (
+            "COALESCE(stage1_rate_gap, "
+            "CASE WHEN max_market_rate IS NOT NULL "
+            "THEN predicted_rate - max_market_rate END)"
+        )
+    if "max_market_rate" in columns:
+        return "predicted_rate - max_market_rate"
+    return "rate_gap"
+
+
+def _net_terminal_value_expression(columns: set[str], prefix: str = "") -> str:
+    col = lambda name: f"{prefix}{name}"
+    if "realized_terminal_value_net_wait" in columns:
+        return f"COALESCE({col('realized_terminal_value_net_wait')}, {col('realized_terminal_value')})"
+    if {"period", "realized_wait_hours"}.issubset(columns):
+        return (
+            f"CASE WHEN {col('realized_terminal_value')} IS NOT NULL THEN "
+            f"{col('realized_terminal_value')} * ({col('period')} * 24.0) / "
+            f"NULLIF({col('period')} * 24.0 + COALESCE({col('realized_wait_hours')}, 0.0), 0.0) END"
+        )
+    return col("realized_terminal_value")
+
+
 def fetch_path_metrics(conn: sqlite3.Connection, start: datetime, end: datetime) -> dict:
     columns = _get_virtual_order_columns(conn)
     path_value_expr = "AVG(path_value_score)" if "path_value_score" in columns else "NULL"
@@ -486,7 +532,11 @@ def fetch_path_metrics(conn: sqlite3.Connection, start: datetime, end: datetime)
         else ("terminal_mode" if "terminal_mode" in columns else None)
     )
     expected_mode_col = "expected_terminal_mode" if "expected_terminal_mode" in columns else None
-    realized_value_col = "realized_terminal_value" if "realized_terminal_value" in columns else None
+    realized_value_col = (
+        _net_terminal_value_expression(columns)
+        if "realized_terminal_value" in columns
+        else None
+    )
     params = (start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"))
 
     row = conn.execute(
@@ -731,7 +781,7 @@ def main():
         f"{format_pct(recent_path['path_label_coverage'])}"
     )
     print(
-        f"- avg_realized_terminal_value: {format_num(previous_path['avg_realized_terminal_value'], 3)} -> "
+        f"- avg_realized_terminal_value_net_wait: {format_num(previous_path['avg_realized_terminal_value'], 3)} -> "
         f"{format_num(recent_path['avg_realized_terminal_value'], 3)}"
     )
     print(
@@ -767,8 +817,8 @@ def main():
             f"({metric['executed']}/{metric['executed'] + metric['failed']})"
         )
         for label, key in [
-            ("混合原始", "raw_probability"),
-            ("校准", "calibrated_probability"),
+            ("生产主排序原始", "raw_probability"),
+            ("生产校准概率", "calibrated_probability"),
             ("候选Stage1", "stage1_probability"),
             ("传统模型", "traditional_probability"),
             ("v2模型", "v2_probability"),

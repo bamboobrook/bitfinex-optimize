@@ -112,3 +112,54 @@ def test_predict_with_ensemble_rejects_missing_positive_weight_component():
             "fUSD",
             "model_balanced",
         )
+
+
+def test_low_liquidity_floor_never_clips_candidate_upward():
+    guarded, suppressed = EnsemblePredictor._guard_low_liquidity_min_bound(
+        candidate_rate=6.63,
+        min_bound=8.23,
+        current_rate=4.38,
+        execution_rate=0.10,
+    )
+
+    assert guarded <= 6.63
+    assert suppressed is True
+
+
+def test_healthy_liquidity_keeps_existing_floor():
+    guarded, suppressed = EnsemblePredictor._guard_low_liquidity_min_bound(
+        candidate_rate=6.63,
+        min_bound=8.23,
+        current_rate=4.38,
+        execution_rate=0.50,
+    )
+
+    assert guarded == pytest.approx(8.23)
+    assert suppressed is False
+
+
+def test_funding_book_signal_filters_by_period_and_executable_rate():
+    predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+    predictor._funding_book_cache = {}
+    predictor._fetch_bitfinex_public_json = lambda *args, **kwargs: [
+        [0.00020, 90, 1, -50_000.0],   # 7.30%, executable
+        [0.00010, 90, 1, -100_000.0],  # 3.65%, below target
+        [0.00050, 120, 1, -500_000.0], # wrong period
+        [0.00030, 90, 1, 900_000.0],   # ask, not borrower bid
+    ]
+
+    signal = predictor._get_realtime_non2d_liquidity_signal(
+        "fUSD", period=90, target_rate=6.0
+    )
+
+    assert signal["available"] is True
+    assert signal["period_depth"] == pytest.approx(150_000.0)
+    assert signal["executable_depth"] == pytest.approx(50_000.0)
+    assert signal["best_bid_rate"] == pytest.approx(7.3)
+    assert signal["fillability_signal"] > 0.0
+
+    blocked = predictor._get_realtime_non2d_liquidity_signal(
+        "fUSD", period=90, target_rate=8.0
+    )
+    assert blocked["executable_depth"] == 0.0
+    assert blocked["fillability_signal"] == 0.0

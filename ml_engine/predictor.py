@@ -31,7 +31,12 @@ from ml_engine.c3_combo_optimizer import (
     generate_rate_candidates,
 )
 from ml_engine.execution_features import get_period_window_profile
-from ml_engine.system_policy import load_system_policy, get_step_cap_pct, get_policy_version
+from ml_engine.system_policy import (
+    get_freshness_thresholds_minutes,
+    get_policy_version,
+    get_step_cap_pct,
+    load_system_policy,
+)
 
 class EnsemblePredictor:
     """使用集成模型的增强预测器 - 支持GPU加速和并行化"""
@@ -70,6 +75,8 @@ class EnsemblePredictor:
         )
         self._stale_issues = []
         self._funding_book_cache = {}
+        self._v2_calibrator_lock = threading.Lock()
+        self._v2_calibrator_cache = None
         self.period_prediction_timeout = float(os.getenv("PREDICT_PERIOD_TIMEOUT", "120"))
         logger.info(
             f"Predictor parallel config: max_workers={self.max_workers}, "
@@ -626,45 +633,7 @@ class EnsemblePredictor:
         return self.policy.get(section, {}).get(key, default)
 
     def _freshness_thresholds_minutes(self, currency: str = "", period: int = 0) -> Tuple[float, float]:
-        warn_minutes = float(self._policy_value("automation", "stale_data_warn_minutes", 60))
-        hard_minutes = float(self._policy_value("automation", "stale_data_hard_minutes", 120))
-        # fUST has naturally sparse market data (often 4-24h gaps) - use per-currency overrides
-        is_fust = currency.upper() == "FUST"
-        if is_fust:
-            per_cur_warn = self._policy_value("automation", "stale_data_warn_minutes_fUST", None)
-            if per_cur_warn is not None:
-                warn_minutes = float(per_cur_warn)
-            per_cur_hard = self._policy_value("automation", "stale_data_hard_minutes_fUST", None)
-            if per_cur_hard is not None:
-                hard_minutes = float(per_cur_hard)
-        elif currency:
-            per_cur_key = f"stale_data_hard_minutes_{currency}"
-            per_cur_hard = self._policy_value("automation", per_cur_key, None)
-            if per_cur_hard is not None:
-                hard_minutes = float(per_cur_hard)
-        # Period-tier override: long periods have sparser data on Bitfinex
-        if period > 0:
-            if is_fust:
-                tier_key = "stale_data_hard_minutes_fUST_by_period_tier"
-                tier_config = self._policy_value("automation", tier_key, None)
-            else:
-                tier_config = self._policy_value("automation", "stale_data_hard_minutes_by_period_tier", None)
-            if tier_config:
-                if period >= 30:
-                    tier_hard = tier_config.get("long")
-                elif period >= 10:
-                    # fUST period 10-20: Bitfinex data is naturally sparse (1-2 day gaps)
-                    # Use sparse_medium tier if available, else medium
-                    tier_hard = tier_config.get("sparse_medium", tier_config.get("medium"))
-                elif period >= 6:
-                    tier_hard = tier_config.get("medium")
-                else:
-                    tier_hard = tier_config.get("short")
-                if tier_hard is not None:
-                    hard_minutes = max(hard_minutes, float(tier_hard))
-        if hard_minutes <= warn_minutes:
-            hard_minutes = warn_minutes + 30.0
-        return warn_minutes, hard_minutes
+        return get_freshness_thresholds_minutes(self.policy, currency, period)
 
     def _record_stale_issue(self, currency: str, period: int, age_minutes: float, source_ts: str):
         self._stale_issues.append({
@@ -925,6 +894,176 @@ class EnsemblePredictor:
             "days_no_exec": days_no_exec,
         }
 
+    @staticmethod
+    def _fit_platt_parameters(scores: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
+        """Fit sigmoid(a * logit(score) + b) with damped Newton updates."""
+        scores = np.clip(np.asarray(scores, dtype=float), 1e-5, 1.0 - 1e-5)
+        labels = np.asarray(labels, dtype=float)
+        logits = np.log(scores / (1.0 - scores))
+        design = np.column_stack([logits, np.ones(len(logits))])
+        prevalence = float(np.clip(labels.mean(), 1e-5, 1.0 - 1e-5))
+        params = np.array([1.0, np.log(prevalence / (1.0 - prevalence))], dtype=float)
+        regularization = np.diag([1e-3, 1e-6])
+
+        for _ in range(80):
+            linear = np.clip(design @ params, -35.0, 35.0)
+            probabilities = 1.0 / (1.0 + np.exp(-linear))
+            weights = np.clip(probabilities * (1.0 - probabilities), 1e-6, None)
+            gradient = design.T @ (probabilities - labels) + regularization @ params
+            hessian = design.T @ (design * weights[:, None]) + regularization
+            try:
+                step = np.linalg.solve(hessian, gradient)
+            except np.linalg.LinAlgError:
+                step = np.linalg.pinv(hessian) @ gradient
+            params -= step
+            if float(np.max(np.abs(step))) < 1e-7:
+                break
+
+        return float(params[0]), float(params[1])
+
+    @staticmethod
+    def _apply_platt(scores: np.ndarray, slope: float, intercept: float) -> np.ndarray:
+        clipped = np.clip(np.asarray(scores, dtype=float), 1e-5, 1.0 - 1e-5)
+        logits = np.log(clipped / (1.0 - clipped))
+        linear = np.clip(slope * logits + intercept, -35.0, 35.0)
+        return 1.0 / (1.0 + np.exp(-linear))
+
+    def _load_v2_calibration_samples(self, as_of: Optional[datetime] = None) -> tuple[np.ndarray, np.ndarray, dict]:
+        """Load labels that were observable by `as_of`, in prediction-time order."""
+        as_of = as_of or datetime.now()
+        as_of_text = as_of.strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            with self._connect_db(read_only=True) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        p.v2_execution_probability,
+                        CASE WHEN v.status = 'EXECUTED' THEN 1 ELSE 0 END AS label,
+                        COALESCE(p.prediction_timestamp, v.created_at) AS predicted_at,
+                        v.validated_at
+                    FROM virtual_orders AS v
+                    JOIN prediction_history AS p
+                      ON p.rowid = (
+                          SELECT p2.rowid
+                          FROM prediction_history AS p2
+                          WHERE p2.update_cycle_id = v.update_cycle_id
+                            AND p2.currency = v.currency
+                            AND p2.period = v.period
+                            AND (
+                                v.candidate_id IS NULL
+                                OR p2.candidate_id = v.candidate_id
+                            )
+                            AND p2.v2_execution_probability IS NOT NULL
+                          ORDER BY p2.rowid DESC
+                          LIMIT 1
+                      )
+                    WHERE v.status IN ('EXECUTED', 'FAILED')
+                      AND v.validated_at IS NOT NULL
+                      AND v.validated_at <= ?
+                      AND p.v2_execution_probability BETWEEN 0.0 AND 1.0
+                    ORDER BY predicted_at DESC, v.order_id DESC
+                    LIMIT 2500
+                    """,
+                    (as_of_text,),
+                ).fetchall()
+        except Exception as exc:
+            logger.warning(f"Unable to load v2 calibration labels: {exc}")
+            return np.array([]), np.array([]), {"error": str(exc)}
+
+        rows.reverse()
+        scores = np.asarray([float(row[0]) for row in rows], dtype=float)
+        labels = np.asarray([int(row[1]) for row in rows], dtype=int)
+        return scores, labels, {
+            "sample_count": int(len(rows)),
+            "positive_count": int(labels.sum()) if len(labels) else 0,
+            "negative_count": int((labels == 0).sum()) if len(labels) else 0,
+            "latest_validated_at": max((row[3] for row in rows), default=None),
+        }
+
+    def _build_v2_calibrator(self) -> dict:
+        scores, labels, sample_meta = self._load_v2_calibration_samples()
+        result = {
+            "active": False,
+            "method": "traditional_fallback",
+            **sample_meta,
+        }
+        min_samples = 300
+        min_class_samples = 40
+        if (
+            len(labels) < min_samples
+            or int(labels.sum()) < min_class_samples
+            or int((labels == 0).sum()) < min_class_samples
+        ):
+            result["reason"] = "insufficient_mature_labels"
+            return result
+
+        split = int(len(labels) * 0.75)
+        split = min(max(split, 200), len(labels) - 80)
+        train_scores, holdout_scores = scores[:split], scores[split:]
+        train_labels, holdout_labels = labels[:split], labels[split:]
+        if (
+            int(train_labels.sum()) < 30
+            or int((train_labels == 0).sum()) < 30
+            or int(holdout_labels.sum()) < 15
+            or int((holdout_labels == 0).sum()) < 15
+        ):
+            result["reason"] = "insufficient_time_split_classes"
+            return result
+
+        slope, intercept = self._fit_platt_parameters(train_scores, train_labels)
+        holdout_calibrated = self._apply_platt(holdout_scores, slope, intercept)
+        raw_brier = float(np.mean((holdout_scores - holdout_labels) ** 2))
+        calibrated_brier = float(np.mean((holdout_calibrated - holdout_labels) ** 2))
+        result.update({
+            "holdout_count": int(len(holdout_labels)),
+            "holdout_raw_brier": raw_brier,
+            "holdout_calibrated_brier": calibrated_brier,
+            "holdout_brier_delta": calibrated_brier - raw_brier,
+            "gate_slope": slope,
+            "gate_intercept": intercept,
+        })
+        if not (0.02 <= slope <= 12.0 and calibrated_brier <= raw_brier - 0.002):
+            result["reason"] = "time_split_gate_failed"
+            return result
+
+        slope, intercept = self._fit_platt_parameters(scores, labels)
+        if not (0.02 <= slope <= 12.0):
+            result["reason"] = "full_fit_unstable"
+            return result
+        result.update({
+            "active": True,
+            "method": "v2_global_platt",
+            "reason": "time_split_gate_passed",
+            "slope": slope,
+            "intercept": intercept,
+        })
+        return result
+
+    def _get_v2_calibrator(self) -> dict:
+        cached = getattr(self, "_v2_calibrator_cache", None)
+        if cached is not None:
+            return cached
+        lock = getattr(self, "_v2_calibrator_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._v2_calibrator_lock = lock
+        with lock:
+            if getattr(self, "_v2_calibrator_cache", None) is None:
+                self._v2_calibrator_cache = self._build_v2_calibrator()
+                logger.info(f"V2 calibration gate: {self._v2_calibrator_cache}")
+        return self._v2_calibrator_cache
+
+    def _calibrate_v2_probability(self, score: float) -> tuple[Optional[float], dict]:
+        calibrator = self._get_v2_calibrator()
+        if not calibrator.get("active"):
+            return None, calibrator
+        probability = float(self._apply_platt(
+            np.asarray([score]),
+            float(calibrator["slope"]),
+            float(calibrator["intercept"]),
+        )[0])
+        return probability, calibrator
+
     def _apply_probability_divergence_guard(
         self,
         calibrated_prob: float,
@@ -1097,12 +1236,14 @@ class EnsemblePredictor:
         p_aggr = float(pred_aggressive)
         p_bal = float(pred_balanced)
 
-        # S1: 融合 v2 执行概率 (如果可用)
-        # execution_prob 最终值 = 0.6 × 传统 + 0.4 × v2
+        # v2 is the primary ranking score. Its raw output is never exposed as
+        # a production probability; probability calibration is gated below.
         if v2_execution_prob is not None:
-            blended_prob = 0.6 * prob + 0.4 * v2_execution_prob
-            logger.info(f"v2 blend for {currency}-{period}: traditional={prob:.4f}, v2={v2_execution_prob:.4f}, blended={blended_prob:.4f}")
-            prob = blended_prob
+            logger.info(
+                f"v2 primary score for {currency}-{period}: "
+                f"traditional={prob:.4f}, v2={v2_execution_prob:.4f}"
+            )
+            prob = float(v2_execution_prob)
 
         # ========== 校准执行概率 (Bayesian-style Calibration) ==========
         # 根据周期分层窗口动态加权模型概率和历史执行率
@@ -1136,16 +1277,39 @@ class EnsemblePredictor:
         exec_rate_7d = exec_rate_fast
         exec_rate_30d = exec_rate_slow
 
-        calibrated_prob, calibration_meta = self._calibrate_execution_probability(
-            currency=currency,
-            period=period,
-            model_prob=prob,
-            exec_rate_fast=exec_rate_fast,
-            exec_rate_slow=exec_rate_slow,
-            avg_rate_gap=avg_rate_gap,
-            order_count=order_count,
-            current_rate=current_rate,
-        )
+        platt_probability = None
+        platt_meta = {"active": False, "method": "traditional_fallback"}
+        if v2_execution_prob is not None:
+            platt_probability, platt_meta = self._calibrate_v2_probability(
+                float(v2_execution_prob)
+            )
+
+        if platt_probability is not None:
+            calibrated_prob = platt_probability
+            calibration_meta = {
+                "tier": "global_platt",
+                "historical_signal": (
+                    float(platt_meta.get("positive_count", 0)) /
+                    max(float(platt_meta.get("sample_count", 0)), 1.0)
+                ),
+                "evidence_weight": 1.0,
+                "gap_ratio": (
+                    avg_rate_gap / (current_rate + 1e-8)
+                    if avg_rate_gap > 0 and current_rate > 0 else 0.0
+                ),
+                "days_no_exec": self._get_days_since_last_execution(currency, period),
+            }
+        else:
+            calibrated_prob, calibration_meta = self._calibrate_execution_probability(
+                currency=currency,
+                period=period,
+                model_prob=float(pred_execution_prob),
+                exec_rate_fast=exec_rate_fast,
+                exec_rate_slow=exec_rate_slow,
+                avg_rate_gap=avg_rate_gap,
+                order_count=order_count,
+                current_rate=current_rate,
+            )
 
         # 诊断日志: 记录关键决策变量
         logger.debug(
@@ -1329,12 +1493,18 @@ class EnsemblePredictor:
         else:
             bound_base = 0.55 * ma_720 + 0.45 * current_rate
 
-        # 市场崩塌修复: exec_rate 极低时将 current_rate 混入 bound_base，
-        # 防止历史高位 MA 把 floor 拉得远高于市场
-        if exec_rate_fast < 0.20 and current_rate > 0:
-            alpha = 1.0 - (exec_rate_fast / 0.20)        # exec_rate=0 → alpha=1.0
-            blend_weight = alpha * 0.35                   # 最大混入 35% current_rate
-            bound_base = (1.0 - blend_weight) * bound_base + blend_weight * (current_rate * 1.2)
+        # Continuously anchor the safety band to the live market as fill rate
+        # falls. This starts before a full liquidity collapse, at 35%.
+        low_liquidity_severity = 0.0
+        if exec_rate_fast < 0.35 and current_rate > 0:
+            low_liquidity_severity = float(np.clip(
+                (0.35 - exec_rate_fast) / 0.35, 0.0, 1.0
+            ))
+            blend_weight = low_liquidity_severity * 0.75
+            bound_base = (
+                (1.0 - blend_weight) * bound_base
+                + blend_weight * (current_rate * 1.05)
+            )
 
         if calibrated_prob > 0.8:
             floor_base = 0.50
@@ -1362,8 +1532,24 @@ class EnsemblePredictor:
 
         min_bound = max(bound_base * floor_factor, 0.01)
 
+        min_bound, low_liquidity_floor_suppressed = (
+            self._guard_low_liquidity_min_bound(
+                final_rate,
+                min_bound,
+                current_rate,
+                exec_rate_fast,
+            )
+        )
+
+        pre_clipping_rate = float(final_rate)
         clipped_rate = np.clip(final_rate, min_bound, max_bound)
-        was_clipped = (clipped_rate != final_rate)
+        was_clipped = not bool(np.isclose(clipped_rate, final_rate, rtol=0.0, atol=1e-12))
+        if not was_clipped:
+            clipping_direction = "none"
+        elif clipped_rate > final_rate:
+            clipping_direction = "up"
+        else:
+            clipping_direction = "down"
 
         if was_clipped:
             reduction_pct = abs((final_rate - clipped_rate) / final_rate * 100) if final_rate != 0 else 0
@@ -1374,6 +1560,7 @@ class EnsemblePredictor:
                 f"strategy={strategy_label}, reduction={reduction_pct:.1f}%)"
             )
         final_rate = clipped_rate
+        post_clipping_rate = float(clipped_rate)
 
         # Enforce policy step cap for selected periods (120d by default).
         final_rate, previous_rate, step_change_pct, step_capped, step_cap_pct = self._apply_period_step_cap(
@@ -1385,6 +1572,12 @@ class EnsemblePredictor:
                 f"{clipped_rate:.4f} -> {final_rate:.4f} "
                 f"(prev={previous_rate:.4f}, cap={step_cap_pct:.2%})"
             )
+        if not step_capped:
+            step_cap_direction = "none"
+        elif final_rate > post_clipping_rate:
+            step_cap_direction = "up"
+        else:
+            step_cap_direction = "down"
 
         # Closed-loop diagnostics: market following error and direction alignment.
         market_follow_error = float(final_rate - current_rate)
@@ -1424,7 +1617,8 @@ class EnsemblePredictor:
             calibrated_prob=calibrated_prob,
             volume_ratio=volume_ratio,
             data_age_minutes=data_age_minutes,
-            currency=currency
+            currency=currency,
+            period=period,
         )
 
         return {
@@ -1439,6 +1633,16 @@ class EnsemblePredictor:
                 float(v2_execution_prob) if v2_execution_prob is not None else None
             ),
             "calibrated_execution_prob": float(calibrated_prob),  # exec_rate校准后的成交概率（反映真实流动性）
+            "execution_ranking_score": float(prob),
+            "probability_calibration_method": str(platt_meta.get("method", "traditional_fallback")),
+            "probability_calibration_reason": str(platt_meta.get("reason", "v2_unavailable")),
+            "probability_calibration_samples": int(platt_meta.get("sample_count", 0) or 0),
+            "probability_calibration_slope": (
+                float(platt_meta["slope"]) if platt_meta.get("slope") is not None else None
+            ),
+            "probability_calibration_intercept": (
+                float(platt_meta["intercept"]) if platt_meta.get("intercept") is not None else None
+            ),
             "exec_rate_raw": float(exec_rate_fast),  # 原始历史成交率（用于流动性评分，不受模型滞后影响）
             "liquidity_score": liq_score,
             "liquidity_level": liq_level,
@@ -1476,6 +1680,12 @@ class EnsemblePredictor:
             "v2_revenue_rate": v2_revenue_rate,
             # Rate clipping 元数据
             "was_clipped": was_clipped,
+            "clipping_direction": clipping_direction,
+            "pre_clipping_rate": pre_clipping_rate,
+            "post_clipping_rate": post_clipping_rate,
+            "step_cap_direction": step_cap_direction,
+            "low_liquidity_floor_suppressed": low_liquidity_floor_suppressed,
+            "low_liquidity_severity": low_liquidity_severity,
             "clipping_strategy": strategy_label,
             "clipping_bounds": {"min": float(min_bound), "max": float(max_bound)}
         }
@@ -1521,10 +1731,11 @@ class EnsemblePredictor:
         calibrated_prob: float,
         volume_ratio: float,
         data_age_minutes: float,
-        currency: str
+        currency: str,
+        period: int = 0,
     ) -> tuple:
         """计算 (liquidity_score: float 0-100, liquidity_level: str)"""
-        warn_min, hard_min = self._freshness_thresholds_minutes(currency)
+        warn_min, hard_min = self._freshness_thresholds_minutes(currency, period)
         if data_age_minutes <= warn_min:
             freshness_signal = 1.0
         else:
@@ -1576,6 +1787,7 @@ class EnsemblePredictor:
             return data
         except (urllib_error.URLError, TimeoutError, ValueError) as e:
             logger.warning(f"Bitfinex public API fetch failed for {url}: {e}")
+            self._funding_book_cache[cache_key] = {"ts": now_ts, "data": None}
             return None
 
     @staticmethod
@@ -1599,6 +1811,24 @@ class EnsemblePredictor:
             if np.isfinite(rate):
                 return rate
         return 0.0
+
+    @staticmethod
+    def _guard_low_liquidity_min_bound(
+        candidate_rate: float,
+        min_bound: float,
+        current_rate: float,
+        execution_rate: float,
+    ) -> tuple[float, bool]:
+        if execution_rate >= 0.35 or current_rate <= 0:
+            return float(min_bound), False
+        market_relative_cap = current_rate * (
+            1.05 + 0.45 * (max(execution_rate, 0.0) / 0.35)
+        )
+        would_raise_candidate = candidate_rate > 0 and min_bound > candidate_rate
+        guarded_bound = min(float(min_bound), float(market_relative_cap))
+        if candidate_rate > 0 and guarded_bound > candidate_rate:
+            guarded_bound = float(candidate_rate)
+        return guarded_bound, bool(would_raise_candidate)
 
     def _calc_fillability_signal(self, bid_levels: list) -> float:
         """
@@ -1662,7 +1892,12 @@ class EnsemblePredictor:
             1.0
         ))
 
-    def _get_realtime_non2d_liquidity_signal(self, currency: str) -> dict:
+    def _get_realtime_non2d_liquidity_signal(
+        self,
+        currency: str,
+        period: int = 0,
+        target_rate: float = 0.0,
+    ) -> dict:
         """
         Use realtime Bitfinex funding book to judge whether non-2d orders can be
         executed now. Internal-only helper; no extra output fields are exposed.
@@ -1699,26 +1934,53 @@ class EnsemblePredictor:
                 "amount": abs(amount),
             })
 
-        if not bid_levels:
+        if period > 2:
+            bid_levels = [
+                level for level in bid_levels
+                if int(level["period"]) == int(period)
+            ]
+
+        period_depth = sum(level["amount"] for level in bid_levels)
+        executable_levels = [
+            level for level in bid_levels
+            if target_rate <= 0.0 or level["rate"] >= target_rate * 0.995
+        ]
+
+        if not executable_levels:
             return {
                 "available": True,
                 "fillability_signal": 0.0,
                 "depth_signal": 0.0,
+                "period_depth": float(period_depth),
+                "executable_depth": 0.0,
+                "best_bid_rate": max(
+                    (float(level["rate"]) for level in bid_levels),
+                    default=0.0,
+                ),
             }
 
-        total_depth = sum(level["amount"] for level in bid_levels)
-        fillability_signal = self._calc_fillability_signal(bid_levels)
+        total_depth = sum(level["amount"] for level in executable_levels)
+        fillability_signal = self._calc_fillability_signal(executable_levels)
         # Use a tighter scaling so sub-million depth no longer looks close to max.
         depth_signal = self._clip_unit(
             np.log1p(total_depth / 100_000.0) / np.log1p(50.0)
         )
-        structure_factor = self._calc_book_structure_factor(bid_levels)
+        structure_factor = (
+            1.0 if period > 2
+            else self._calc_book_structure_factor(executable_levels)
+        )
 
         return {
             "available": True,
             "fillability_signal": fillability_signal,
             "depth_signal": float(depth_signal),
             "structure_factor": structure_factor,
+            "period_depth": float(period_depth),
+            "executable_depth": float(total_depth),
+            "best_bid_rate": max(
+                (float(level["rate"]) for level in bid_levels),
+                default=0.0,
+            ),
         }
 
     def _get_unified_adjustment(self, exec_rate_7d: float, exec_rate_30d: float,
@@ -1781,14 +2043,19 @@ class EnsemblePredictor:
             non2d_items = [x for x in items if int(x.get('period', 0)) != 2]
             ref_items = non2d_items or items
             avg_exec = sum(x.get('exec_rate_raw', x.get('calibrated_execution_prob', 0.5)) for x in ref_items) / len(ref_items)
-            avg_age = sum(float(x.get('data_age_minutes', 0.0) or 0.0) for x in ref_items) / len(ref_items)
-            warn_min, hard_min = self._freshness_thresholds_minutes(currency)
-            if avg_age <= warn_min:
-                freshness_signal = 1.0
-            else:
-                freshness_signal = max(0.2, 1.0 - 0.8 * min(
-                    (avg_age - warn_min) / max(hard_min - warn_min, 1.0), 1.0
-                ))
+            freshness_signals = []
+            for item in ref_items:
+                age = float(item.get('data_age_minutes', 0.0) or 0.0)
+                warn_min, hard_min = self._freshness_thresholds_minutes(
+                    currency, int(item.get('period', 0) or 0)
+                )
+                if age <= warn_min:
+                    freshness_signals.append(1.0)
+                else:
+                    freshness_signals.append(max(0.2, 1.0 - 0.8 * min(
+                        (age - warn_min) / max(hard_min - warn_min, 1.0), 1.0
+                    )))
+            freshness_signal = sum(freshness_signals) / len(freshness_signals)
 
             # 查 funding_rates 24h vs 30d 平均成交量（用 period=30 作代表性基准）
             try:
@@ -1817,22 +2084,56 @@ class EnsemblePredictor:
             except Exception:
                 volume_ratio_24h = None
 
-            book_signal = self._get_realtime_non2d_liquidity_signal(currency)
-            if book_signal["available"]:
-                fillability_signal = float(book_signal.get("fillability_signal", 0.0) or 0.0)
+            period_book_signals = []
+            for item in ref_items:
+                book_signal = self._get_realtime_non2d_liquidity_signal(
+                    currency,
+                    int(item.get("period", 0) or 0),
+                    float(item.get("predicted_rate", 0.0) or 0.0),
+                )
+                item["book_fillability_signal"] = float(
+                    book_signal.get("fillability_signal", 0.0) or 0.0
+                )
+                item["book_depth_signal"] = float(
+                    book_signal.get("depth_signal", 0.0) or 0.0
+                )
+                item["book_executable_depth"] = float(
+                    book_signal.get("executable_depth", 0.0) or 0.0
+                )
+                item["book_best_bid_rate"] = float(
+                    book_signal.get("best_bid_rate", 0.0) or 0.0
+                )
+                period_book_signals.append(book_signal)
+
+            available_book_signals = [
+                signal for signal in period_book_signals if signal.get("available")
+            ]
+            if available_book_signals:
+                fillability_signal = float(np.mean([
+                    signal.get("fillability_signal", 0.0) or 0.0
+                    for signal in available_book_signals
+                ]))
+                depth_signal = float(np.mean([
+                    signal.get("depth_signal", 0.0) or 0.0
+                    for signal in available_book_signals
+                ]))
+                structure_factor = float(np.mean([
+                    signal.get("structure_factor", 1.0) or 1.0
+                    for signal in available_book_signals
+                ]))
                 fast_score = self._clip_unit(
                     avg_exec * 0.45 +
                     fillability_signal * 0.30 +
-                    book_signal.get("depth_signal", 0.0) * 0.15 +
+                    depth_signal * 0.15 +
                     freshness_signal * 0.10
-                ) * book_signal.get("structure_factor", 1.0)
+                ) * structure_factor
                 base_score = (
                     avg_exec * 0.40 +
                     freshness_signal * 0.20 +
                     fillability_signal * 0.20 +
-                    book_signal["depth_signal"] * 0.20
+                    depth_signal * 0.20
                 )
-                score = base_score * book_signal.get("structure_factor", 1.0) * 100.0
+                score = base_score * structure_factor * 100.0
             else:
                 fillability_signal = self._clip_unit(avg_exec * 0.75 + freshness_signal * 0.25)
                 fast_score = self._clip_unit(avg_exec * 0.70 + freshness_signal * 0.30)
@@ -1901,7 +2202,8 @@ class EnsemblePredictor:
     def _estimate_frr_proxy_rate(self, currency: str, current_rate: float) -> float:
         """
         First-pass FRR proxy:
-        use the latest same-currency 120d market rate; if unavailable or stale (>7d), fall back to current_rate.
+        use the latest same-currency 120d market rate; if unavailable or stale
+        under the shared period policy, fall back to current_rate.
         """
         try:
             proxy_rate, proxy_ts = self.get_latest_rate_from_db(currency, 120)
@@ -1909,7 +2211,7 @@ class EnsemblePredictor:
             proxy_rate, proxy_ts = None, None
         if proxy_rate is None or float(proxy_rate or 0.0) <= 0.0:
             return float(current_rate or 0.0)
-        # 新鲜度检查：120d 利率 >7 天则降级为 current_rate
+        # Apply the same period-aware freshness gate used by prediction.
         if proxy_ts:
             try:
                 from datetime import datetime as _dt
@@ -1920,10 +2222,12 @@ class EnsemblePredictor:
                     ts_dt = _dt.fromtimestamp(ts_val)
                 else:
                     ts_dt = proxy_ts
-                age_days = (_dt.now() - ts_dt).total_seconds() / 86400.0
-                if age_days > 7:
+                age_minutes = (_dt.now() - ts_dt).total_seconds() / 60.0
+                _, hard_minutes = self._freshness_thresholds_minutes(currency, 120)
+                if age_minutes > hard_minutes:
                     logger.debug(
-                        f"FRR proxy {currency}-120d 已 {age_days:.1f} 天未更新(>7d)，降级为 current_rate={current_rate}"
+                        f"FRR proxy {currency}-120d age={age_minutes:.0f}m "
+                        f"> hard={hard_minutes:.0f}m, fallback current_rate={current_rate}"
                     )
                     return float(current_rate or 0.0)
             except Exception:
@@ -2073,7 +2377,13 @@ class EnsemblePredictor:
             market_meta.get("fast_score", market_score_signal)
         )
         fillability_signal = self._clip_unit(
-            market_meta.get("fillability_signal", market_fast_score)
+            pred.get(
+                "book_fillability_signal",
+                market_meta.get("fillability_signal", market_fast_score),
+            )
+        )
+        book_depth_signal = self._clip_unit(
+            pred.get("book_depth_signal", market_fast_score)
         )
         volume_ratio = market_meta.get("volume_ratio_24h")
         if volume_ratio is None:
@@ -2092,8 +2402,9 @@ class EnsemblePredictor:
         fast_score = (
             exec_prob * 0.34 +
             exec_rate_fast * 0.22 +
-            market_fast_score * 0.20 +
-            fillability_signal * 0.14 +
+            market_fast_score * 0.12 +
+            fillability_signal * 0.16 +
+            book_depth_signal * 0.06 +
             market_score_signal * 0.10
         ) * (0.88 + 0.12 * volume_signal) * (1.0 - 0.20 * pending_pressure) * volume_penalty
 
@@ -2103,6 +2414,7 @@ class EnsemblePredictor:
             "market_score_signal": float(market_score_signal),
             "market_fast_score": float(market_fast_score),
             "fillability_signal": float(fillability_signal),
+            "book_depth_signal": float(book_depth_signal),
             "volume_ratio_24h": None if volume_ratio is None else float(volume_ratio),
             "volume_signal": float(volume_signal),
             "volume_penalty": float(volume_penalty),
@@ -2375,6 +2687,12 @@ class EnsemblePredictor:
                 "model_version": "TEXT",
                 "traditional_execution_probability": "REAL",
                 "v2_execution_probability": "REAL",
+                "execution_ranking_score": "REAL",
+                "probability_calibration_method": "TEXT",
+                "probability_calibration_reason": "TEXT",
+                "probability_calibration_samples": "INTEGER",
+                "probability_calibration_slope": "REAL",
+                "probability_calibration_intercept": "REAL",
             }
             for column, col_type in required_columns.items():
                 if column not in existing:
@@ -2750,6 +3068,12 @@ class EnsemblePredictor:
                     if pred.get("v2_execution_probability") is not None
                     else None
                 ),
+                float(pred.get("execution_ranking_score", 0.0) or 0.0),
+                pred.get("probability_calibration_method"),
+                pred.get("probability_calibration_reason"),
+                int(pred.get("probability_calibration_samples", 0) or 0),
+                pred.get("probability_calibration_slope"),
+                pred.get("probability_calibration_intercept"),
             ))
 
         with self._connect_db(read_only=False) as conn:
@@ -2768,8 +3092,11 @@ class EnsemblePredictor:
                     rank6_fallback_penalty, fast_liquidity_score,
                     currency_regime_state, final_rank_score, expected_terminal_mode,
                     model_version, traditional_execution_probability,
-                    v2_execution_probability
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    v2_execution_probability, execution_ranking_score,
+                    probability_calibration_method, probability_calibration_reason,
+                    probability_calibration_samples, probability_calibration_slope,
+                    probability_calibration_intercept
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows
             )
@@ -3130,6 +3457,12 @@ class EnsemblePredictor:
                     "execution_probability": round(calibrated_execution_probability, 4),
                     "calibrated_execution_probability": round(calibrated_execution_probability, 4),
                     "raw_execution_probability": round(raw_execution_probability, 4),
+                    "probability_calibration_method": pred.get(
+                        "probability_calibration_method", "traditional_fallback"
+                    ),
+                    "probability_calibration_samples": int(
+                        pred.get("probability_calibration_samples", 0) or 0
+                    ),
                     "conservative_floor": round(pred['conservative_rate'], 4),
                     "aggressive_target": round(pred['aggressive_rate'], 4),
                     "balanced_target": round(pred['balanced_rate'], 4),
@@ -3441,7 +3774,10 @@ class EnsemblePredictor:
             metrics_collector.print_metrics_summary(predictions=preds)
 
             # 保存到文件
-            metrics_output = os.path.join(base_dir, 'data', 'system_metrics.json')
+            metrics_output = os.path.join(
+                os.path.dirname(os.path.abspath(output_path)),
+                'system_metrics.json',
+            )
             save_metrics_to_file(all_metrics, metrics_output)
 
         except Exception as e:

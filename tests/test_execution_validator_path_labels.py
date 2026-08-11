@@ -61,7 +61,10 @@ def _fetch_order_fields(db_path, order_id):
     try:
         row = conn.execute(
             """
-            SELECT path_stage_outcome, terminal_mode, execution_confidence, market_median, executed_at
+            SELECT path_stage_outcome, terminal_mode, execution_confidence,
+                   market_median, executed_at, rate_gap,
+                   stage1_max_market_rate, stage1_rate_gap,
+                   realized_terminal_value_net_wait
             FROM virtual_orders
             WHERE order_id = ?
             """,
@@ -104,12 +107,16 @@ def test_validate_single_order_marks_frr_proxy_when_fixed_stage_misses(tmp_path)
     assert result["stage2_frr_proxy_rate"] > 0.0
     assert result["execution_confidence"] is not None
     assert result["market_median"] > 0.0
+    assert result["stage1_max_market_rate"] == 13.5
+    assert result["stage1_rate_gap"] == 0.5
+    assert result["rate_gap"] == result["stage1_rate_gap"]
 
     persisted = _fetch_order_fields(db_path, "o-1")
     assert persisted["path_stage_outcome"] == "FIXED_MISS"
     assert persisted["terminal_mode"] == "FRR_PROXY"
     assert persisted["execution_confidence"] is not None
     assert persisted["market_median"] > 0.0
+    assert persisted["stage1_rate_gap"] == 0.5
 
 
 def test_validate_single_order_marks_fixed_fill_with_real_tick_timestamp(tmp_path):
@@ -142,11 +149,16 @@ def test_validate_single_order_marks_fixed_fill_with_real_tick_timestamp(tmp_pat
     assert result["terminal_mode"] == "FIXED"
     assert result["executed_at"] == "2026-03-01 00:30:00"
     assert result["execution_delay_minutes"] == 30
+    assert result["stage1_max_market_rate"] == 13.5
+    assert result["stage1_rate_gap"] == -0.5
+    assert result["realized_terminal_value_net_wait"] < 13.0
 
     persisted = _fetch_order_fields(db_path, "o-2")
     assert persisted["path_stage_outcome"] == "FIXED_FILLED"
     assert persisted["terminal_mode"] == "FIXED"
     assert persisted["executed_at"] == "2026-03-01 00:30:00"
+    assert persisted["stage1_rate_gap"] == -0.5
+    assert persisted["realized_terminal_value_net_wait"] < 13.0
 
 
 def test_validate_single_order_marks_rank6_proxy_when_frr_proxy_missing(tmp_path):

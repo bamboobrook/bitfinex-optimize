@@ -75,7 +75,13 @@ def get_current_status():
 def load_retraining_state():
     """Load retraining cooldown state from disk."""
     if not os.path.exists(RETRAIN_STATE_FILE):
-        return {"last_forced_retrain_time": None, "last_reason": ""}
+        return {
+            "last_forced_retrain_time": None,
+            "last_reason": "",
+            "last_outcome": None,
+            "rejection_streak": 0,
+            "backoff_until": None,
+        }
     try:
         with open(RETRAIN_STATE_FILE, 'r') as f:
             state = json.load(f)
@@ -87,16 +93,40 @@ def load_retraining_state():
         return {"last_forced_retrain_time": None, "last_reason": ""}
 
 
-def save_retraining_state(last_forced_retrain_time: datetime = None, reason: str = ""):
+def save_retraining_state(
+    last_forced_retrain_time: datetime = None,
+    reason: str = "",
+    outcome: str = None,
+    training_data: dict = None,
+):
     """Persist retraining cooldown state to disk."""
-    state = {
-        "last_forced_retrain_time": (
+    state = load_retraining_state()
+    state["last_forced_retrain_time"] = (
             last_forced_retrain_time.strftime('%Y-%m-%d %H:%M:%S')
             if last_forced_retrain_time else None
-        ),
-        "last_reason": reason or "",
-        "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-    }
+        )
+    state["last_reason"] = reason or state.get("last_reason", "")
+    state["updated_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    if outcome:
+        state["last_outcome"] = outcome
+        if outcome in {"trained_not_better", "trained_not_deployed"}:
+            streak = int(state.get("rejection_streak", 0) or 0) + 1
+            backoff_hours = 12 if streak == 1 else 24
+            state["rejection_streak"] = streak
+            state["backoff_until"] = (
+                datetime.now() + timedelta(hours=backoff_hours)
+            ).strftime('%Y-%m-%d %H:%M:%S')
+        elif outcome == "deployed":
+            state["rejection_streak"] = 0
+            state["backoff_until"] = None
+
+    if isinstance(training_data, dict):
+        state["training_data_fingerprint"] = training_data.get("fingerprint")
+        state["training_label_count"] = int(training_data.get("label_count", 0) or 0)
+        state["training_positive_count"] = int(training_data.get("positive_count", 0) or 0)
+        state["training_negative_count"] = int(training_data.get("negative_count", 0) or 0)
+        state["training_window_end"] = training_data.get("training_end")
     try:
         _atomic_write_json(RETRAIN_STATE_FILE, state, indent=2)
     except Exception as e:
@@ -110,6 +140,29 @@ def parse_datetime_safe(dt_str: str):
         return datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
     except Exception:
         return None
+
+
+def _parse_retraining_outcome(stdout: str) -> str:
+    import re
+
+    match = re.search(
+        r"重训练结果:\s*(deployed|trained_not_deployed|trained_not_better|not_needed|train_failed)",
+        stdout or "",
+    )
+    return match.group(1) if match else "unknown"
+
+
+def _parse_training_data_snapshot(stdout: str):
+    marker = "TRAINING_DATA_SNAPSHOT="
+    for line in (stdout or "").splitlines():
+        if marker not in line:
+            continue
+        try:
+            payload = json.loads(line.split(marker, 1)[1])
+        except (json.JSONDecodeError, IndexError):
+            return None
+        return payload if isinstance(payload, dict) else None
+    return None
 
 
 def _load_prediction_result():
@@ -168,10 +221,9 @@ def get_db_statistics():
                 ROUND(100.0 * SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) / COUNT(*), 1) as exec_rate
             FROM virtual_orders
             WHERE order_timestamp >= datetime('now', '-7 days')
-              AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
+              AND status IN ('EXECUTED', 'FAILED')
             GROUP BY currency, period
             ORDER BY total DESC
-            LIMIT 10
         """)
         exec_rate_7d = [
             {
@@ -183,6 +235,8 @@ def get_db_statistics():
             }
             for row in cursor.fetchall()
         ]
+        total_7d = sum(item["total"] for item in exec_rate_7d)
+        executed_7d = sum(item["executed"] for item in exec_rate_7d)
 
         # 最新订单
         cursor.execute("""
@@ -213,6 +267,11 @@ def get_db_statistics():
         return {
             "status_summary": status_stats,
             "execution_rate_7d": exec_rate_7d,
+            "execution_rate_7d_overall": {
+                "total": total_7d,
+                "executed": executed_7d,
+                "exec_rate": round(executed_7d / total_7d * 100.0, 1) if total_7d else None,
+            },
             "latest_orders": latest_orders
         }
     except Exception as e:
@@ -1019,7 +1078,33 @@ async def run_full_pipeline():
                     # Fix6: 每次从磁盘重新读取，而非依赖内存变量（重启后状态也能正确加载）
                     _disk_state = load_retraining_state()
                     _disk_last_retrain = parse_datetime_safe(_disk_state.get("last_forced_retrain_time"))
-                    if _disk_last_retrain and (datetime.now() - _disk_last_retrain) < cooldown:
+                    _backoff_until = parse_datetime_safe(_disk_state.get("backoff_until"))
+                    _dry_run_snapshot = _parse_training_data_snapshot(stdout or "")
+                    _same_rejected_training_data = (
+                        _disk_state.get("last_outcome") in {
+                            "trained_not_better", "trained_not_deployed"
+                        }
+                        and isinstance(_dry_run_snapshot, dict)
+                        and bool(_disk_state.get("training_data_fingerprint"))
+                        and _dry_run_snapshot.get("fingerprint")
+                        == _disk_state.get("training_data_fingerprint")
+                    )
+                    if _same_rejected_training_data:
+                        logger.info(
+                            "ℹ️  Retraining trigger suppressed: mature training labels "
+                            f"unchanged since rejected challenger "
+                            f"(fingerprint={_dry_run_snapshot.get('fingerprint')}, "
+                            f"labels={_dry_run_snapshot.get('label_count')})"
+                        )
+                        should_retrain = False
+                    elif _backoff_until and datetime.now() < _backoff_until:
+                        logger.info(
+                            "ℹ️  Retraining trigger suppressed after rejected challenger: "
+                            f"backoff until {_backoff_until.strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"(streak={int(_disk_state.get('rejection_streak', 0) or 0)})"
+                        )
+                        should_retrain = False
+                    elif _disk_last_retrain and (datetime.now() - _disk_last_retrain) < cooldown:
                         logger.info(f"ℹ️  Retraining triggered but skipped: last retrained {datetime.now() - _disk_last_retrain} ago (< {cooldown_label})")
                         should_retrain = False
                     else:
@@ -1050,13 +1135,23 @@ async def run_full_pipeline():
 
                 # exit code: 0=部署成功或训练成功但未部署, 1=训练失败, 2=无需重训练, -1=超时
                 if rc == 0:
-                    deployed = '新模型已部署' in (stdout or '')
+                    retrain_outcome = _parse_retraining_outcome(stdout or "")
+                    training_snapshot = _parse_training_data_snapshot(stdout or "")
+                    deployed = retrain_outcome == 'deployed'
                     _last_forced_retrain_time = datetime.now()
-                    save_retraining_state(_last_forced_retrain_time, reason="forced_by_pipeline")
+                    save_retraining_state(
+                        _last_forced_retrain_time,
+                        reason="forced_by_pipeline",
+                        outcome=retrain_outcome,
+                        training_data=training_snapshot,
+                    )
                     if deployed:
                         logger.info(f"✅ Retraining completed and new models deployed")
                     else:
-                        logger.info(f"✅ Retraining completed but models not deployed (keeping current)")
+                        logger.info(
+                            "✅ Retraining completed but models not deployed "
+                            f"(outcome={retrain_outcome}, keeping current)"
+                        )
                 elif rc == 2:
                     logger.info(f"ℹ️ Retraining check: not needed")
                 elif rc == -1:

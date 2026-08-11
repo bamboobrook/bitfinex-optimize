@@ -65,6 +65,8 @@ class OrderManager:
                     execution_delay_minutes INTEGER,
                     max_market_rate REAL,
                     rate_gap REAL,
+                    stage1_max_market_rate REAL,
+                    stage1_rate_gap REAL,
                     model_version TEXT,
                     prediction_confidence TEXT,
                     prediction_strategy TEXT,
@@ -104,7 +106,10 @@ class OrderManager:
                 "validation_label": "TEXT",
                 "realized_terminal_mode": "TEXT",
                 "realized_terminal_value": "REAL",
+                "realized_terminal_value_net_wait": "REAL",
                 "realized_wait_hours": "REAL",
+                "stage1_max_market_rate": "REAL",
+                "stage1_rate_gap": "REAL",
                 "path_stage_outcome": "TEXT",
                 "stage1_fill_hours": "INTEGER",
                 "stage2_frr_proxy_rate": "REAL",
@@ -295,6 +300,8 @@ class OrderManager:
                     execution_delay_minutes = ?,
                     max_market_rate = ?,
                     rate_gap = ?,
+                    stage1_max_market_rate = ?,
+                    stage1_rate_gap = ?,
                     path_stage_outcome = ?,
                     stage1_fill_hours = ?,
                     stage2_frr_proxy_rate = ?,
@@ -303,6 +310,7 @@ class OrderManager:
                     validation_label = ?,
                     realized_terminal_mode = ?,
                     realized_terminal_value = ?,
+                    realized_terminal_value_net_wait = ?,
                     realized_wait_hours = ?,
                     validated_at = ?
                 WHERE order_id = ?
@@ -313,6 +321,8 @@ class OrderManager:
                 execution_details.get('execution_delay_minutes'),
                 execution_details.get('max_market_rate'),
                 execution_details.get('rate_gap'),
+                execution_details.get('stage1_max_market_rate'),
+                execution_details.get('stage1_rate_gap'),
                 execution_details.get('path_stage_outcome'),
                 execution_details.get('stage1_fill_hours'),
                 execution_details.get('stage2_frr_proxy_rate'),
@@ -321,6 +331,7 @@ class OrderManager:
                 execution_details.get('validation_label'),
                 execution_details.get('realized_terminal_mode'),
                 execution_details.get('realized_terminal_value'),
+                execution_details.get('realized_terminal_value_net_wait'),
                 execution_details.get('realized_wait_hours'),
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 order_id
@@ -365,7 +376,13 @@ class OrderManager:
                 SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END) as executed,
                 AVG(CASE WHEN status = 'EXECUTED' THEN execution_delay_minutes END) as avg_delay,
                 AVG(CASE WHEN status = 'EXECUTED' THEN (execution_rate - predicted_rate) END) as avg_spread,
-                AVG(CASE WHEN status = 'FAILED' THEN rate_gap END) as avg_gap
+                AVG(CASE WHEN status = 'FAILED' THEN
+                    COALESCE(
+                        stage1_rate_gap,
+                        CASE WHEN max_market_rate IS NOT NULL
+                             THEN predicted_rate - max_market_rate END
+                    )
+                END) as avg_gap
             FROM virtual_orders
             WHERE currency = ?
               AND period = ?
@@ -534,7 +551,13 @@ class OrderManager:
                     SUM(CASE WHEN status = 'EXPIRED' THEN 1 ELSE 0 END) as expired,
                     AVG(predicted_rate) as avg_predicted,
                     AVG(CASE WHEN status = 'EXECUTED' THEN execution_rate END) as avg_exec_rate,
-                    AVG(CASE WHEN status = 'FAILED' THEN rate_gap END) as avg_gap,
+                    AVG(CASE WHEN status = 'FAILED' THEN
+                        COALESCE(
+                            stage1_rate_gap,
+                            CASE WHEN max_market_rate IS NOT NULL
+                                 THEN predicted_rate - max_market_rate END
+                        )
+                    END) as avg_gap,
                     AVG(CASE WHEN status = 'EXECUTED' THEN execution_delay_minutes END) as avg_delay
                 FROM virtual_orders
                 WHERE validated_at IS NOT NULL

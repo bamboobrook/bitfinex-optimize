@@ -471,6 +471,7 @@ class EnhancedModelTrainer:
             'validation_window_hours',
             'realized_terminal_mode',
             'realized_terminal_value',
+            'realized_terminal_value_net_wait',
             'realized_wait_hours',
             'candidate_id',
             'update_cycle_id',

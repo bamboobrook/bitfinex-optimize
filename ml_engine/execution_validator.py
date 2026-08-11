@@ -39,6 +39,8 @@ class ExecutionValidator:
                 "execution_delay_minutes": "INTEGER",
                 "max_market_rate": "REAL",
                 "rate_gap": "REAL",
+                "stage1_max_market_rate": "REAL",
+                "stage1_rate_gap": "REAL",
                 "validated_at": "TEXT",
                 "execution_confidence": "REAL",
                 "percentile_score": "REAL",
@@ -64,6 +66,7 @@ class ExecutionValidator:
                 "validation_label": "TEXT",
                 "realized_terminal_mode": "TEXT",
                 "realized_terminal_value": "REAL",
+                "realized_terminal_value_net_wait": "REAL",
                 "realized_wait_hours": "REAL",
             }
             for column, col_type in required_columns.items():
@@ -72,6 +75,20 @@ class ExecutionValidator:
             conn.commit()
         finally:
             conn.close()
+
+    @staticmethod
+    def _wait_adjusted_terminal_value(
+        annual_rate: float | None,
+        period: int,
+        wait_hours: float | None,
+    ) -> float | None:
+        """Discount an annualized terminal rate for capital idle before lending."""
+        if annual_rate is None:
+            return None
+        rate = float(annual_rate)
+        wait = max(float(wait_hours or 0.0), 0.0)
+        term_hours = max(float(period) * 24.0, 1.0)
+        return rate * term_hours / (term_hours + wait)
 
     def _simulate_stage1_fixed_path(self, order_time: datetime, market_rows: List, predicted_rate: float, period: int):
         """
@@ -368,6 +385,8 @@ class ExecutionValidator:
                     'gate_reject_reason': 'NO_VALID_MARKET_DATA',
                     'max_market_rate': 0.0,
                     'rate_gap': predicted_rate,
+                    'stage1_max_market_rate': 0.0,
+                    'stage1_rate_gap': predicted_rate,
                     'path_stage_outcome': 'NO_VALID_MARKET_DATA',
                     'stage1_fill_hours': None,
                     'stage2_frr_proxy_rate': 0.0,
@@ -396,6 +415,15 @@ class ExecutionValidator:
                 )
                 market_median = float(score_details['market_median'])
                 max_market_rate = max(market_high_rates) if market_high_rates else max(market_close_rates)
+                stage1_end = order_time + timedelta(hours=6)
+                stage1_high_rates = [
+                    float(high_rate or close_rate or 0.0)
+                    for timestamp_str, close_rate, high_rate in market_data_timestamped
+                    if order_time < datetime.fromisoformat(timestamp_str) <= stage1_end
+                    and float(high_rate or close_rate or 0.0) > 0.0
+                ]
+                stage1_max_market_rate = max(stage1_high_rates) if stage1_high_rates else 0.0
+                stage1_rate_gap = predicted_rate - stage1_max_market_rate
                 follow_error_at_order = predicted_rate - market_median
                 compatibility_details = {
                     'execution_confidence': confidence,
@@ -426,7 +454,9 @@ class ExecutionValidator:
                         'execution_rate': stage1_effective_rate,
                         'execution_delay_minutes': int((row_time - order_time).total_seconds() / 60),
                         'max_market_rate': max_market_rate,
-                        'rate_gap': predicted_rate - max_market_rate,
+                        'rate_gap': stage1_rate_gap,
+                        'stage1_max_market_rate': stage1_max_market_rate,
+                        'stage1_rate_gap': stage1_rate_gap,
                         'follow_error_at_order': follow_error_at_order,
                         'path_stage_outcome': 'FIXED_FILLED',
                         'stage1_fill_hours': stage1_fill_hours,
@@ -436,6 +466,11 @@ class ExecutionValidator:
                         'validation_label': 'PATH_STAGE1_FILLED',
                         'realized_terminal_mode': 'FIXED',
                         'realized_terminal_value': stage1_effective_rate,
+                        'realized_terminal_value_net_wait': self._wait_adjusted_terminal_value(
+                            stage1_effective_rate,
+                            int(order['period']),
+                            realized_wait_hours,
+                        ),
                         'realized_wait_hours': realized_wait_hours,
                         **compatibility_details,
                     }
@@ -447,7 +482,9 @@ class ExecutionValidator:
                         'status': 'FAILED',
                         'gate_reject_reason': 'PATH_FIXED_MISS',
                         'max_market_rate': max_market_rate,
-                        'rate_gap': predicted_rate - max_market_rate,
+                        'rate_gap': stage1_rate_gap,
+                        'stage1_max_market_rate': stage1_max_market_rate,
+                        'stage1_rate_gap': stage1_rate_gap,
                         'follow_error_at_order': follow_error_at_order,
                         'path_stage_outcome': 'FIXED_MISS',
                         'stage1_fill_hours': None,
@@ -457,6 +494,11 @@ class ExecutionValidator:
                         'validation_label': validation_label,
                         'realized_terminal_mode': realized_terminal_mode,
                         'realized_terminal_value': stage2_frr_proxy_rate if stage2_frr_proxy_rate > 0 else None,
+                        'realized_terminal_value_net_wait': self._wait_adjusted_terminal_value(
+                            stage2_frr_proxy_rate if stage2_frr_proxy_rate > 0 else None,
+                            int(order['period']),
+                            12.0,
+                        ),
                         'realized_wait_hours': 12.0,
                         **compatibility_details,
                     }
@@ -564,7 +606,7 @@ class ExecutionValidator:
             'market_median': median,
             'market_min': min_rate,
             'market_max': max_rate,
-            'rate_gap': rate_gap,
+            'market_min_rate_gap': rate_gap,
             'nearby_rate_count': len(nearby_rates) if predicted_rate > 0 else 0
         }
 
@@ -632,6 +674,7 @@ class ExecutionValidator:
             for field in [
                 'status', 'executed_at', 'execution_rate',
                 'execution_delay_minutes', 'max_market_rate', 'rate_gap',
+                'stage1_max_market_rate', 'stage1_rate_gap',
                 'execution_confidence', 'percentile_score', 'gap_score',
                 'density_score', 'total_score', 'execution_threshold',
                 'market_percentile_25', 'market_percentile_30',
@@ -642,7 +685,8 @@ class ExecutionValidator:
                 'stage1_fill_hours', 'stage2_frr_proxy_rate',
                 'terminal_mode', 'data_quality_label',
                 'validation_label', 'realized_terminal_mode',
-                'realized_terminal_value', 'realized_wait_hours'
+                'realized_terminal_value', 'realized_terminal_value_net_wait',
+                'realized_wait_hours'
             ]:
                 if field in update_data:
                     set_clauses.append(f"{field} = ?")

@@ -15,6 +15,7 @@
 import os
 import sys
 import json
+import hashlib
 import shutil
 import sqlite3
 import numpy as np
@@ -283,6 +284,74 @@ class RetrainingScheduler:
 
         return count
 
+    def get_training_label_snapshot(
+        self,
+        training_end: Optional[datetime] = None,
+    ) -> Dict[str, object]:
+        """Fingerprint mature execution labels eligible for the 90-day train window."""
+        training_end = training_end or (datetime.now() - timedelta(days=7))
+        training_start = training_end - timedelta(days=90)
+        snapshot = {
+            "training_start": training_start.strftime('%Y-%m-%d %H:%M:%S'),
+            "training_end": training_end.strftime('%Y-%m-%d %H:%M:%S'),
+            "label_count": 0,
+            "positive_count": 0,
+            "negative_count": 0,
+            "fingerprint": hashlib.sha256(b"").hexdigest()[:16],
+        }
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(virtual_orders)")
+            columns = {row[1] for row in cursor.fetchall()}
+            identifier = "order_id" if "order_id" in columns else "CAST(rowid AS TEXT)"
+            clauses = [
+                "order_timestamp >= ?",
+                "order_timestamp < ?",
+                "status IN ('EXECUTED', 'FAILED')",
+            ]
+            params = [snapshot["training_start"], snapshot["training_end"]]
+            if "validated_at" in columns:
+                clauses.extend(["validated_at IS NOT NULL", "validated_at < ?"])
+                params.append(snapshot["training_end"])
+            if "decision_mode" in columns:
+                clauses.append("COALESCE(decision_mode, 'exploit') = 'exploit'")
+            if "data_quality_label" in columns:
+                clauses.append("COALESCE(data_quality_label, '') != 'CENSORED'")
+            cursor.execute(
+                f"""
+                SELECT {identifier}, status,
+                       COALESCE(validated_at, '')
+                FROM virtual_orders
+                WHERE {' AND '.join(clauses)}
+                ORDER BY {identifier}
+                """ if "validated_at" in columns else f"""
+                SELECT {identifier}, status, ''
+                FROM virtual_orders
+                WHERE {' AND '.join(clauses)}
+                ORDER BY {identifier}
+                """,
+                params,
+            )
+            rows = cursor.fetchall()
+            conn.close()
+        except Exception as exc:
+            snapshot["error"] = str(exc)
+            return snapshot
+
+        digest = hashlib.sha256()
+        for identifier_value, status, validated_at in rows:
+            digest.update(
+                f"{identifier_value}|{status}|{validated_at}\n".encode("utf-8")
+            )
+        snapshot.update({
+            "label_count": len(rows),
+            "positive_count": sum(1 for row in rows if row[1] == "EXECUTED"),
+            "negative_count": sum(1 for row in rows if row[1] == "FAILED"),
+            "fingerprint": digest.hexdigest()[:16],
+        })
+        return snapshot
+
     def get_recent_execution_rate(self, days: int = 7, since_dt: Optional[datetime] = None) -> float:
         """
         获取近期全局成交率
@@ -306,7 +375,7 @@ class RetrainingScheduler:
             SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed
         FROM virtual_orders
         WHERE {time_column} >= ?
-          AND status IN ('EXECUTED', 'FAILED', 'EXPIRED')
+          AND status IN ('EXECUTED', 'FAILED')
         """
 
         cursor.execute(query.format(time_column=time_column), (since_date,))
@@ -736,20 +805,26 @@ class RetrainingScheduler:
                     (r[0], r[1], int(r[3] or 0), int(r[4] or 0))
                     for r in zero_liq
                 ]
-                reason = (
-                    "货币对成熟结果零成交 "
-                    f"(至少{th['zero_liq_min_decided_orders']}条已决): {currencies}"
+                print(
+                    "🛡️  零流动性组合交由报价保护/期限熔断，不触发全模型重训练: "
+                    f"{currencies}"
                 )
-                print(f"⚠️  需要重训练: {reason}")
-                return True, reason
+        else:
+            zero_liq = []
+
+        zero_liq_pairs = {(row[0], int(row[1])) for row in zero_liq}
+        actionable_period_anomalies = [
+            anomaly for anomaly in period_anomalies
+            if (anomaly['currency'], int(anomaly['period'])) not in zero_liq_pairs
+        ]
 
         # Multi-signal trigger score (execution + follow + stability + per-period anomalies).
         score_exec_rate = exec_rate_7d
-        score_period_anomalies = period_anomalies
+        score_period_anomalies = actionable_period_anomalies
         if not high_exec_maturity_ready:
             score_exec_rate = min(exec_rate_7d, exec_high)
             score_period_anomalies = [
-                anomaly for anomaly in period_anomalies
+                anomaly for anomaly in actionable_period_anomalies
                 if anomaly.get("exec_rate", 0.0) <= exec_high
             ]
 
@@ -775,9 +850,9 @@ class RetrainingScheduler:
             return True, reason
 
         # 紧急重训练 - 单个 period 成交率异常（避免被全局平均稀释）
-        if period_anomalies:
+        if actionable_period_anomalies:
             # critical 级别的低执行率
-            critical_low = [a for a in period_anomalies if a['exec_rate'] < 0.20 and a['severity'] == 'critical']
+            critical_low = [a for a in actionable_period_anomalies if a['exec_rate'] < 0.20 and a['severity'] == 'critical']
             if critical_low:
                 details = ", ".join(
                     f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
@@ -788,7 +863,7 @@ class RetrainingScheduler:
                 return True, reason
 
             # critical 级别的高执行率
-            critical_high = [a for a in period_anomalies if a['exec_rate'] > 0.85 and a['severity'] == 'critical']
+            critical_high = [a for a in actionable_period_anomalies if a['exec_rate'] > 0.85 and a['severity'] == 'critical']
             if critical_high and high_exec_maturity_ready:
                 details = ", ".join(
                     f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
@@ -799,7 +874,7 @@ class RetrainingScheduler:
                 return True, reason
 
             # warning 级别: 低执行率 < 0.30
-            warning_low = [a for a in period_anomalies if a['exec_rate'] < 0.30 and a['severity'] == 'warning']
+            warning_low = [a for a in actionable_period_anomalies if a['exec_rate'] < 0.30 and a['severity'] == 'warning']
             if warning_low:
                 details = ", ".join(
                     f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
@@ -810,7 +885,7 @@ class RetrainingScheduler:
                 return True, reason
 
             # warning 级别: 高执行率 > 0.65
-            warning_high = [a for a in period_anomalies if a['exec_rate'] > 0.65 and a['severity'] == 'warning']
+            warning_high = [a for a in actionable_period_anomalies if a['exec_rate'] > 0.65 and a['severity'] == 'warning']
             if warning_high and high_exec_maturity_ready:
                 details = ", ".join(
                     f"{a['currency']} {a['period']}天={a['exec_rate']:.0%}"
@@ -822,7 +897,12 @@ class RetrainingScheduler:
 
         # 2天短窗口: 检测急剧崩溃（避免7天窗口稀释0%信号）
         short_anomalies = self.get_per_period_execution_anomalies(days=2, since_dt=quality_since_dt)
-        zero_rate_2d = [a for a in short_anomalies if a['exec_rate'] == 0.0 and a['total'] >= 2]
+        zero_rate_2d = [
+            a for a in short_anomalies
+            if a['exec_rate'] == 0.0
+            and a['total'] >= 2
+            and (a['currency'], int(a['period'])) not in zero_liq_pairs
+        ]
         if zero_rate_2d:
             details = ", ".join(f"{a['currency']}-{a['period']}d" for a in zero_rate_2d)
             reason = f"2天内执行率归零 ({details}), 紧急重训练"
@@ -1889,7 +1969,10 @@ class RetrainingScheduler:
         trigger: str,
         retrained: bool,
         deployed: bool,
-        comparison: Dict = None
+        comparison: Dict = None,
+        outcome: Optional[str] = None,
+        training_data: Optional[Dict] = None,
+        challenger_dir: Optional[str] = None,
     ):
         """
         记录重训练事件到日志
@@ -1901,13 +1984,18 @@ class RetrainingScheduler:
             comparison: 模型对比结果
         """
         history = self._load_retraining_history_entries()
-        history.append({
+        event = {
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'trigger': trigger,
             'retrained': retrained,
             'deployed': deployed,
-            'comparison': comparison
-        })
+            'outcome': outcome,
+            'training_data': training_data,
+            'comparison': comparison,
+        }
+        if challenger_dir:
+            event['challenger_dir'] = challenger_dir
+        history.append(event)
 
         # 保存
         with open(self.history_log_path, 'w') as f:
@@ -1915,7 +2003,12 @@ class RetrainingScheduler:
 
         print(f"\n📝 日志已记录: {self.history_log_path}")
 
-    def cleanup_old_artifacts(self, retrained_dir: str = None, max_backups: int = 3):
+    def cleanup_old_artifacts(
+        self,
+        retrained_dir: str = None,
+        max_backups: int = 3,
+        preserve_retrained: bool = False,
+    ):
         """
         清理重训练产生的冗余文件
 
@@ -1931,7 +2024,12 @@ class RetrainingScheduler:
         print("\n🧹 清理冗余模型文件...")
 
         # 1. 删除本次 retrained 临时目录
-        if retrained_dir and os.path.exists(retrained_dir):
+        protected_dir = (
+            os.path.realpath(retrained_dir)
+            if retrained_dir and preserve_retrained
+            else None
+        )
+        if retrained_dir and os.path.exists(retrained_dir) and not preserve_retrained:
             try:
                 shutil.rmtree(retrained_dir)
                 print(f"  ✅ 删除临时目录: {retrained_dir}")
@@ -1942,6 +2040,9 @@ class RetrainingScheduler:
         base_dir = os.path.dirname(self.production_model_dir)
         retrained_dirs = sorted(glob_mod.glob(os.path.join(base_dir, 'models_retrained_*')))
         for d in retrained_dirs:
+            if protected_dir and os.path.realpath(d) == protected_dir:
+                print(f"  📎 保留 rejected challenger 供 shadow: {d}")
+                continue
             try:
                 shutil.rmtree(d)
                 print(f"  ✅ 删除残留目录: {d}")
@@ -1992,6 +2093,12 @@ class RetrainingScheduler:
             reason = "强制重训练"
             print(f"\n⚠️  {reason}")
 
+        training_snapshot = self.get_training_label_snapshot()
+        print(
+            "TRAINING_DATA_SNAPSHOT="
+            + json.dumps(training_snapshot, ensure_ascii=False, sort_keys=True)
+        )
+
         # Step 2: 执行重训练
         retrained_dir = f"data/models_retrained_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         retrain_success = self.retrain_models(output_dir=retrained_dir)
@@ -2000,7 +2107,9 @@ class RetrainingScheduler:
             self.log_retraining_event(
                 trigger=reason,
                 retrained=False,
-                deployed=False
+                deployed=False,
+                outcome='train_failed',
+                training_data=training_snapshot,
             )
             print("\n" + "="*80)
             print(" "*20 + "❌ 重训练失败,流程结束")
@@ -2013,6 +2122,7 @@ class RetrainingScheduler:
             old_model_dir=self.production_model_dir,
             new_model_dir=retrained_dir
         )
+        comparison['training_data'] = training_snapshot
 
         # Step 4: 部署决策
         if is_better:
@@ -2022,7 +2132,9 @@ class RetrainingScheduler:
                 trigger=reason,
                 retrained=True,
                 deployed=deploy_success,
-                comparison=comparison
+                comparison=comparison,
+                outcome='deployed' if deploy_success else 'trained_not_deployed',
+                training_data=training_snapshot,
             )
 
             if deploy_success:
@@ -2042,13 +2154,19 @@ class RetrainingScheduler:
                 trigger=reason,
                 retrained=True,
                 deployed=False,
-                comparison=comparison
+                comparison=comparison,
+                outcome='trained_not_better',
+                training_data=training_snapshot,
+                challenger_dir=retrained_dir,
             )
 
             print("\n" + "="*80)
             print(" "*20 + "⚠️  新模型未达标,保持现有模型")
             print("="*80)
-            self.cleanup_old_artifacts(retrained_dir)
+            self.cleanup_old_artifacts(
+                retrained_dir,
+                preserve_retrained=True,
+            )
             return 'trained_not_better'
 
 
@@ -2071,6 +2189,11 @@ def main():
     if args.dry_run:
         # 仅检查
         should_retrain, reason = scheduler.should_retrain()
+        training_snapshot = scheduler.get_training_label_snapshot()
+        print(
+            "TRAINING_DATA_SNAPSHOT="
+            + json.dumps(training_snapshot, ensure_ascii=False, sort_keys=True)
+        )
         if should_retrain:
             print(f"\n结论: 需要重训练 ({reason})")
         else:

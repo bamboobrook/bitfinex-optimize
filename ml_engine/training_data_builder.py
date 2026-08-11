@@ -104,6 +104,7 @@ class TrainingDataBuilder:
             'validation_label',
             'realized_terminal_mode',
             'realized_terminal_value',
+            'realized_terminal_value_net_wait',
             'realized_wait_hours',
             'validated_at',
             'validation_window_hours',
@@ -251,6 +252,7 @@ class TrainingDataBuilder:
                   'rank_weight', 'candidate_id', 'decision_mode',
                   'data_quality_label', 'validation_label',
                   'realized_terminal_mode', 'realized_terminal_value',
+                  'realized_terminal_value_net_wait',
                   'realized_wait_hours', 'validated_at',
                   'validation_window_hours']:
             if c in execution_results.columns:
@@ -403,6 +405,7 @@ class TrainingDataBuilder:
             'terminal_mode',
             'realized_terminal_mode',
             'realized_terminal_value',
+            'realized_terminal_value_net_wait',
             'realized_wait_hours',
         ]:
             if col not in df.columns:
@@ -415,6 +418,7 @@ class TrainingDataBuilder:
             'execution_rate',
             'stage2_frr_proxy_rate',
             'realized_terminal_value',
+            'realized_terminal_value_net_wait',
             'realized_wait_hours',
         ]:
             if col in df.columns:
@@ -429,12 +433,26 @@ class TrainingDataBuilder:
             ),
             index=df.index,
         )
+        net_terminal_value_available = (
+            df['realized_terminal_value_net_wait'].notna()
+        ) & (df['realized_terminal_value_net_wait'] != '')
         realized_terminal_value_available = (
             df['realized_terminal_value'].notna()
         ) & (df['realized_terminal_value'] != '')
-        df['path_terminal_value'] = df['realized_terminal_value'].where(
-            realized_terminal_value_available,
-            fallback_terminal_value
+        nominal_terminal_value = df['realized_terminal_value'].where(
+            realized_terminal_value_available, fallback_terminal_value
+        )
+        if 'period' in df.columns:
+            term_hours = pd.to_numeric(df['period'], errors='coerce') * 24.0
+            wait_hours = pd.to_numeric(
+                df['realized_wait_hours'], errors='coerce'
+            ).fillna(0.0).clip(lower=0.0)
+            wait_factor = term_hours / (term_hours + wait_hours).replace(0.0, np.nan)
+            legacy_net_terminal_value = nominal_terminal_value * wait_factor.fillna(1.0)
+        else:
+            legacy_net_terminal_value = nominal_terminal_value
+        df['path_terminal_value'] = df['realized_terminal_value_net_wait'].where(
+            net_terminal_value_available, legacy_net_terminal_value
         )
 
         fallback_stage1_success = (executed_mask & (df.get('terminal_mode', pd.Series(dtype=str)) == 'FIXED')).astype(float)
