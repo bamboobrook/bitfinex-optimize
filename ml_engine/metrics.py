@@ -98,6 +98,7 @@ class MetricsCollector:
             columns = {row[1] for row in cursor.fetchall()}
 
             # 1. 执行率统计（包含 EXPIRED，基于有效闭合订单）
+            cutoff_7d = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute("""
                 SELECT status, COUNT(*) as count
                 FROM virtual_orders
@@ -110,9 +111,9 @@ class MetricsCollector:
                     COUNT(*),
                     SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END)
                 FROM virtual_orders
-                WHERE order_timestamp >= datetime('now', '-7 days')
+                WHERE order_timestamp >= ?
                   AND status IN ('EXECUTED', 'FAILED')
-            """)
+            """, (cutoff_7d,))
             recent_total, recent_executed = cursor.fetchone()
             recent_total = int(recent_total or 0)
             recent_executed = int(recent_executed or 0)

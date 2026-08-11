@@ -211,7 +211,9 @@ def get_db_statistics():
         """)
         status_stats = [{"status": row[0], "count": row[1]} for row in cursor.fetchall()]
 
-        # 7天执行率
+        # order_timestamp is stored in local wall-clock time. SQLite's
+        # datetime('now') is UTC, so build the cutoff in Python explicitly.
+        cutoff_7d = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
         cursor.execute("""
             SELECT
                 currency,
@@ -220,11 +222,11 @@ def get_db_statistics():
                 SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed,
                 ROUND(100.0 * SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) / COUNT(*), 1) as exec_rate
             FROM virtual_orders
-            WHERE order_timestamp >= datetime('now', '-7 days')
+            WHERE order_timestamp >= ?
               AND status IN ('EXECUTED', 'FAILED')
             GROUP BY currency, period
             ORDER BY total DESC
-        """)
+        """, (cutoff_7d,))
         exec_rate_7d = [
             {
                 "currency": row[0],

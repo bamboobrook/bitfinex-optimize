@@ -145,14 +145,15 @@ class ExecutionValidator:
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
+            cutoff = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute("""
                 SELECT COUNT(DISTINCT o.order_id)
                 FROM virtual_orders o
                 WHERE o.period = ?
                   AND o.currency = ?
                   AND o.validated_at IS NOT NULL
-                  AND o.validated_at >= datetime('now', '-' || ? || ' hours')
-            """, (period, currency, hours))
+                  AND o.validated_at >= ?
+            """, (period, currency, cutoff))
             result = cursor.fetchone()
             return result[0] if result else 0
         finally:
@@ -179,12 +180,13 @@ class ExecutionValidator:
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
+            cutoff_7d = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute("""
                 SELECT COUNT(*) FROM virtual_orders
                 WHERE currency = ? AND period = ?
                   AND status IN ('EXECUTED', 'FAILED')
-                  AND order_timestamp >= datetime('now', '-7 days')
-            """, (currency, period))
+                  AND order_timestamp >= ?
+            """, (currency, period, cutoff_7d))
             recent_7d_count = cursor.fetchone()[0] or 0
         except Exception:
             recent_7d_count = 1  # 查询失败时保守处理，仍允许放宽
