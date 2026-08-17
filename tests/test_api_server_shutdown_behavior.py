@@ -87,3 +87,33 @@ def test_run_full_pipeline_treats_prediction_sigterm_as_shutdown(monkeypatch):
     assert calls == ["Order Validation", "Retraining Check", "Prediction"]
     assert not any(status[0] == "error" for status in statuses)
     assert not logged_errors
+
+
+def test_calibration_runtime_status_reads_result_details(tmp_path, monkeypatch):
+    _install_api_server_import_stubs(monkeypatch)
+    sys.modules.pop("ml_engine.api_server", None)
+    import ml_engine.api_server as api_server
+
+    monkeypatch.setattr(
+        api_server,
+        "_load_prediction_result",
+        lambda: {
+            "recommendations": [
+                {
+                    "details": {
+                        "probability_calibration_method": "v2_global_platt_persisted"
+                    }
+                },
+                {"probability_calibration_method": "v2_global_platt"},
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        api_server,
+        "CALIBRATION_STATE_FILE",
+        str(tmp_path / "missing-calibration-state.json"),
+    )
+
+    status = api_server._calibration_runtime_status()
+
+    assert status["methods"] == ["v2_global_platt", "v2_global_platt_persisted"]

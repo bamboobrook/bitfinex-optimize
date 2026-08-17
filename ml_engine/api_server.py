@@ -30,6 +30,8 @@ DATA_FILE = str(BASE_DIR / "data" / "optimal_combination.json")
 STATUS_FILE = str(BASE_DIR / "data" / "service_status.json")
 DB_FILE = str(BASE_DIR / "data" / "lending_history.db")
 RETRAIN_STATE_FILE = str(BASE_DIR / "data" / "retraining_state.json")
+RETRAIN_HISTORY_FILE = str(BASE_DIR / "data" / "retraining_history.json")
+CALIBRATION_STATE_FILE = str(BASE_DIR / "data" / "v2_calibration_state.json")
 
 
 def _atomic_write_json(path: str, payload: dict, indent: int = 4):
@@ -117,7 +119,7 @@ def save_retraining_state(
             state["backoff_until"] = (
                 datetime.now() + timedelta(hours=backoff_hours)
             ).strftime('%Y-%m-%d %H:%M:%S')
-        elif outcome == "deployed":
+        elif outcome in {"deployed", "partially_deployed"}:
             state["rejection_streak"] = 0
             state["backoff_until"] = None
 
@@ -146,7 +148,7 @@ def _parse_retraining_outcome(stdout: str) -> str:
     import re
 
     match = re.search(
-        r"重训练结果:\s*(deployed|trained_not_deployed|trained_not_better|not_needed|train_failed)",
+        r"重训练结果:\s*(partially_deployed|deployed|trained_not_deployed|trained_not_better|not_needed|train_failed)",
         stdout or "",
     )
     return match.group(1) if match else "unknown"
@@ -174,6 +176,103 @@ def _load_prediction_result():
     except Exception as e:
         logger.warning(f"Failed to inspect prediction result file: {e}")
         return None
+
+
+def _model_deployment_times() -> dict:
+    currencies = ("fUSD", "fUST")
+    deployed_at = {currency: None for currency in currencies}
+    try:
+        with open(RETRAIN_HISTORY_FILE, "r", encoding="utf-8") as history_file:
+            raw = json.load(history_file)
+        entries = raw if isinstance(raw, list) else list(raw.values()) if isinstance(raw, dict) else []
+        for entry in reversed(entries):
+            if not isinstance(entry, dict) or entry.get("deployed") is not True:
+                continue
+            timestamp = parse_datetime_safe(entry.get("timestamp"))
+            if timestamp is None:
+                continue
+            selected = entry.get("deployed_currencies")
+            for currency in currencies:
+                if deployed_at[currency] is not None:
+                    continue
+                if isinstance(selected, list) and currency not in selected:
+                    continue
+                deployed_at[currency] = timestamp
+    except Exception as exc:
+        logger.warning(f"Failed to read model deployment history: {exc}")
+
+    model_dir = BASE_DIR / "data" / "models"
+    for currency in currencies:
+        if deployed_at[currency] is not None or not model_dir.exists():
+            continue
+        meta_files = list(model_dir.glob(f"{currency}_*_meta.json"))
+        if meta_files:
+            deployed_at[currency] = datetime.fromtimestamp(
+                max(path.stat().st_mtime for path in meta_files)
+            )
+    return deployed_at
+
+
+def _model_cohort_status(deployed_at: dict) -> dict:
+    cohorts = {}
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            for currency, timestamp in deployed_at.items():
+                if timestamp is None:
+                    cohorts[currency] = {"decided": 0, "executed": 0, "pending": 0, "hit_rate": None}
+                    continue
+                row = conn.execute(
+                    """
+                    SELECT
+                        SUM(status IN ('EXECUTED', 'FAILED')),
+                        SUM(status = 'EXECUTED'),
+                        SUM(status = 'PENDING')
+                    FROM virtual_orders
+                    WHERE currency = ? AND created_at >= ?
+                    """,
+                    (currency, timestamp.strftime('%Y-%m-%d %H:%M:%S')),
+                ).fetchone()
+                decided, executed, pending = (int(value or 0) for value in row)
+                cohorts[currency] = {
+                    "decided": decided,
+                    "executed": executed,
+                    "pending": pending,
+                    "hit_rate": (executed / decided) if decided else None,
+                    "age_hours": round((datetime.now() - timestamp).total_seconds() / 3600.0, 1),
+                }
+    except Exception as exc:
+        logger.warning(f"Failed to calculate model cohort status: {exc}")
+    return cohorts
+
+
+def _calibration_runtime_status() -> dict:
+    state = {}
+    try:
+        if os.path.exists(CALIBRATION_STATE_FILE):
+            with open(CALIBRATION_STATE_FILE, "r", encoding="utf-8") as state_file:
+                loaded = json.load(state_file)
+            state = loaded if isinstance(loaded, dict) else {}
+    except Exception as exc:
+        logger.warning(f"Failed to read calibration state: {exc}")
+    latest_result = _load_prediction_result() or {}
+    recommendations = latest_result.get("recommendations", []) if isinstance(latest_result, dict) else []
+    methods = set()
+    for item in recommendations:
+        if not isinstance(item, dict):
+            continue
+        details = item.get("details")
+        method = item.get("probability_calibration_method")
+        if not method and isinstance(details, dict):
+            method = details.get("probability_calibration_method")
+        if method:
+            methods.add(str(method))
+    return {
+        "methods": sorted(methods),
+        "consecutive_failures": int(state.get("consecutive_failures", 0) or 0),
+        "last_failure_reason": state.get("last_failure_reason"),
+        "last_success_at": state.get("last_success_at"),
+        "updated_at": state.get("updated_at"),
+    }
 
 
 def _extract_prediction_failure(result):
@@ -1139,7 +1238,7 @@ async def run_full_pipeline():
                 if rc == 0:
                     retrain_outcome = _parse_retraining_outcome(stdout or "")
                     training_snapshot = _parse_training_data_snapshot(stdout or "")
-                    deployed = retrain_outcome == 'deployed'
+                    deployed = retrain_outcome in {'deployed', 'partially_deployed'}
                     _last_forced_retrain_time = datetime.now()
                     save_retraining_state(
                         _last_forced_retrain_time,
@@ -1302,19 +1401,37 @@ def check_status():
     """
     status_info = get_current_status()
 
-    # 添加模型年龄监控
-    model_dir = os.path.join(BASE_DIR, "data", "models")
-    if os.path.exists(model_dir):
-        meta_files = [f for f in os.listdir(model_dir) if f.endswith('_meta.json')]
-        if meta_files:
-            newest_mtime = max(os.path.getmtime(os.path.join(model_dir, f)) for f in meta_files)
-            model_age_days = (datetime.now() - datetime.fromtimestamp(newest_mtime)).days
-            status_info["model_age_days"] = model_age_days
-            if model_age_days > 7:
-                logger.warning(f"Production models are {model_age_days} days old!")
-                if model_age_days > 14:
-                    status_info["status"] = "degraded"
-                    status_info["details"] = f"Models {model_age_days} days stale"
+    deployment_times = _model_deployment_times()
+    age_by_currency = {
+        currency: (
+            max(0, (datetime.now() - deployed_at).days)
+            if deployed_at is not None
+            else 999
+        )
+        for currency, deployed_at in deployment_times.items()
+    }
+    status_info["model_age_days_by_currency"] = age_by_currency
+    status_info["model_deployed_at_by_currency"] = {
+        currency: deployed_at.strftime('%Y-%m-%d %H:%M:%S') if deployed_at else None
+        for currency, deployed_at in deployment_times.items()
+    }
+    status_info["model_cohort_by_currency"] = _model_cohort_status(deployment_times)
+    status_info["probability_calibration"] = _calibration_runtime_status()
+    status_info["model_age_days"] = max(age_by_currency.values(), default=999)
+
+    stale_currencies = [
+        currency for currency, age in age_by_currency.items() if age > 14
+    ]
+    for currency, age in age_by_currency.items():
+        if age > 7:
+            logger.warning(f"Production {currency} models are {age} days old!")
+    if stale_currencies:
+        status_info["status"] = "degraded"
+        stale_summary = ", ".join(
+            f"{currency}={age_by_currency[currency]}d"
+            for currency in stale_currencies
+        )
+        status_info["details"] = f"Models stale: {stale_summary}"
 
     return {
         "api_online": True,
@@ -1799,10 +1916,17 @@ async def trigger_retraining(background_tasks: BackgroundTasks, force: bool = Fa
                 update_status("online", "Idle", f"Retraining not needed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             else:
                 # rc == 0: 训练成功（可能部署也可能未部署）
-                deployed = '新模型已部署' in (stdout_text or '')
+                retrain_outcome = _parse_retraining_outcome(stdout_text or "")
+                training_snapshot = _parse_training_data_snapshot(stdout_text or "")
+                deployed = retrain_outcome in {'deployed', 'partially_deployed'}
                 if force:
                     _last_forced_retrain_time = datetime.now()
-                    save_retraining_state(_last_forced_retrain_time, reason="manual_force")
+                    save_retraining_state(
+                        _last_forced_retrain_time,
+                        reason="manual_force",
+                        outcome=retrain_outcome,
+                        training_data=training_snapshot,
+                    )
                 if deployed:
                     logger.info("✅ Closed-loop retraining completed and new models deployed")
                 else:

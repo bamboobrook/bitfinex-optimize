@@ -51,6 +51,25 @@
     "max_execution_v2_brier": 0.25,
     "max_revenue_mae": 5.0
   },
+  "probability_calibration": {
+    "min_samples": 300,
+    "min_class_samples": 40,
+    "min_brier_improvement": 0.002,
+    "max_consecutive_failures": 3,
+    "severe_brier_degradation": 0.01,
+    "bootstrap_mild_brier_delta": 0.002,
+    "max_state_age_hours": 168
+  },
+  "quote_guard": {
+    "enabled": true,
+    "min_order_count": 10,
+    "activation_execution_rate": 0.35,
+    "short_base_premium_pct": 0.18,
+    "medium_base_premium_pct": 0.15,
+    "long_base_premium_pct": 0.12,
+    "minimum_premium_pct": 0.04,
+    "severity_scale": 0.65
+  },
   "combo_optimizer": {
     "combo_mode": "shadow",
     "beam_width": 24,

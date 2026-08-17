@@ -138,14 +138,50 @@ def test_healthy_liquidity_keeps_existing_floor():
     assert suppressed is False
 
 
+def test_execution_quote_guard_caps_mature_collapsing_pair():
+    predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+    predictor.policy = {"quote_guard": {}}
+
+    guarded, meta = predictor._apply_execution_quote_guard(
+        candidate_rate=12.74,
+        current_rate=9.89,
+        period=60,
+        execution_rate=0.115,
+        avg_rate_gap=1.115,
+        order_count=1106,
+    )
+
+    assert meta["applied"] is True
+    assert guarded < 12.74
+    assert guarded == pytest.approx(meta["cap"])
+    assert meta["allowed_premium_pct"] < 0.08
+
+
+def test_execution_quote_guard_leaves_recovered_pair_unchanged():
+    predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+    predictor.policy = {"quote_guard": {}}
+
+    guarded, meta = predictor._apply_execution_quote_guard(
+        candidate_rate=10.62,
+        current_rate=9.46,
+        period=14,
+        execution_rate=0.462,
+        avg_rate_gap=0.72,
+        order_count=1370,
+    )
+
+    assert guarded == pytest.approx(10.62)
+    assert meta["applied"] is False
+
+
 def test_funding_book_signal_filters_by_period_and_executable_rate():
     predictor = EnsemblePredictor.__new__(EnsemblePredictor)
     predictor._funding_book_cache = {}
     predictor._fetch_bitfinex_public_json = lambda *args, **kwargs: [
         [0.00020, 90, 1, -50_000.0],   # 7.30%, executable
         [0.00010, 90, 1, -100_000.0],  # 3.65%, below target
-        [0.00050, 120, 1, -500_000.0], # wrong period
         [0.00030, 90, 1, 900_000.0],   # ask, not borrower bid
+        [0.00050, 120, 1, -500_000.0], # wrong period, deliberately last
     ]
 
     signal = predictor._get_realtime_non2d_liquidity_signal(

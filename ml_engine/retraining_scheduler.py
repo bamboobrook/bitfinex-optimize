@@ -74,7 +74,9 @@ class RetrainingScheduler:
         self.history_log_path = os.path.join(self.log_dir, 'retraining_history.json')
         self.policy = load_system_policy()
 
-    def _get_production_model_deployed_at(self) -> Optional[datetime]:
+    def _get_production_model_deployed_at(
+        self, currency: Optional[str] = None
+    ) -> Optional[datetime]:
         """
         获取当前生产模型部署时间。
 
@@ -83,6 +85,13 @@ class RetrainingScheduler:
         """
         for entry in reversed(self._load_retraining_history_entries()):
             if entry.get('deployed') is not True:
+                continue
+            deployed_currencies = entry.get('deployed_currencies')
+            if (
+                currency
+                and isinstance(deployed_currencies, list)
+                and currency not in deployed_currencies
+            ):
                 continue
             timestamp = entry.get('timestamp')
             if not timestamp:
@@ -100,6 +109,7 @@ class RetrainingScheduler:
                 os.path.join(self.production_model_dir, name)
                 for name in os.listdir(self.production_model_dir)
                 if name.endswith('_meta.json')
+                and (not currency or name.startswith(f'{currency}_'))
             ]
         except Exception:
             return None
@@ -110,14 +120,14 @@ class RetrainingScheduler:
         newest_mtime = max(os.path.getmtime(path) for path in meta_files)
         return datetime.fromtimestamp(newest_mtime)
 
-    def _get_production_model_age_days(self) -> int:
+    def _get_production_model_age_days(self, currency: Optional[str] = None) -> int:
         """
         获取当前生产模型年龄（以最新 meta 文件为准）。
 
         Returns:
             距今的天数；若生产模型不存在或无 meta 文件，返回一个很大的值以触发重训。
         """
-        deployed_at = self._get_production_model_deployed_at()
+        deployed_at = self._get_production_model_deployed_at(currency)
         if deployed_at is None:
             return 999
 
@@ -1154,84 +1164,80 @@ class RetrainingScheduler:
             # 检查1: 模型文件完整性
             print("\n检查1: 模型文件完整性")
 
-            expected_models = [
-                'fUSD_model_execution_prob',
-                'fUSD_model_conservative',
-                'fUSD_model_aggressive',
-                'fUSD_model_balanced',
-                'fUST_model_execution_prob',
-                'fUST_model_conservative',
-                'fUST_model_aggressive',
-                'fUST_model_balanced',
+            base_types = [
+                'model_execution_prob',
+                'model_conservative',
+                'model_aggressive',
+                'model_balanced',
             ]
-
-            new_model_count = 0
-            for model_prefix in expected_models:
-                meta_file = os.path.join(new_model_dir, f"{model_prefix}_meta.json")
-                if os.path.exists(meta_file):
-                    new_model_count += 1
-
-            print(f"  新模型文件: {new_model_count}/{len(expected_models)}")
-
-            if new_model_count < len(expected_models):
-                print(f"  ⚠️  新模型不完整")
-                comparison['checks']['completeness'] = False
-                comparison['is_better'] = False
-                return False, comparison
-
-            comparison['checks']['completeness'] = True
-            print(f"  ✅ 新模型完整")
-
-            # 检查2: 新模型包含增强特性
-            print("\n检查2: 检查增强模型")
-
-            enhanced_models = [
-                'fUSD_model_execution_prob_v2',
-                'fUSD_model_revenue_optimized',
-                'fUST_model_execution_prob_v2',
-                'fUST_model_revenue_optimized',
+            enhanced_types = [
+                'model_execution_prob_v2',
+                'model_revenue_optimized',
             ]
-
-            enhanced_count = 0
+            currency_artifacts = {}
+            eligible_currencies = []
             missing_enhanced_models = []
-            retained_count = 0
-            for model_prefix in enhanced_models:
-                old_meta_file = os.path.join(old_model_dir, f"{model_prefix}_meta.json")
-                new_meta_file = os.path.join(new_model_dir, f"{model_prefix}_meta.json")
+            total_present = 0
+            total_expected = 0
 
-                if os.path.exists(new_meta_file):
-                    enhanced_count += 1
+            for currency in ['fUSD', 'fUST']:
+                missing_base = []
+                missing_enhanced = []
+                for model_type in base_types + enhanced_types:
+                    model_prefix = f"{currency}_{model_type}"
+                    total_expected += 1
+                    meta_path = os.path.join(new_model_dir, f"{model_prefix}_meta.json")
+                    if os.path.exists(meta_path):
+                        total_present += 1
+                    elif model_type in enhanced_types:
+                        missing_enhanced.append(model_prefix)
+                        missing_enhanced_models.append(model_prefix)
+                    else:
+                        missing_base.append(model_prefix)
+
+                artifact_ok = not missing_base and not missing_enhanced
+                currency_artifacts[currency] = {
+                    'passed': artifact_ok,
+                    'missing_base_models': missing_base,
+                    'missing_enhanced_models': missing_enhanced,
+                }
+                if artifact_ok:
+                    eligible_currencies.append(currency)
+
+            print(f"  新模型文件: {total_present}/{total_expected}")
+            comparison['checks']['currency_artifacts'] = currency_artifacts
+            comparison['checks']['completeness'] = all(
+                not value['missing_base_models'] for value in currency_artifacts.values()
+            )
+            comparison['checks']['enhanced_models'] = not missing_enhanced_models
+            comparison['checks']['enhanced_model_retention'] = not missing_enhanced_models
+            comparison['missing_enhanced_models'] = missing_enhanced_models
+
+            for currency, artifact_status in currency_artifacts.items():
+                if artifact_status['passed']:
+                    print(f"  ✅ {currency} 模型产物完整")
                 else:
-                    # 增强模型是当前闭环能力的必备输出；新模型缺失即拒绝部署。
-                    missing_enhanced_models.append(model_prefix)
-
-                if os.path.exists(old_meta_file) and os.path.exists(new_meta_file):
-                    retained_count += 1
-
-            print(f"  增强模型: {enhanced_count}/{len(enhanced_models)} (旧模型保留: {retained_count})")
-
-            if missing_enhanced_models:
-                print(f"  ⚠️  增强模型缺失: {', '.join(missing_enhanced_models)}（拒绝部署）")
-                comparison['checks']['enhanced_models'] = False
-                comparison['checks']['enhanced_model_retention'] = False
-                comparison['missing_enhanced_models'] = missing_enhanced_models
-            else:
-                comparison['checks']['enhanced_model_retention'] = True
-                comparison['checks']['enhanced_models'] = True
-                comparison['missing_enhanced_models'] = []
-                print(f"  ✅ 增强模型检查通过")
+                    missing = (
+                        artifact_status['missing_base_models']
+                        + artifact_status['missing_enhanced_models']
+                    )
+                    print(f"  ❌ {currency} 模型产物不完整: {', '.join(missing)}")
 
             # 检查3: 实际性能对比 (S2 核心修复)
             print("\n检查3: 模型性能对比 (验证集)")
             performance_ok = self._compare_model_performance(
-                old_model_dir, new_model_dir, comparison
+                old_model_dir,
+                new_model_dir,
+                comparison,
+                eligible_currencies,
             )
 
-            is_better = (
-                comparison['checks']['completeness'] and
-                comparison['checks'].get('enhanced_models', False) and
-                performance_ok
-            )
+            approved_currencies = comparison.get('approved_currencies')
+            if approved_currencies is None and performance_ok:
+                approved_currencies = list(eligible_currencies)
+                comparison['approved_currencies'] = approved_currencies
+            approved_currencies = approved_currencies or []
+            is_better = bool(performance_ok and approved_currencies)
             comparison['is_better'] = is_better
 
             if is_better:
@@ -1251,7 +1257,8 @@ class RetrainingScheduler:
         self,
         old_model_dir: str,
         new_model_dir: str,
-        comparison: Dict
+        comparison: Dict,
+        eligible_currencies: Optional[List[str]] = None,
     ) -> bool:
         """
         使用最近7天的执行数据对比新旧模型性能
@@ -1303,22 +1310,40 @@ class RetrainingScheduler:
             }
             comparison['metrics'] = metrics_comparison
 
-            all_pass = True
+            if eligible_currencies is None:
+                eligible_currencies = [
+                    currency
+                    for currency in ['fUSD', 'fUST']
+                    if (
+                        currency in old_eval.get("currency_scores", {})
+                        or currency in new_eval.get("currency_scores", {})
+                        or currency in old_eval.get("metrics", {})
+                        or currency in new_eval.get("metrics", {})
+                    )
+                ]
+            eligible_currencies = list(dict.fromkeys(eligible_currencies))
+            currency_pass = {currency: True for currency in eligible_currencies}
+            currency_reasons = {currency: [] for currency in eligible_currencies}
+
+            def reject(currency: str, reason: str):
+                if currency in currency_pass:
+                    currency_pass[currency] = False
+                    currency_reasons[currency].append(reason)
+
             old_score = old_eval["overall_score"]
             new_score = new_eval["overall_score"]
 
-            # New model should not degrade aggregated score by more than 2%.
+            # Overall score remains diagnostic. Deployment is decided per currency.
             if old_score > 0 and new_score < old_score * 0.98:
-                print(f"  ❌ 综合分数下降过多: old={old_score:.4f}, new={new_score:.4f}")
-                all_pass = False
+                print(f"  ⚠️  综合分数下降过多: old={old_score:.4f}, new={new_score:.4f}")
 
             # Per-currency guardrail: not worse than 5%.
-            for currency in ['fUSD', 'fUST']:
+            for currency in eligible_currencies:
                 old_curr = old_eval["currency_scores"].get(currency, 0.0)
                 new_curr = new_eval["currency_scores"].get(currency, 0.0)
                 if old_curr > 0 and new_curr < old_curr * 0.95:
                     print(f"  ❌ {currency} 分数下降超过5%: old={old_curr:.4f}, new={new_curr:.4f}")
-                    all_pass = False
+                    reject(currency, "currency_score_degraded")
 
             enhanced_checks = 0
             enhanced_pass = True
@@ -1332,9 +1357,10 @@ class RetrainingScheduler:
             max_revenue_mae = float(
                 model_gate.get("max_revenue_mae", 5.0)
             )
-            for currency in ['fUSD', 'fUST']:
+            for currency in eligible_currencies:
                 old_metrics = old_eval["metrics"].get(currency, {})
                 new_metrics = new_eval["metrics"].get(currency, {})
+                currency_enhanced_failed = False
 
                 v2_samples = int(
                     new_metrics.get(
@@ -1360,8 +1386,9 @@ class RetrainingScheduler:
                             f"  ❌ {currency} execution_prob_v2 有 {v2_samples} 条验证样本，"
                             "但 challenger 无有效指标"
                         )
-                        all_pass = False
+                        reject(currency, "execution_v2_metrics_invalid")
                         enhanced_pass = False
+                        currency_enhanced_failed = True
                     else:
                         new_auc = float(new_auc)
                         new_brier = float(new_brier)
@@ -1375,22 +1402,25 @@ class RetrainingScheduler:
                                 f"  ❌ {currency} execution_prob_v2 AUC "
                                 f"低于绝对门槛: {new_auc:.4f} < {min_v2_auc:.4f}"
                             )
-                            all_pass = False
+                            reject(currency, "execution_v2_auc_below_floor")
                             enhanced_pass = False
+                            currency_enhanced_failed = True
                         if new_brier > max_v2_brier:
                             print(
                                 f"  ❌ {currency} execution_prob_v2 Brier "
                                 f"高于绝对门槛: {new_brier:.4f} > {max_v2_brier:.4f}"
                             )
-                            all_pass = False
+                            reject(currency, "execution_v2_brier_above_ceiling")
                             enhanced_pass = False
+                            currency_enhanced_failed = True
                         if old_auc is not None and new_auc < old_auc - 0.02:
                             print(
                                 f"  ❌ {currency} execution_prob_v2 AUC 下降超过0.02: "
                                 f"old={old_auc:.4f}, new={new_auc:.4f}"
                             )
-                            all_pass = False
+                            reject(currency, "execution_v2_auc_degraded")
                             enhanced_pass = False
+                            currency_enhanced_failed = True
                         if (
                             old_brier is not None
                             and old_brier > 0
@@ -1400,8 +1430,9 @@ class RetrainingScheduler:
                                 f"  ❌ {currency} execution_prob_v2 Brier 退化超过5%: "
                                 f"old={old_brier:.4f}, new={new_brier:.4f}"
                             )
-                            all_pass = False
+                            reject(currency, "execution_v2_brier_degraded")
                             enhanced_pass = False
+                            currency_enhanced_failed = True
 
                 revenue_samples = int(
                     new_metrics.get(
@@ -1420,8 +1451,9 @@ class RetrainingScheduler:
                             f"  ❌ {currency} revenue_optimized 有 {revenue_samples} 条验证样本，"
                             "但 challenger 无有效指标"
                         )
-                        all_pass = False
+                        reject(currency, "revenue_metrics_invalid")
                         enhanced_pass = False
+                        currency_enhanced_failed = True
                     else:
                         new_mae = float(new_mae)
                         if old_mae is not None and not np.isfinite(float(old_mae)):
@@ -1433,8 +1465,9 @@ class RetrainingScheduler:
                                 f"高于绝对门槛: {new_mae:.4f} > "
                                 f"{max_revenue_mae:.4f}"
                             )
-                            all_pass = False
+                            reject(currency, "revenue_mae_above_ceiling")
                             enhanced_pass = False
+                            currency_enhanced_failed = True
                         if (
                             old_mae is not None
                             and old_mae > 0
@@ -1444,8 +1477,12 @@ class RetrainingScheduler:
                                 f"  ❌ {currency} revenue_optimized MAE 退化超过5%: "
                                 f"old={old_mae:.4f}, new={new_mae:.4f}"
                             )
-                            all_pass = False
+                            reject(currency, "revenue_mae_degraded")
                             enhanced_pass = False
+                            currency_enhanced_failed = True
+
+                if not currency_enhanced_failed and currency_pass.get(currency):
+                    print(f"  ✅ {currency} 独立性能门禁通过")
 
             comparison['checks']['enhanced_performance'] = (
                 'passed'
@@ -1455,10 +1492,18 @@ class RetrainingScheduler:
                 else 'skipped_insufficient_data'
             )
 
-            # Sanity check: 验证新模型基本可用
-            sanity_ok = self._sanity_check_new_models(new_model_dir)
-            if not sanity_ok:
-                all_pass = False
+            # Sanity check is isolated per currency so one broken artifact set does
+            # not block a healthy currency from being promoted.
+            for currency in eligible_currencies:
+                try:
+                    sanity_ok = self._sanity_check_new_models(
+                        new_model_dir, [currency]
+                    )
+                except TypeError:
+                    # Compatibility with test doubles and older integrations.
+                    sanity_ok = self._sanity_check_new_models(new_model_dir)
+                if not sanity_ok:
+                    reject(currency, "sanity_check_failed")
 
             # Live follow/stability is a retraining trigger signal, not a hard
             # deploy gate for the challenger. Otherwise stale production metrics
@@ -1471,13 +1516,36 @@ class RetrainingScheduler:
             else:
                 comparison['checks']['live_follow_stability'] = 'passed'
 
-            comparison['checks']['performance'] = 'passed' if all_pass else 'degraded'
-
-            if all_pass:
-                print(f"  ✅ 新模型通过同集对比 + sanity check + 闭环质量门禁")
+            approved_currencies = [
+                currency for currency in eligible_currencies if currency_pass[currency]
+            ]
+            rejected_currencies = {
+                currency: reasons
+                for currency, reasons in currency_reasons.items()
+                if not currency_pass[currency]
+            }
+            comparison['approved_currencies'] = approved_currencies
+            comparison['rejected_currencies'] = rejected_currencies
+            comparison['checks']['currency_performance'] = {
+                currency: {
+                    'passed': currency_pass[currency],
+                    'reasons': currency_reasons[currency],
+                }
+                for currency in eligible_currencies
+            }
+            if approved_currencies and len(approved_currencies) == len(eligible_currencies):
+                performance_status = 'passed'
+            elif approved_currencies:
+                performance_status = 'partial'
             else:
-                print(f"  ❌ 新模型未通过对比门禁")
-            return all_pass
+                performance_status = 'degraded'
+            comparison['checks']['performance'] = performance_status
+
+            if approved_currencies:
+                print(f"  ✅ 独立门禁通过: {', '.join(approved_currencies)}")
+            if rejected_currencies:
+                print(f"  ❌ 独立门禁拒绝: {', '.join(rejected_currencies)}")
+            return bool(approved_currencies)
 
         except Exception as e:
             print(f"  ❌ 性能对比异常: {e},拒绝部署")
@@ -1742,7 +1810,11 @@ class RetrainingScheduler:
             return False, f"{model_prefix} 没有正权重组件"
         return True, ""
 
-    def _sanity_check_new_models(self, model_dir: str) -> bool:
+    def _sanity_check_new_models(
+        self,
+        model_dir: str,
+        currencies: Optional[List[str]] = None,
+    ) -> bool:
         """
         验证新模型基本可用: 文件完整、预测输出合理
 
@@ -1765,7 +1837,8 @@ class RetrainingScheduler:
             ]
 
             # 检查每个币种的核心与增强模型
-            for currency in ['fUSD', 'fUST']:
+            target_currencies = currencies or ['fUSD', 'fUST']
+            for currency in target_currencies:
                 required_models = [
                     f'{currency}_{model_type}'
                     for model_type in required_types
@@ -1784,7 +1857,7 @@ class RetrainingScheduler:
             test_predictor = EnsemblePredictor(model_dir=model_dir, max_workers=1)
 
             # 获取最新特征数据做几组预测
-            for currency in ['fUSD', 'fUST']:
+            for currency in target_currencies:
                 if currency not in test_predictor.models or not test_predictor.models[currency]:
                     print(f"  ❌ sanity check失败: {currency} 模型加载失败")
                     return False
@@ -1913,7 +1986,11 @@ class RetrainingScheduler:
             print(f"❌ 备份失败: {e}")
             return False
 
-    def deploy_new_models(self, new_model_dir: str) -> bool:
+    def deploy_new_models(
+        self,
+        new_model_dir: str,
+        currencies: Optional[List[str]] = None,
+    ) -> bool:
         """
         部署新模型到生产环境
 
@@ -1928,36 +2005,87 @@ class RetrainingScheduler:
         print("="*60)
 
         try:
-            # 先备份当前模型
-            if not self.backup_production_models():
-                print("⚠️  备份失败,但继续部署")
-
             prod_dir = self.production_model_dir
+            selected = list(dict.fromkeys(currencies or ['fUSD', 'fUST']))
+            invalid = [currency for currency in selected if currency not in {'fUSD', 'fUST'}]
+            if invalid or not selected:
+                print(f"❌ 部署币种无效: {invalid or selected}")
+                return False
 
-            # 合并部署：保留旧模型中存在但新模型中未重新训练的增强模型
-            enhanced_suffixes = ['_v2_', '_revenue_optimized_']
-            retained_files = []
+            required_types = [
+                'model_execution_prob',
+                'model_conservative',
+                'model_aggressive',
+                'model_balanced',
+                'model_execution_prob_v2',
+                'model_revenue_optimized',
+            ]
+
+            def selected_artifacts_complete(model_dir: str) -> bool:
+                for currency in selected:
+                    for model_type in required_types:
+                        complete, reason = self._check_model_artifact_set(
+                            model_dir, f'{currency}_{model_type}'
+                        )
+                        if not complete:
+                            print(f"❌ {currency} 部署产物不完整: {reason}")
+                            return False
+                return True
+
+            if not selected_artifacts_complete(new_model_dir):
+                return False
+
+            parent_dir = os.path.dirname(os.path.abspath(prod_dir))
+            base_name = os.path.basename(os.path.abspath(prod_dir))
+            token = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+            staging_dir = os.path.join(parent_dir, f'.{base_name}.staging_{token}')
+            rollback_dir = os.path.join(parent_dir, f'.{base_name}.rollback_{token}')
+
             if os.path.exists(prod_dir):
-                for fname in os.listdir(prod_dir):
-                    src_path = os.path.join(prod_dir, fname)
-                    dst_path = os.path.join(new_model_dir, fname)
-                    if not os.path.exists(dst_path) and os.path.isfile(src_path):
-                        if any(s in fname for s in enhanced_suffixes):
-                            shutil.copy2(src_path, dst_path)
-                            retained_files.append(fname)
+                shutil.copytree(prod_dir, staging_dir)
+            else:
+                os.makedirs(staging_dir, exist_ok=False)
 
-                # 删除旧模型
-                print(f"删除旧模型: {prod_dir}")
-                shutil.rmtree(prod_dir)
+            for currency in selected:
+                prefix = f'{currency}_'
+                for name in list(os.listdir(staging_dir)):
+                    path = os.path.join(staging_dir, name)
+                    if name.startswith(prefix) and os.path.isfile(path):
+                        os.unlink(path)
+                for name in os.listdir(new_model_dir):
+                    source = os.path.join(new_model_dir, name)
+                    if name.startswith(prefix) and os.path.isfile(source):
+                        shutil.copy2(source, os.path.join(staging_dir, name))
 
-            # 复制新模型（含保留的增强模型）
-            print(f"复制新模型: {new_model_dir} -> {prod_dir}")
-            shutil.copytree(new_model_dir, prod_dir)
+            if not selected_artifacts_complete(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                print("❌ 暂存模型产物校验失败,保持现有模型")
+                return False
 
-            if retained_files:
-                print(f"  📎 保留旧增强模型: {', '.join(retained_files)}")
+            if os.path.exists(prod_dir) and not self.backup_production_models():
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                print("❌ 生产模型备份失败,取消部署")
+                return False
 
-            print("✅ 部署成功")
+            moved_old = False
+            try:
+                if os.path.exists(prod_dir):
+                    os.replace(prod_dir, rollback_dir)
+                    moved_old = True
+                os.replace(staging_dir, prod_dir)
+                if not selected_artifacts_complete(prod_dir):
+                    raise RuntimeError("post-deploy artifact check failed")
+            except Exception:
+                if os.path.exists(prod_dir):
+                    shutil.rmtree(prod_dir, ignore_errors=True)
+                if moved_old and os.path.exists(rollback_dir):
+                    os.replace(rollback_dir, prod_dir)
+                raise
+            finally:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
+            shutil.rmtree(rollback_dir, ignore_errors=True)
+            print(f"✅ 按币种部署成功: {', '.join(selected)}")
             return True
 
         except Exception as e:
@@ -1973,6 +2101,7 @@ class RetrainingScheduler:
         outcome: Optional[str] = None,
         training_data: Optional[Dict] = None,
         challenger_dir: Optional[str] = None,
+        deployed_currencies: Optional[List[str]] = None,
     ):
         """
         记录重训练事件到日志
@@ -1993,6 +2122,10 @@ class RetrainingScheduler:
             'training_data': training_data,
             'comparison': comparison,
         }
+        if deployed:
+            event['deployed_currencies'] = list(
+                dict.fromkeys(deployed_currencies or ['fUSD', 'fUST'])
+            )
         if challenger_dir:
             event['challenger_dir'] = challenger_dir
         history.append(event)
@@ -2126,23 +2259,40 @@ class RetrainingScheduler:
 
         # Step 4: 部署决策
         if is_better:
-            deploy_success = self.deploy_new_models(retrained_dir)
+            approved_currencies = comparison.get('approved_currencies', [])
+            deploy_success = self.deploy_new_models(
+                retrained_dir, approved_currencies
+            )
+            partial_deployment = (
+                deploy_success and set(approved_currencies) != {'fUSD', 'fUST'}
+            )
 
             self.log_retraining_event(
                 trigger=reason,
                 retrained=True,
                 deployed=deploy_success,
                 comparison=comparison,
-                outcome='deployed' if deploy_success else 'trained_not_deployed',
+                outcome=(
+                    'partially_deployed'
+                    if partial_deployment
+                    else 'deployed'
+                    if deploy_success
+                    else 'trained_not_deployed'
+                ),
                 training_data=training_snapshot,
+                challenger_dir=retrained_dir if partial_deployment else None,
+                deployed_currencies=approved_currencies if deploy_success else None,
             )
 
             if deploy_success:
                 print("\n" + "="*80)
                 print(" "*20 + "✅ 新模型已部署到生产环境")
                 print("="*80)
-                self.cleanup_old_artifacts(retrained_dir)
-                return 'deployed'
+                self.cleanup_old_artifacts(
+                    retrained_dir,
+                    preserve_retrained=partial_deployment,
+                )
+                return 'partially_deployed' if partial_deployment else 'deployed'
             else:
                 print("\n" + "="*80)
                 print(" "*20 + "⚠️  部署失败,保持现有模型")
@@ -2212,6 +2362,7 @@ def main():
         # exit code: 0=部署成功或训练成功但未部署, 1=训练失败, 2=无需重训练
         exit_code = {
             'deployed': 0,
+            'partially_deployed': 0,
             'trained_not_deployed': 0,
             'trained_not_better': 0,
             'not_needed': 2,

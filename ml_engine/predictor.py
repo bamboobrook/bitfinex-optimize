@@ -50,8 +50,8 @@ class EnsemblePredictor:
 
     def __init__(self, model_dir=None, max_workers=None):
         # Use absolute path for models directory
+        base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
         if model_dir is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             model_dir = os.path.join(base_dir, "data", "models")
         self.model_dir = model_dir
         cpu_count = os.cpu_count() or 8
@@ -64,11 +64,18 @@ class EnsemblePredictor:
         self._timestamp_deprecation_warned = False  # 废弃警告标志
         self.policy = load_system_policy()
         self.policy_version = get_policy_version(self.policy)
-        self.model_version = self._derive_model_version()
         self.db_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+            base_dir,
             "data", "lending_history.db"
         )
+        self._v2_calibration_state_path = os.path.join(
+            base_dir, "data", "v2_calibration_state.json"
+        )
+        self.model_versions = {
+            currency: self._derive_model_version(currency)
+            for currency in ("fUSD", "fUST")
+        }
+        self.model_version = self._derive_model_version()
         self.refresh_probe_state_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
             "data", "refresh_probe_state.json"
@@ -95,7 +102,7 @@ class EnsemblePredictor:
         # 加载所有模型
         self.load_all_models()
 
-    def _derive_model_version(self) -> str:
+    def _derive_model_version(self, currency: Optional[str] = None) -> str:
         """Build a stable identifier from the latest successful deployment."""
         try:
             history_path = os.path.join(
@@ -116,6 +123,13 @@ class EnsemblePredictor:
                 for entry in entries:
                     if not isinstance(entry, dict) or entry.get("deployed") is not True:
                         continue
+                    deployed_currencies = entry.get("deployed_currencies")
+                    if (
+                        currency
+                        and isinstance(deployed_currencies, list)
+                        and currency not in deployed_currencies
+                    ):
+                        continue
                     try:
                         deployed_times.append(
                             datetime.strptime(
@@ -133,6 +147,7 @@ class EnsemblePredictor:
                 os.path.join(self.model_dir, name)
                 for name in os.listdir(self.model_dir)
                 if name.endswith("_meta.json")
+                and (not currency or name.startswith(f"{currency}_"))
             ]
             if not meta_files:
                 return "model_unknown"
@@ -980,6 +995,155 @@ class EnsemblePredictor:
             "latest_validated_at": max((row[3] for row in rows), default=None),
         }
 
+    def _v2_calibration_policy(self) -> dict:
+        configured = self.policy.get("probability_calibration", {}) if hasattr(self, "policy") else {}
+        return {
+            "min_samples": int(configured.get("min_samples", 300)),
+            "min_class_samples": int(configured.get("min_class_samples", 40)),
+            "min_brier_improvement": float(configured.get("min_brier_improvement", 0.002)),
+            "max_consecutive_failures": int(configured.get("max_consecutive_failures", 3)),
+            "severe_brier_degradation": float(configured.get("severe_brier_degradation", 0.01)),
+            "bootstrap_mild_brier_delta": float(configured.get("bootstrap_mild_brier_delta", 0.002)),
+            "max_state_age_hours": float(configured.get("max_state_age_hours", 168)),
+        }
+
+    def _load_v2_calibration_state(self) -> dict:
+        path = getattr(self, "_v2_calibration_state_path", None)
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            return state if isinstance(state, dict) else {}
+        except Exception as exc:
+            logger.warning(f"Unable to load v2 calibration state: {exc}")
+            return {}
+
+    def _save_v2_calibration_state(self, state: dict):
+        path = getattr(self, "_v2_calibration_state_path", None)
+        if not path:
+            return
+        try:
+            self._atomic_write_json(path, state, indent=2)
+        except Exception as exc:
+            logger.warning(f"Unable to persist v2 calibration state: {exc}")
+
+    @staticmethod
+    def _calibrator_state_payload(calibrator: dict) -> dict:
+        keys = (
+            "slope", "intercept", "sample_count", "positive_count", "negative_count",
+            "latest_validated_at", "holdout_count", "holdout_raw_brier",
+            "holdout_calibrated_brier", "holdout_brier_delta",
+        )
+        return {key: calibrator.get(key) for key in keys if calibrator.get(key) is not None}
+
+    def _activate_v2_calibrator(self, result: dict, slope: float, intercept: float, reason: str) -> dict:
+        result.update({
+            "active": True,
+            "method": "v2_global_platt",
+            "reason": reason,
+            "slope": float(slope),
+            "intercept": float(intercept),
+            "consecutive_failures": 0,
+        })
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._save_v2_calibration_state({
+            "version": 1,
+            "updated_at": now_text,
+            "last_success_at": now_text,
+            "consecutive_failures": 0,
+            "last_failure_reason": None,
+            "active_calibrator": self._calibrator_state_payload(result),
+        })
+        return result
+
+    def _retain_or_fallback_v2_calibrator(
+        self,
+        result: dict,
+        candidate_parameters: Optional[tuple[float, float]] = None,
+    ) -> dict:
+        policy = self._v2_calibration_policy()
+        state = self._load_v2_calibration_state()
+        previous = state.get("active_calibrator") if isinstance(state, dict) else None
+        failures = int(state.get("consecutive_failures", 0) or 0) + 1
+        reason = str(result.get("reason", "calibration_gate_failed"))
+        brier_delta = result.get("holdout_brier_delta")
+        severe = reason in {"full_fit_unstable"}
+        if brier_delta is not None and np.isfinite(float(brier_delta)):
+            severe = severe or float(brier_delta) >= policy["severe_brier_degradation"]
+
+        now = datetime.now()
+        previous_age_hours = None
+        if isinstance(state, dict) and state.get("last_success_at"):
+            try:
+                previous_age_hours = (
+                    now - datetime.strptime(state["last_success_at"], "%Y-%m-%d %H:%M:%S")
+                ).total_seconds() / 3600.0
+            except (TypeError, ValueError):
+                previous_age_hours = None
+
+        reusable_previous = (
+            isinstance(previous, dict)
+            and previous.get("slope") is not None
+            and previous.get("intercept") is not None
+            and (previous_age_hours is None or previous_age_hours <= policy["max_state_age_hours"])
+        )
+        bootstrap_candidate = (
+            not reusable_previous
+            and reason == "time_split_gate_failed"
+            and candidate_parameters is not None
+            and brier_delta is not None
+            and np.isfinite(float(brier_delta))
+            and float(brier_delta) <= policy["bootstrap_mild_brier_delta"]
+        )
+
+        retained = None
+        retention_reason = None
+        if not severe and failures < policy["max_consecutive_failures"]:
+            if reusable_previous:
+                retained = previous
+                retention_reason = f"retained_after_{reason}"
+            elif bootstrap_candidate:
+                retained = {
+                    **self._calibrator_state_payload(result),
+                    "slope": float(candidate_parameters[0]),
+                    "intercept": float(candidate_parameters[1]),
+                }
+                retention_reason = "bootstrap_mild_gate_miss"
+
+        next_state = {
+            "version": 1,
+            "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "last_success_at": state.get("last_success_at"),
+            "consecutive_failures": failures,
+            "last_failure_reason": reason,
+            "last_gate": self._calibrator_state_payload(result),
+            "active_calibrator": previous,
+        }
+        if retained is not None:
+            next_state["active_calibrator"] = retained
+            if bootstrap_candidate:
+                next_state["last_success_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            result.update({
+                "active": True,
+                "method": "v2_global_platt_persisted",
+                "reason": retention_reason,
+                "slope": float(retained["slope"]),
+                "intercept": float(retained["intercept"]),
+                "consecutive_failures": failures,
+                "retained_calibrator_age_hours": previous_age_hours,
+            })
+        else:
+            result["consecutive_failures"] = failures
+            if severe:
+                result["fallback_detail"] = "severe_degradation"
+            elif failures >= policy["max_consecutive_failures"]:
+                result["fallback_detail"] = "consecutive_failure_limit"
+            elif reusable_previous is False and previous:
+                result["fallback_detail"] = "persisted_calibrator_expired"
+        self._save_v2_calibration_state(next_state)
+        return result
+
     def _build_v2_calibrator(self) -> dict:
         scores, labels, sample_meta = self._load_v2_calibration_samples()
         result = {
@@ -987,15 +1151,16 @@ class EnsemblePredictor:
             "method": "traditional_fallback",
             **sample_meta,
         }
-        min_samples = 300
-        min_class_samples = 40
+        policy = self._v2_calibration_policy()
+        min_samples = policy["min_samples"]
+        min_class_samples = policy["min_class_samples"]
         if (
             len(labels) < min_samples
             or int(labels.sum()) < min_class_samples
             or int((labels == 0).sum()) < min_class_samples
         ):
             result["reason"] = "insufficient_mature_labels"
-            return result
+            return self._retain_or_fallback_v2_calibrator(result)
 
         split = int(len(labels) * 0.75)
         split = min(max(split, 200), len(labels) - 80)
@@ -1008,7 +1173,7 @@ class EnsemblePredictor:
             or int((holdout_labels == 0).sum()) < 15
         ):
             result["reason"] = "insufficient_time_split_classes"
-            return result
+            return self._retain_or_fallback_v2_calibrator(result)
 
         slope, intercept = self._fit_platt_parameters(train_scores, train_labels)
         holdout_calibrated = self._apply_platt(holdout_scores, slope, intercept)
@@ -1022,22 +1187,26 @@ class EnsemblePredictor:
             "gate_slope": slope,
             "gate_intercept": intercept,
         })
-        if not (0.02 <= slope <= 12.0 and calibrated_brier <= raw_brier - 0.002):
+        if not (
+            0.02 <= slope <= 12.0
+            and calibrated_brier <= raw_brier - policy["min_brier_improvement"]
+        ):
             result["reason"] = "time_split_gate_failed"
-            return result
+            full_slope, full_intercept = self._fit_platt_parameters(scores, labels)
+            candidate = (
+                (full_slope, full_intercept)
+                if 0.02 <= full_slope <= 12.0
+                else None
+            )
+            return self._retain_or_fallback_v2_calibrator(result, candidate)
 
         slope, intercept = self._fit_platt_parameters(scores, labels)
         if not (0.02 <= slope <= 12.0):
             result["reason"] = "full_fit_unstable"
-            return result
-        result.update({
-            "active": True,
-            "method": "v2_global_platt",
-            "reason": "time_split_gate_passed",
-            "slope": slope,
-            "intercept": intercept,
-        })
-        return result
+            return self._retain_or_fallback_v2_calibrator(result)
+        return self._activate_v2_calibrator(
+            result, slope, intercept, "time_split_gate_passed"
+        )
 
     def _get_v2_calibrator(self) -> dict:
         cached = getattr(self, "_v2_calibrator_cache", None)
@@ -1257,12 +1426,17 @@ class EnsemblePredictor:
             _exec_calc = ExecutionFeatures()
             exec_rate_fast = _exec_calc.calculate_execution_rate(currency, period, fast_days)
             exec_rate_slow = _exec_calc.calculate_execution_rate(currency, period, slow_days)
+            guard_window_days = min(fast_days, 7)
+            quote_guard_exec_rate = _exec_calc.calculate_execution_rate(
+                currency, period, guard_window_days
+            )
             avg_rate_gap = _exec_calc.calculate_avg_rate_gap(currency, period, gap_days)
             order_count = _exec_calc.get_order_count(currency, period)
             logger.debug(
                 f"Live execution stats for {currency}-{period}: "
                 f"exec_rate_fast={exec_rate_fast:.4f}({fast_days}d), "
                 f"exec_rate_slow={exec_rate_slow:.4f}({slow_days}d), "
+                f"guard_exec_rate={quote_guard_exec_rate:.4f}({guard_window_days}d), "
                 f"avg_gap={avg_rate_gap:.4f}({gap_days}d), "
                 f"orders={order_count}"
             )
@@ -1270,6 +1444,8 @@ class EnsemblePredictor:
             logger.warning(f"Failed to get live execution stats for {currency}-{period}: {e}, using feature data")
             exec_rate_fast = row_data.get('exec_rate_fast', row_data.get('exec_rate_7d', 0.6))
             exec_rate_slow = row_data.get('exec_rate_slow', row_data.get('exec_rate_30d', 0.6))
+            quote_guard_exec_rate = exec_rate_fast
+            guard_window_days = min(fast_days, 7)
             avg_rate_gap = row_data.get('avg_rate_gap_failed_profile', row_data.get('avg_rate_gap_failed_7d', 0.0))
             order_count = 0
 
@@ -1560,7 +1736,16 @@ class EnsemblePredictor:
                 f"strategy={strategy_label}, reduction={reduction_pct:.1f}%)"
             )
         final_rate = clipped_rate
-        post_clipping_rate = float(clipped_rate)
+
+        final_rate, quote_guard_meta = self._apply_execution_quote_guard(
+            candidate_rate=float(final_rate),
+            current_rate=float(current_rate),
+            period=period,
+            execution_rate=float(quote_guard_exec_rate),
+            avg_rate_gap=float(avg_rate_gap),
+            order_count=int(order_count),
+        )
+        post_clipping_rate = float(final_rate)
 
         # Enforce policy step cap for selected periods (120d by default).
         final_rate, previous_rate, step_change_pct, step_capped, step_cap_pct = self._apply_period_step_cap(
@@ -1624,7 +1809,9 @@ class EnsemblePredictor:
         return {
             "currency": currency,
             "period": int(row_data['period']),
-            "model_version": self.model_version,
+            "model_version": getattr(self, "model_versions", {}).get(
+                currency, getattr(self, "model_version", "model_unknown")
+            ),
             "current_rate": current_rate,
             "predicted_rate": float(final_rate),
             "execution_probability": prob,
@@ -1642,6 +1829,9 @@ class EnsemblePredictor:
             ),
             "probability_calibration_intercept": (
                 float(platt_meta["intercept"]) if platt_meta.get("intercept") is not None else None
+            ),
+            "probability_calibration_failure_count": int(
+                platt_meta.get("consecutive_failures", 0) or 0
             ),
             "exec_rate_raw": float(exec_rate_fast),  # 原始历史成交率（用于流动性评分，不受模型滞后影响）
             "liquidity_score": liq_score,
@@ -1668,6 +1858,8 @@ class EnsemblePredictor:
             "execution_rate_slow": exec_rate_slow,
             "exec_rate_fast_window_days": fast_days,
             "exec_rate_slow_window_days": slow_days,
+            "quote_guard_exec_rate": float(quote_guard_exec_rate),
+            "quote_guard_window_days": int(guard_window_days),
             "avg_gap_window_days": gap_days,
             "execution_adjustment_applied": adjustment,
             "market_follow_error": market_follow_error,
@@ -1686,6 +1878,10 @@ class EnsemblePredictor:
             "step_cap_direction": step_cap_direction,
             "low_liquidity_floor_suppressed": low_liquidity_floor_suppressed,
             "low_liquidity_severity": low_liquidity_severity,
+            "quote_guard_applied": bool(quote_guard_meta["applied"]),
+            "quote_guard_rate_before": float(quote_guard_meta["rate_before"]),
+            "quote_guard_cap": quote_guard_meta["cap"],
+            "quote_guard_allowed_premium_pct": quote_guard_meta["allowed_premium_pct"],
             "clipping_strategy": strategy_label,
             "clipping_bounds": {"min": float(min_bound), "max": float(max_bound)}
         }
@@ -1830,6 +2026,76 @@ class EnsemblePredictor:
             guarded_bound = float(candidate_rate)
         return guarded_bound, bool(would_raise_candidate)
 
+    def _apply_execution_quote_guard(
+        self,
+        candidate_rate: float,
+        current_rate: float,
+        period: int,
+        execution_rate: float,
+        avg_rate_gap: float,
+        order_count: int,
+    ) -> tuple[float, dict]:
+        """Cap premium while a mature pair's recent fill rate is collapsing."""
+        config = self.policy.get("quote_guard", {}) if hasattr(self, "policy") else {}
+        rate_before = float(candidate_rate)
+        meta = {
+            "applied": False,
+            "rate_before": rate_before,
+            "cap": None,
+            "allowed_premium_pct": None,
+        }
+        if not bool(config.get("enabled", True)):
+            return rate_before, meta
+
+        min_orders = int(config.get("min_order_count", 10))
+        activation_rate = float(config.get("activation_execution_rate", 0.35))
+        if (
+            period <= 2
+            or current_rate <= 0
+            or rate_before <= current_rate
+            or order_count < min_orders
+            or execution_rate >= activation_rate
+        ):
+            return rate_before, meta
+
+        if period >= 60:
+            base_premium = float(config.get("long_base_premium_pct", 0.12))
+        elif period >= 8:
+            base_premium = float(config.get("medium_base_premium_pct", 0.15))
+        else:
+            base_premium = float(config.get("short_base_premium_pct", 0.18))
+
+        fill_severity = float(np.clip(
+            (activation_rate - max(execution_rate, 0.0)) / max(activation_rate, 1e-8),
+            0.0,
+            1.0,
+        ))
+        gap_ratio = max(avg_rate_gap, 0.0) / (current_rate + 1e-8)
+        gap_severity = float(np.clip((gap_ratio - 0.08) / 0.50, 0.0, 1.0))
+        severity = max(fill_severity, gap_severity * 0.75)
+        minimum_premium = float(config.get("minimum_premium_pct", 0.04))
+        severity_scale = float(config.get("severity_scale", 0.65))
+        allowed_premium = max(
+            minimum_premium,
+            base_premium * (1.0 - severity_scale * severity),
+        )
+        cap = float(current_rate * (1.0 + allowed_premium))
+        guarded_rate = min(rate_before, cap)
+        meta.update({
+            "applied": bool(guarded_rate < rate_before - 1e-12),
+            "cap": cap,
+            "allowed_premium_pct": allowed_premium,
+            "fill_severity": fill_severity,
+            "gap_severity": gap_severity,
+        })
+        if meta["applied"]:
+            logger.info(
+                f"Execution quote guard: period={period} {rate_before:.4f}->{guarded_rate:.4f} "
+                f"(recent_exec={execution_rate:.3f}, gap_ratio={gap_ratio:.3f}, "
+                f"premium_cap={allowed_premium:.1%})"
+            )
+        return float(guarded_rate), meta
+
     def _calc_fillability_signal(self, bid_levels: list) -> float:
         """
         Evaluate whether medium-size non-2d funding offers can be filled quickly.
@@ -1920,17 +2186,17 @@ class EnsemblePredictor:
                 continue
             try:
                 rate = float(row[0])
-                period = int(row[1])
+                level_period = int(row[1])
                 amount = float(row[3])
             except (TypeError, ValueError):
                 continue
 
             # Funding book: amount < 0 means bid. Ignore 2d to avoid short-term masking.
-            if amount >= 0 or period <= 2:
+            if amount >= 0 or level_period <= 2:
                 continue
             bid_levels.append({
                 "rate": self._annualize_rate(rate),
-                "period": period,
+                "period": level_period,
                 "amount": abs(amount),
             })
 
@@ -2693,6 +2959,11 @@ class EnsemblePredictor:
                 "probability_calibration_samples": "INTEGER",
                 "probability_calibration_slope": "REAL",
                 "probability_calibration_intercept": "REAL",
+                "probability_calibration_failure_count": "INTEGER",
+                "quote_guard_applied": "INTEGER",
+                "quote_guard_rate_before": "REAL",
+                "quote_guard_cap": "REAL",
+                "quote_guard_exec_rate": "REAL",
             }
             for column, col_type in required_columns.items():
                 if column not in existing:
@@ -3074,6 +3345,11 @@ class EnsemblePredictor:
                 int(pred.get("probability_calibration_samples", 0) or 0),
                 pred.get("probability_calibration_slope"),
                 pred.get("probability_calibration_intercept"),
+                int(pred.get("probability_calibration_failure_count", 0) or 0),
+                int(bool(pred.get("quote_guard_applied"))),
+                pred.get("quote_guard_rate_before"),
+                pred.get("quote_guard_cap"),
+                pred.get("quote_guard_exec_rate"),
             ))
 
         with self._connect_db(read_only=False) as conn:
@@ -3095,8 +3371,10 @@ class EnsemblePredictor:
                     v2_execution_probability, execution_ranking_score,
                     probability_calibration_method, probability_calibration_reason,
                     probability_calibration_samples, probability_calibration_slope,
-                    probability_calibration_intercept
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    probability_calibration_intercept,
+                    probability_calibration_failure_count, quote_guard_applied,
+                    quote_guard_rate_before, quote_guard_cap, quote_guard_exec_rate
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows
             )

@@ -117,6 +117,28 @@ def _write_model_meta_files(model_dir: Path, model_prefixes):
         (model_dir / f"{model_prefix}_meta.json").write_text("{}", encoding="utf-8")
 
 
+def _write_complete_currency_artifacts(model_dir: Path, currency: str, marker: str):
+    for model_type in [
+        "model_execution_prob",
+        "model_conservative",
+        "model_aggressive",
+        "model_balanced",
+        "model_execution_prob_v2",
+        "model_revenue_optimized",
+    ]:
+        prefix = f"{currency}_{model_type}"
+        (model_dir / f"{prefix}_meta.json").write_text(
+            json.dumps({
+                "weights": {"cat": 1.0},
+                "feature_cols": ["signal"],
+                "task_type": "classification" if "execution_prob" in model_type else "regression",
+                "marker": marker,
+            }),
+            encoding="utf-8",
+        )
+        (model_dir / f"{prefix}_cat.cbm").write_text(marker, encoding="utf-8")
+
+
 @pytest.fixture
 def scheduler_module(monkeypatch):
     _install_scheduler_import_stubs(monkeypatch)
@@ -435,6 +457,103 @@ def test_compare_models_requires_enhanced_models_even_when_production_is_missing
         "fUST_model_execution_prob_v2",
         "fUST_model_revenue_optimized",
     ]
+
+
+def test_model_performance_approves_fusd_without_fust(tmp_path, scheduler_module, monkeypatch):
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    validation = pd.DataFrame({
+        "actual_execution_binary": [0.0, 1.0] * 60,
+        "revenue_optimized_target": [1.0] * 120,
+    })
+    monkeypatch.setattr(
+        scheduler,
+        "_prepare_champion_validation_data",
+        lambda days=7, warmup_days=21: {"fUSD": validation, "fUST": validation},
+    )
+    old_eval = {
+        "overall_score": 0.64,
+        "currency_scores": {"fUSD": 0.63, "fUST": 0.64},
+        "metrics": {
+            "fUSD": {
+                "model_execution_prob_v2_eligible_samples": 60,
+                "model_execution_prob_v2_auc": 0.71,
+                "model_execution_prob_v2_brier": 0.22,
+                "model_revenue_optimized_eligible_samples": 60,
+                "model_revenue_optimized_mae": 0.42,
+            },
+            "fUST": {
+                "model_execution_prob_v2_eligible_samples": 60,
+                "model_execution_prob_v2_auc": 0.63,
+                "model_execution_prob_v2_brier": 0.27,
+                "model_revenue_optimized_eligible_samples": 60,
+                "model_revenue_optimized_mae": 0.50,
+            },
+        },
+    }
+    new_eval = {
+        "overall_score": 0.65,
+        "currency_scores": {"fUSD": 0.65, "fUST": 0.65},
+        "metrics": {
+            "fUSD": {
+                "model_execution_prob_v2_eligible_samples": 60,
+                "model_execution_prob_v2_auc": 0.704,
+                "model_execution_prob_v2_brier": 0.207,
+                "model_revenue_optimized_eligible_samples": 60,
+                "model_revenue_optimized_mae": 0.43,
+            },
+            "fUST": {
+                "model_execution_prob_v2_eligible_samples": 60,
+                "model_execution_prob_v2_auc": 0.629,
+                "model_execution_prob_v2_brier": 0.289,
+                "model_revenue_optimized_eligible_samples": 60,
+                "model_revenue_optimized_mae": 0.574,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        scheduler,
+        "_evaluate_model_dir_on_validation",
+        lambda model_dir, val_data: new_eval if model_dir == "new" else old_eval,
+    )
+    monkeypatch.setattr(scheduler, "_sanity_check_new_models", lambda *args: True)
+    monkeypatch.setattr(scheduler, "_evaluate_follow_and_stability", lambda days=7: (True, {}))
+
+    comparison = {"checks": {}, "metrics": {}}
+    approved = scheduler._compare_model_performance(
+        "old", "new", comparison, ["fUSD", "fUST"]
+    )
+
+    assert approved is True
+    assert comparison["approved_currencies"] == ["fUSD"]
+    assert "fUST" in comparison["rejected_currencies"]
+    assert comparison["checks"]["performance"] == "partial"
+
+
+def test_partial_currency_deployment_preserves_rejected_currency(
+    tmp_path, scheduler_module, monkeypatch
+):
+    production = tmp_path / "models"
+    challenger = tmp_path / "challenger"
+    production.mkdir()
+    challenger.mkdir()
+    for currency in ["fUSD", "fUST"]:
+        _write_complete_currency_artifacts(production, currency, "old")
+        _write_complete_currency_artifacts(challenger, currency, "new")
+
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(production),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    monkeypatch.setattr(scheduler, "_sanity_check_new_models", lambda *args: True)
+
+    assert scheduler.deploy_new_models(str(challenger), ["fUSD"]) is True
+    assert (production / "fUSD_model_balanced_cat.cbm").read_text() == "new"
+    assert (production / "fUST_model_balanced_cat.cbm").read_text() == "old"
 
 
 def test_follow_stability_and_divergence_checks_handle_missing_market_median_column(
@@ -981,6 +1100,41 @@ def test_production_deployment_time_prefers_successful_history_event(
     )
 
     assert scheduler._get_production_model_deployed_at() == (
+        __import__("datetime").datetime(2026, 4, 1, 10, 5, 0)
+    )
+
+
+def test_production_deployment_time_is_tracked_per_currency(
+    tmp_path, scheduler_module
+):
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    history = [
+        {
+            "timestamp": "2026-04-01 10:05:00",
+            "retrained": True,
+            "deployed": True,
+        },
+        {
+            "timestamp": "2026-04-10 12:00:00",
+            "retrained": True,
+            "deployed": True,
+            "deployed_currencies": ["fUSD"],
+        },
+    ]
+    (tmp_path / "retraining_history.json").write_text(
+        json.dumps(history), encoding="utf-8"
+    )
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(model_dir),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path),
+    )
+
+    assert scheduler._get_production_model_deployed_at("fUSD") == (
+        __import__("datetime").datetime(2026, 4, 10, 12, 0, 0)
+    )
+    assert scheduler._get_production_model_deployed_at("fUST") == (
         __import__("datetime").datetime(2026, 4, 1, 10, 5, 0)
     )
 

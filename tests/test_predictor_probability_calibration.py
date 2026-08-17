@@ -1,5 +1,7 @@
 import sys
 import threading
+import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -63,3 +65,54 @@ def test_v2_platt_falls_back_when_mature_labels_are_insufficient():
     assert probability is None
     assert calibrator["active"] is False
     assert calibrator["reason"] == "insufficient_mature_labels"
+
+
+def test_v2_platt_retains_last_valid_calibrator_after_one_mild_failure(tmp_path):
+    predictor = _predictor_with_samples([], [])
+    predictor.policy = {"probability_calibration": {"max_consecutive_failures": 3}}
+    predictor._v2_calibration_state_path = str(tmp_path / "calibration.json")
+    (tmp_path / "calibration.json").write_text(
+        json.dumps({
+            "last_success_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "consecutive_failures": 0,
+            "active_calibrator": {"slope": 0.75, "intercept": -0.25},
+        }),
+        encoding="utf-8",
+    )
+
+    result = predictor._retain_or_fallback_v2_calibrator({
+        "active": False,
+        "method": "traditional_fallback",
+        "reason": "time_split_gate_failed",
+        "holdout_brier_delta": 0.0004,
+    })
+
+    assert result["active"] is True
+    assert result["method"] == "v2_global_platt_persisted"
+    assert result["consecutive_failures"] == 1
+    assert result["slope"] == 0.75
+
+
+def test_v2_platt_falls_back_after_consecutive_failure_limit(tmp_path):
+    predictor = _predictor_with_samples([], [])
+    predictor.policy = {"probability_calibration": {"max_consecutive_failures": 3}}
+    predictor._v2_calibration_state_path = str(tmp_path / "calibration.json")
+    (tmp_path / "calibration.json").write_text(
+        json.dumps({
+            "last_success_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "consecutive_failures": 2,
+            "active_calibrator": {"slope": 0.75, "intercept": -0.25},
+        }),
+        encoding="utf-8",
+    )
+
+    result = predictor._retain_or_fallback_v2_calibrator({
+        "active": False,
+        "method": "traditional_fallback",
+        "reason": "time_split_gate_failed",
+        "holdout_brier_delta": 0.0004,
+    })
+
+    assert result["active"] is False
+    assert result["fallback_detail"] == "consecutive_failure_limit"
+    assert result["consecutive_failures"] == 3
