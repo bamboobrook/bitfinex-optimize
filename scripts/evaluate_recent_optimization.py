@@ -51,7 +51,8 @@ class WindowMetric:
         return (self.executed / self.total) if self.total else 0.0
 
 
-def infer_model_deployment_time(model_dir: Path) -> datetime | None:
+def infer_model_deployment_times(model_dir: Path) -> dict[str, datetime | None]:
+    deployed = {currency: None for currency in sorted(SUPPORTED_CURRENCIES)}
     history_path = model_dir.parent / "retraining_history.json"
     if history_path.exists():
         try:
@@ -63,28 +64,40 @@ def infer_model_deployment_time(model_dir: Path) -> datetime | None:
                 if isinstance(raw_history, dict)
                 else []
             )
-            deployed_times = []
-            for entry in entries:
+            for entry in reversed(entries):
                 if not isinstance(entry, dict) or entry.get("deployed") is not True:
                     continue
+                selected = entry.get("deployed_currencies")
                 try:
-                    deployed_times.append(
-                        datetime.strptime(
-                            entry.get("timestamp", ""),
-                            "%Y-%m-%d %H:%M:%S",
-                        )
+                    timestamp = datetime.strptime(
+                        entry.get("timestamp", ""), "%Y-%m-%d %H:%M:%S"
                     )
                 except (TypeError, ValueError):
                     continue
-            if deployed_times:
-                return max(deployed_times)
+                for currency in deployed:
+                    if deployed[currency] is not None:
+                        continue
+                    if isinstance(selected, list) and currency not in selected:
+                        continue
+                    deployed[currency] = timestamp
         except (OSError, json.JSONDecodeError):
             pass
 
-    meta_files = list(model_dir.glob("*_meta.json"))
-    if not meta_files:
-        return None
-    return datetime.fromtimestamp(max(path.stat().st_mtime for path in meta_files))
+    for currency in deployed:
+        if deployed[currency] is not None:
+            continue
+        meta_files = list(model_dir.glob(f"{currency}_*_meta.json"))
+        if meta_files:
+            deployed[currency] = datetime.fromtimestamp(
+                max(path.stat().st_mtime for path in meta_files)
+            )
+    return deployed
+
+
+def infer_model_deployment_time(model_dir: Path) -> datetime | None:
+    """Backward-compatible latest deployment helper."""
+    values = [value for value in infer_model_deployment_times(model_dir).values() if value]
+    return max(values) if values else None
 
 
 def _binary_auc(labels: list[int], scores: list[float]) -> float | None:
@@ -155,6 +168,7 @@ def _pearson(values_x: list[float], values_y: list[float]) -> float | None:
 def fetch_deployment_cohort_metrics(
     conn: sqlite3.Connection,
     deployed_at: datetime,
+    currency: str | None = None,
 ) -> dict:
     deployed_text = deployed_at.strftime("%Y-%m-%d %H:%M:%S")
     virtual_columns = _get_virtual_order_columns(conn)
@@ -192,6 +206,10 @@ def fetch_deployment_cohort_metrics(
         if "realized_terminal_value" in virtual_columns
         else "NULL"
     )
+    currency_clause = " AND v.currency = ?" if currency else ""
+    params = [deployed_text]
+    if currency:
+        params.append(currency)
     rows = conn.execute(
         f"""
         SELECT
@@ -225,9 +243,9 @@ def fetch_deployment_cohort_metrics(
               ORDER BY p2.rowid DESC
               LIMIT 1
           )
-        WHERE v.created_at >= ?
+        WHERE v.created_at >= ? {currency_clause}
         """,
-        (deployed_text,),
+        tuple(params),
     ).fetchall()
 
     status_counts = defaultdict(int)
@@ -303,6 +321,7 @@ def fetch_deployment_cohort_metrics(
     ]
     return {
         "deployed_at": deployed_text,
+        "currency": currency,
         "total": len(rows),
         "decided": decided,
         "pending": status_counts["PENDING"],
@@ -471,16 +490,18 @@ def fetch_freshness(conn: sqlite3.Connection) -> list[dict]:
 def fetch_prediction_history_status(conn: sqlite3.Connection) -> dict:
     row = conn.execute(
         """
-        SELECT COUNT(*), MIN(created_at), MAX(created_at), COUNT(DISTINCT update_cycle_id)
+        SELECT COUNT(*), MIN(prediction_timestamp), MAX(prediction_timestamp),
+               COUNT(DISTINCT update_cycle_id)
         FROM prediction_history
         """
     ).fetchone()
     latest_cycles = conn.execute(
         """
-        SELECT update_cycle_id, COUNT(*) AS rows, MAX(created_at) AS created_at
+        SELECT update_cycle_id, COUNT(*) AS rows,
+               MAX(prediction_timestamp) AS prediction_timestamp
         FROM prediction_history
         GROUP BY update_cycle_id
-        ORDER BY created_at DESC
+        ORDER BY prediction_timestamp DESC
         LIMIT 3
         """
     ).fetchall()
@@ -655,9 +676,14 @@ def main():
     prev_start = now - timedelta(days=args.days * 2)
 
     if args.deployment_at:
-        deployed_at = datetime.strptime(args.deployment_at, "%Y-%m-%d %H:%M:%S")
+        explicit_deployed_at = datetime.strptime(
+            args.deployment_at, "%Y-%m-%d %H:%M:%S"
+        )
+        deployed_by_currency = {
+            currency: explicit_deployed_at for currency in SUPPORTED_CURRENCIES
+        }
     else:
-        deployed_at = infer_model_deployment_time(model_dir)
+        deployed_by_currency = infer_model_deployment_times(model_dir)
 
     with sqlite3.connect(db_path) as conn:
         recent_overall = fetch_window_metric(conn, recent_start, now)
@@ -673,11 +699,15 @@ def main():
         history_status = fetch_prediction_history_status(conn)
         recent_path = fetch_path_metrics(conn, recent_start, now)
         previous_path = fetch_path_metrics(conn, prev_start, recent_start)
-        deployment_metrics = (
-            fetch_deployment_cohort_metrics(conn, deployed_at)
-            if deployed_at is not None
-            else None
-        )
+        deployment_metrics = {
+            currency: (
+                fetch_deployment_cohort_metrics(
+                    conn, deployed_at, currency=currency
+                )
+                if deployed_at is not None else None
+            )
+            for currency, deployed_at in deployed_by_currency.items()
+        }
 
     result_file = load_result_file(result_path)
     combo_deltas = build_combo_delta(recent_combo, previous_combo, args.min_combo_orders)
@@ -795,13 +825,17 @@ def main():
     print()
 
     print("八、当前生产模型成熟度")
-    if deployment_metrics is None:
+    if not any(deployment_metrics.values()):
         print("- 无法识别生产模型部署时间")
-    else:
-        metric = deployment_metrics
+    for currency in ["fUSD", "fUST"]:
+        metric = deployment_metrics.get(currency)
+        deployed_at = deployed_by_currency.get(currency)
+        if metric is None or deployed_at is None:
+            print(f"- {currency}: 无法识别生产模型部署时间")
+            continue
         model_age_hours = (now - deployed_at).total_seconds() / 3600.0
         print(
-            f"- 部署时间: {metric['deployed_at']} (age={model_age_hours:.1f}h), "
+            f"- {currency} 部署时间: {metric['deployed_at']} (age={model_age_hours:.1f}h), "
             f"成熟: {metric['decided']}/{metric['total']}, pending={metric['pending']}"
         )
         print(

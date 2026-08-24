@@ -31,6 +31,9 @@ SUPPORTED_PERIODS = {2, 3, 4, 5, 6, 7, 10, 14, 15, 20, 30, 60, 90, 120}
 # 健康阈值
 PIPELINE_STALE_HOURS = 5      # pipeline 超过 5h 没跑视为调度器卡死（正常 2h 一轮）
 PREDICTION_STALE_HOURS = 12   # optimal_combination.json 超过 12h 未更新视为预测异常
+BUSINESS_STALE_HOURS = 48
+MODEL_MAX_AGE_DAYS = 14
+CALIBRATION_MAX_FAILURES = 3
 API_STATUS_RETRIES = 3
 API_STATUS_RETRY_DELAY_SECONDS = 2
 
@@ -270,6 +273,65 @@ def check_prediction_output():
     return True
 
 
+def check_business_quality():
+    """检查模型年龄、校准门禁和持续 partial stale。"""
+    online, status_out, _ = _api_status_online()
+    if not online:
+        log("❌ 无法获取业务质量状态", "ERROR")
+        return False
+    try:
+        payload = json.loads(status_out)
+    except json.JSONDecodeError:
+        log("❌ /status 返回无法解析", "ERROR")
+        return False
+
+    service = payload.get("service_info") or {}
+    issues = []
+    for currency, age in (service.get("model_age_days_by_currency") or {}).items():
+        if int(age or 0) > MODEL_MAX_AGE_DAYS:
+            issues.append(f"{currency} 模型年龄 {age}d > {MODEL_MAX_AGE_DAYS}d")
+
+    calibration = service.get("probability_calibration") or {}
+    by_currency = calibration.get("by_currency") or {}
+    if by_currency:
+        for currency, state in by_currency.items():
+            failures = int((state or {}).get("consecutive_failures", 0) or 0)
+            if failures >= CALIBRATION_MAX_FAILURES:
+                issues.append(f"{currency} 校准连续失败 {failures} 次")
+    elif int(calibration.get("consecutive_failures", 0) or 0) >= CALIBRATION_MAX_FAILURES:
+        issues.append(
+            f"校准连续失败 {int(calibration.get('consecutive_failures', 0) or 0)} 次"
+        )
+
+    for currency, gate in (service.get("live_model_gate_by_currency") or {}).items():
+        if isinstance(gate, dict) and gate.get("rollback_required") is True:
+            issues.append(f"{currency} live gate 要求回滚")
+
+    result_path = os.path.join(DATA_DIR, "optimal_combination.json")
+    try:
+        with open(result_path, "r", encoding="utf-8") as result_file:
+            result = json.load(result_file)
+        stale_minutes = float(result.get("stale_minutes", 0) or 0)
+        if result.get("stale_data") and stale_minutes >= BUSINESS_STALE_HOURS * 60:
+            pairs = [
+                f"{item.get('currency')}-{item.get('period')}d"
+                for item in result.get("stale_issues", [])
+                if isinstance(item, dict)
+            ]
+            issues.append(
+                f"partial stale 持续 {stale_minutes / 60:.1f}h: {', '.join(pairs)}"
+            )
+    except (OSError, json.JSONDecodeError) as exc:
+        issues.append(f"无法读取业务结果: {exc}")
+
+    if issues:
+        for issue in issues:
+            log(f"❌ 业务质量降级: {issue}", "ERROR")
+        return False
+    log("✅ 模型年龄、校准和 live gate 业务质量正常")
+    return True
+
+
 def main():
     log("=" * 60)
     log(f"Bitfinex 预测程序健康检查 @ {datetime.now()}")
@@ -281,6 +343,7 @@ def main():
         ("Pipeline 时效", check_pipeline_freshness()),
         ("近期错误", check_recent_errors()),
         ("预测输出", check_prediction_output()),
+        ("业务质量", check_business_quality()),
     ]
 
     log("-" * 60)

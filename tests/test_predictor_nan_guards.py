@@ -174,6 +174,52 @@ def test_execution_quote_guard_leaves_recovered_pair_unchanged():
     assert meta["applied"] is False
 
 
+def test_quote_guard_cohort_uses_active_model_and_beta_smoothing(tmp_path):
+    db_path = tmp_path / "cohort.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                currency TEXT, period INTEGER, model_version TEXT,
+                status TEXT, decision_mode TEXT, created_at TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?, 'exploit', ?)",
+            [
+                ("fUSD", 3, "model_current", status, "2026-08-23 01:00:00")
+                for status in ["EXECUTED", "FAILED", "FAILED", "FAILED"]
+            ] + [
+                ("fUSD", 3, "model_old", "EXECUTED", "2026-08-22 01:00:00")
+                for _ in range(20)
+            ],
+        )
+
+    predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+    predictor.db_path = str(db_path)
+    predictor.model_deployed_at_by_currency = {}
+    predictor.policy = {"quote_guard": {}}
+
+    stats = predictor._get_current_model_cohort_execution_stats(
+        "fUSD", 3, "model_current"
+    )
+    guarded, meta = predictor._apply_execution_quote_guard(
+        candidate_rate=12.0,
+        current_rate=8.0,
+        period=3,
+        execution_rate=min(0.70, stats["smoothed_execution_rate"]),
+        avg_rate_gap=2.0,
+        order_count=100,
+    )
+
+    assert stats["decided"] == 4
+    assert stats["execution_rate"] == pytest.approx(0.25)
+    assert stats["smoothed_execution_rate"] == pytest.approx(1 / 3)
+    assert meta["applied"] is True
+    assert guarded < 12.0
+
+
 def test_funding_book_signal_filters_by_period_and_executable_rate():
     predictor = EnsemblePredictor.__new__(EnsemblePredictor)
     predictor._funding_book_cache = {}

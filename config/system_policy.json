@@ -51,10 +51,26 @@
     "max_execution_v2_brier": 0.25,
     "max_revenue_mae": 5.0
   },
+  "live_model_gate": {
+    "enabled": true,
+    "min_current_decided": 40,
+    "min_champion_decided": 80,
+    "min_execution_rate_drop": 0.15,
+    "max_brier": 0.25,
+    "max_ece": 0.15,
+    "max_observation_age_hours": 168
+  },
+  "currency_retrain_backoff": {
+    "base_hours": 24,
+    "max_hours": 168
+  },
   "probability_calibration": {
     "min_samples": 300,
     "min_class_samples": 40,
     "min_brier_improvement": 0.002,
+    "max_identity_brier": 0.25,
+    "max_identity_ece": 0.1,
+    "min_identity_auc": 0.5,
     "max_consecutive_failures": 3,
     "severe_brier_degradation": 0.01,
     "bootstrap_mild_brier_delta": 0.002,
@@ -68,7 +84,10 @@
     "medium_base_premium_pct": 0.15,
     "long_base_premium_pct": 0.12,
     "minimum_premium_pct": 0.04,
-    "severity_scale": 0.65
+    "severity_scale": 0.65,
+    "cohort_min_decided": 4,
+    "cohort_prior_success": 1,
+    "cohort_prior_failure": 1
   },
   "combo_optimizer": {
     "combo_mode": "shadow",

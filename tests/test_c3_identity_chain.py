@@ -68,6 +68,37 @@ class C3IdentityChainTest(unittest.TestCase):
                 "model_20260401_100500",
             )
 
+    def test_model_version_preserves_source_version_after_live_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            model_dir = data_dir / "models"
+            model_dir.mkdir()
+            (model_dir / "fUSD_model_balanced_meta.json").write_text("{}")
+            (data_dir / "retraining_history.json").write_text(
+                json.dumps([
+                    {
+                        "timestamp": "2026-08-23 00:32:41",
+                        "deployed": True,
+                        "deployed_currencies": ["fUSD"],
+                    },
+                    {
+                        "timestamp": "2026-08-24 12:00:00",
+                        "deployed": True,
+                        "deployed_currencies": ["fUSD"],
+                        "outcome": "rolled_back",
+                        "source_model_version": "model_20260819_223827",
+                    },
+                ]),
+                encoding="utf-8",
+            )
+            predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+            predictor.model_dir = str(model_dir)
+
+            self.assertEqual(
+                predictor._derive_model_version("fUSD"),
+                "model_20260819_223827",
+            )
+
     def test_prediction_history_and_virtual_orders_share_identity_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "lending_history.db"

@@ -32,6 +32,7 @@ DB_FILE = str(BASE_DIR / "data" / "lending_history.db")
 RETRAIN_STATE_FILE = str(BASE_DIR / "data" / "retraining_state.json")
 RETRAIN_HISTORY_FILE = str(BASE_DIR / "data" / "retraining_history.json")
 CALIBRATION_STATE_FILE = str(BASE_DIR / "data" / "v2_calibration_state.json")
+_live_gate_status_cache = {"loaded_at": None, "value": {}}
 
 
 def _atomic_write_json(path: str, payload: dict, indent: int = 4):
@@ -119,7 +120,7 @@ def save_retraining_state(
             state["backoff_until"] = (
                 datetime.now() + timedelta(hours=backoff_hours)
             ).strftime('%Y-%m-%d %H:%M:%S')
-        elif outcome in {"deployed", "partially_deployed"}:
+        elif outcome in {"deployed", "partially_deployed", "rolled_back"}:
             state["rejection_streak"] = 0
             state["backoff_until"] = None
 
@@ -148,7 +149,7 @@ def _parse_retraining_outcome(stdout: str) -> str:
     import re
 
     match = re.search(
-        r"重训练结果:\s*(partially_deployed|deployed|trained_not_deployed|trained_not_better|not_needed|train_failed)",
+        r"重训练结果:\s*(partially_deployed|deployed|rolled_back|trained_not_deployed|trained_not_better|not_needed|train_failed)",
         stdout or "",
     )
     return match.group(1) if match else "unknown"
@@ -165,6 +166,19 @@ def _parse_training_data_snapshot(stdout: str):
             return None
         return payload if isinstance(payload, dict) else None
     return None
+
+
+def _parse_live_model_gates(stdout: str) -> dict:
+    marker = "LIVE_MODEL_GATES="
+    for line in (stdout or "").splitlines():
+        if marker not in line:
+            continue
+        try:
+            payload = json.loads(line.split(marker, 1)[1])
+        except (json.JSONDecodeError, IndexError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+    return {}
 
 
 def _load_prediction_result():
@@ -254,25 +268,128 @@ def _calibration_runtime_status() -> dict:
             state = loaded if isinstance(loaded, dict) else {}
     except Exception as exc:
         logger.warning(f"Failed to read calibration state: {exc}")
+    latest_by_currency = {}
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            latest_cycle = conn.execute(
+                "SELECT update_cycle_id FROM prediction_history ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if latest_cycle:
+                for currency, method, failures, reason, model_version in conn.execute(
+                    """
+                    SELECT currency, probability_calibration_method,
+                           MAX(probability_calibration_failure_count),
+                           MAX(probability_calibration_reason), MAX(model_version)
+                    FROM prediction_history
+                    WHERE update_cycle_id = ?
+                    GROUP BY currency, probability_calibration_method
+                    """,
+                    (latest_cycle[0],),
+                ):
+                    latest_by_currency[currency] = {
+                        "method": method,
+                        "consecutive_failures": int(failures or 0),
+                        "last_failure_reason": reason,
+                        "model_version": model_version,
+                    }
+    except Exception as exc:
+        logger.warning(f"Failed to read latest calibration methods: {exc}")
+
+    result_methods = set()
     latest_result = _load_prediction_result() or {}
-    recommendations = latest_result.get("recommendations", []) if isinstance(latest_result, dict) else []
-    methods = set()
-    for item in recommendations:
+    for item in latest_result.get("recommendations", []) if isinstance(latest_result, dict) else []:
         if not isinstance(item, dict):
             continue
-        details = item.get("details")
-        method = item.get("probability_calibration_method")
-        if not method and isinstance(details, dict):
-            method = details.get("probability_calibration_method")
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        method = item.get("probability_calibration_method") or details.get(
+            "probability_calibration_method"
+        )
         if method:
-            methods.add(str(method))
-    return {
-        "methods": sorted(methods),
-        "consecutive_failures": int(state.get("consecutive_failures", 0) or 0),
-        "last_failure_reason": state.get("last_failure_reason"),
-        "last_success_at": state.get("last_success_at"),
-        "updated_at": state.get("updated_at"),
+            result_methods.add(str(method))
+
+    state_by_currency = (
+        state.get("currencies", {})
+        if state.get("version") == 2 and isinstance(state.get("currencies"), dict)
+        else {}
+    )
+    by_currency = {}
+    for currency in ("fUSD", "fUST"):
+        persisted = state_by_currency.get(currency, {})
+        latest = latest_by_currency.get(currency, {})
+        active = persisted.get("active_calibrator") or {}
+        by_currency[currency] = {
+            **latest,
+            "method": latest.get("method") or active.get("method") or "traditional_fallback",
+            "model_version": latest.get("model_version") or persisted.get("model_version"),
+            "consecutive_failures": int(
+                persisted.get("consecutive_failures", latest.get("consecutive_failures", 0)) or 0
+            ),
+            "last_failure_reason": (
+                persisted.get("last_failure_reason")
+                or latest.get("last_failure_reason")
+                if int(persisted.get("consecutive_failures", latest.get("consecutive_failures", 0)) or 0) > 0
+                else None
+            ),
+            "last_success_at": persisted.get("last_success_at"),
+            "updated_at": persisted.get("updated_at"),
+            "last_gate": persisted.get("last_gate"),
+        }
+    state_methods = {
+        by_currency[currency]["method"]
+        for currency in by_currency
+        if currency in latest_by_currency or currency in state_by_currency
     }
+    methods = sorted(state_methods | result_methods)
+    max_failures = max(
+        (int(item.get("consecutive_failures", 0) or 0) for item in by_currency.values()),
+        default=int(state.get("consecutive_failures", 0) or 0),
+    )
+    successful_times = [
+        item.get("last_success_at") for item in by_currency.values()
+        if item.get("last_success_at")
+    ]
+    updated_times = [
+        item.get("updated_at") for item in by_currency.values()
+        if item.get("updated_at")
+    ]
+    aggregate_failure_reason = next((
+        item.get("last_failure_reason")
+        for item in sorted(
+            by_currency.values(),
+            key=lambda value: int(value.get("consecutive_failures", 0) or 0),
+            reverse=True,
+        )
+        if item.get("last_failure_reason")
+    ), None)
+    return {
+        "methods": methods,
+        "consecutive_failures": max_failures,
+        "last_failure_reason": aggregate_failure_reason or state.get("last_failure_reason"),
+        "last_success_at": max(successful_times) if successful_times else state.get("last_success_at"),
+        "updated_at": max(updated_times) if updated_times else state.get("updated_at"),
+        "by_currency": by_currency,
+    }
+
+
+def _live_model_gate_status() -> dict:
+    loaded_at = _live_gate_status_cache.get("loaded_at")
+    if loaded_at and (datetime.now() - loaded_at).total_seconds() < 60:
+        return _live_gate_status_cache.get("value", {})
+    try:
+        from ml_engine.retraining_scheduler import RetrainingScheduler
+
+        scheduler = RetrainingScheduler(
+            db_path=DB_FILE,
+            production_model_dir=str(BASE_DIR / "data" / "models"),
+            backup_dir=str(BASE_DIR / "data" / "models_backup"),
+            log_dir=str(BASE_DIR / "data"),
+        )
+        value = scheduler.evaluate_live_model_gates()
+        _live_gate_status_cache.update({"loaded_at": datetime.now(), "value": value})
+        return value
+    except Exception as exc:
+        logger.warning(f"Failed to calculate live model gates: {exc}")
+        return {}
 
 
 def _extract_prediction_failure(result):
@@ -1139,15 +1256,29 @@ async def run_full_pipeline():
         logger.info("Step 3: 🤖 Checking if model retraining is needed (closed-loop)")
 
         should_retrain = False
+        live_rollback_currencies = []
         try:
             stdout, stderr, rc = await _run_subprocess_with_timeout(
                 [sys.executable, str(BASE_DIR / "ml_engine" / "retraining_scheduler.py"), "--dry-run"],
                 BASE_DIR, TIMEOUT_VALIDATE, "Retraining Check"
             )
+            live_gates = _parse_live_model_gates(stdout or "")
+            live_rollback_currencies = sorted(
+                currency
+                for currency, gate in live_gates.items()
+                if isinstance(gate, dict) and gate.get("rollback_required") is True
+            )
+            if live_rollback_currencies:
+                logger.warning(
+                    "Live model rollback required: "
+                    + ", ".join(live_rollback_currencies)
+                )
 
             # 检查输出中是否包含实际触发信号（排除标题"🔍 检查是否需要重训练"的误匹配）
             # 方案B: 匹配实际触发行前缀 "⚠️  需要重训练" 或 "✅ 需要重训练"
-            if "⚠️  需要重训练" in stdout or "✅ 需要重训练" in stdout:
+            if live_rollback_currencies:
+                should_retrain = False
+            elif "⚠️  需要重训练" in stdout or "✅ 需要重训练" in stdout:
                 # 极端低流动性（exec_rate < 10%）：绕过冷却强制重训
                 _bypass_cooldown = False
                 if "全局成交率过低" in stdout:
@@ -1218,8 +1349,32 @@ async def run_full_pipeline():
             logger.warning(f"⚠️  Retraining check failed: {e}, skipping retraining")
         # ====================================================================
 
-        # ========== STEP 4: 执行模型重训练 (如果需要) ==========
-        if should_retrain:
+        # ========== STEP 4: live rollback 或模型重训练 ==========
+        if live_rollback_currencies:
+            update_status(
+                "processing", "4. Rolling Back Models",
+                "Applying live quality gate rollback...",
+            )
+            for currency in live_rollback_currencies:
+                stdout, stderr, rc = await _run_subprocess_with_timeout(
+                    [
+                        sys.executable,
+                        str(BASE_DIR / "ml_engine" / "retraining_scheduler.py"),
+                        "--apply-live-rollback",
+                        currency,
+                    ],
+                    BASE_DIR,
+                    TIMEOUT_VALIDATE,
+                    f"Live Rollback {currency}",
+                )
+                if stdout:
+                    logger.info(f"Live rollback output ({currency}):\n{stdout[-2000:]}")
+                if rc != 0:
+                    detail = stderr or stdout or "unknown rollback failure"
+                    logger.error(f"Live rollback failed for {currency}: {detail[-500:]}")
+                    degraded_msg = f"Live rollback failed: {currency}"
+                    pipeline_degraded_reasons.append(degraded_msg)
+        elif should_retrain:
             update_status("processing", "4. Retraining Models", "Training models with execution feedback...")
             logger.info("Step 4: 🚀 Retraining models with execution feedback (CLOSED-LOOP)")
 
@@ -1417,6 +1572,7 @@ def check_status():
     }
     status_info["model_cohort_by_currency"] = _model_cohort_status(deployment_times)
     status_info["probability_calibration"] = _calibration_runtime_status()
+    status_info["live_model_gate_by_currency"] = _live_model_gate_status()
     status_info["model_age_days"] = max(age_by_currency.values(), default=999)
 
     stale_currencies = [

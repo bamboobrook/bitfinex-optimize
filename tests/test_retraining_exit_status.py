@@ -556,6 +556,48 @@ def test_partial_currency_deployment_preserves_rejected_currency(
     assert (production / "fUST_model_balanced_cat.cbm").read_text() == "old"
 
 
+def test_live_rollback_restores_only_failed_currency_and_logs_source(
+    tmp_path, scheduler_module, monkeypatch
+):
+    backup = tmp_path / "backup" / "production_20260823_003241"
+    backup.mkdir(parents=True)
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path),
+    )
+    gate = {
+        "currency": "fUSD",
+        "rollback_required": True,
+        "deployed_at": "2026-08-23 00:32:41",
+        "current_model_version": "model_20260823_003241",
+        "previous_model_version": "model_20260819_223827",
+    }
+    deployed = []
+    logged = []
+    monkeypatch.setattr(
+        scheduler, "evaluate_live_model_gate", lambda currency: gate
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "deploy_new_models",
+        lambda model_dir, currencies: deployed.append((model_dir, currencies)) or True,
+    )
+    monkeypatch.setattr(
+        scheduler, "_currency_artifact_digest", lambda *args: "unchanged"
+    )
+    monkeypatch.setattr(
+        scheduler, "log_retraining_event", lambda **kwargs: logged.append(kwargs)
+    )
+
+    outcome = scheduler.rollback_live_model("fUSD")
+
+    assert outcome == "rolled_back"
+    assert deployed == [(str(backup), ["fUSD"])]
+    assert logged[0]["outcome"] == "rolled_back"
+    assert logged[0]["source_model_version"] == "model_20260819_223827"
+
+
 def test_follow_stability_and_divergence_checks_handle_missing_market_median_column(
     tmp_path, scheduler_module
 ):
@@ -1139,6 +1181,135 @@ def test_production_deployment_time_is_tracked_per_currency(
     )
 
 
+def test_live_model_gate_waits_for_40_then_requires_rollback(
+    tmp_path, scheduler_module
+):
+    db_path = tmp_path / "live_gate.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                order_id TEXT PRIMARY KEY, currency TEXT, period INTEGER,
+                status TEXT, validation_window_hours INTEGER, created_at TEXT,
+                model_version TEXT, decision_mode TEXT, update_cycle_id TEXT,
+                candidate_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE prediction_history (
+                id INTEGER PRIMARY KEY, update_cycle_id TEXT, currency TEXT,
+                period INTEGER, candidate_id TEXT,
+                calibrated_execution_probability REAL
+            )
+            """
+        )
+        rows = []
+        predictions = []
+        for prefix, version, count, executed, created_at, probability in [
+            ("old", "model_20260819_223827", 80, 64, "2026-08-20 00:00:00", 0.75),
+            ("new", "model_20260823_003241", 40, 10, "2026-08-23 01:00:00", 0.70),
+        ]:
+            for index in range(count):
+                cycle = f"{prefix}_{index}"
+                status = "EXECUTED" if index < executed else "FAILED"
+                rows.append((
+                    cycle, "fUSD", 3, status, 24, created_at, version,
+                    "exploit", cycle, cycle,
+                ))
+                predictions.append((cycle, "fUSD", 3, cycle, probability))
+        conn.executemany(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.executemany(
+            """
+            INSERT INTO prediction_history(
+                update_cycle_id, currency, period, candidate_id,
+                calibrated_execution_probability
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            predictions,
+        )
+
+    history = [
+        {
+            "timestamp": "2026-08-19 22:38:27",
+            "deployed": True,
+            "deployed_currencies": ["fUSD"],
+        },
+        {
+            "timestamp": "2026-08-23 00:32:41",
+            "deployed": True,
+            "deployed_currencies": ["fUSD"],
+        },
+    ]
+    (tmp_path / "retraining_history.json").write_text(
+        json.dumps(history), encoding="utf-8"
+    )
+    scheduler = scheduler_module.RetrainingScheduler(
+        db_path=str(db_path),
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path),
+    )
+    scheduler.policy = {
+        "live_model_gate": {
+            "enabled": True,
+            "min_current_decided": 40,
+            "min_champion_decided": 80,
+            "min_execution_rate_drop": 0.15,
+            "max_brier": 0.25,
+            "max_ece": 0.15,
+            "max_observation_age_hours": 100000,
+        }
+    }
+
+    gate = scheduler.evaluate_live_model_gate("fUSD")
+
+    assert gate["ready"] is True
+    assert gate["current"]["decided"] == 40
+    assert gate["previous"]["decided"] == 80
+    assert gate["rollback_required"] is True
+    assert gate["execution_rate_drop"] == pytest.approx(0.55)
+
+
+def test_partial_deploy_rejection_backoff_is_currency_specific(
+    tmp_path, scheduler_module
+):
+    history = [
+        {
+            "timestamp": "2026-08-20 00:00:00",
+            "deployed": True,
+            "deployed_currencies": ["fUSD"],
+            "comparison": {"rejected_currencies": {"fUST": ["brier"]}},
+        },
+        {
+            "timestamp": "2026-08-23 00:00:00",
+            "deployed": True,
+            "deployed_currencies": ["fUSD"],
+            "comparison": {"rejected_currencies": {"fUST": ["mae"]}},
+        },
+    ]
+    (tmp_path / "retraining_history.json").write_text(
+        json.dumps(history), encoding="utf-8"
+    )
+    scheduler = scheduler_module.RetrainingScheduler(
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path),
+    )
+    scheduler.policy = {
+        "currency_retrain_backoff": {"base_hours": 24, "max_hours": 168}
+    }
+
+    assert scheduler._currency_retrain_backoff_until("fUSD") is None
+    assert scheduler._currency_retrain_backoff_until("fUST") == (
+        __import__("datetime").datetime(2026, 8, 25, 0, 0, 0)
+    )
+
+
 def test_should_retrain_skips_quality_triggers_during_post_deploy_grace(
     tmp_path, scheduler_module, monkeypatch
 ):
@@ -1171,17 +1342,17 @@ def test_should_retrain_skips_quality_triggers_during_post_deploy_grace(
 
     monkeypatch.setattr(scheduler_module, "datetime", _FrozenDatetime)
     monkeypatch.setattr(scheduler, "count_new_execution_results", lambda since_date: 0)
-    monkeypatch.setattr(scheduler, "_count_orders_since", lambda since_dt: 100)
+    monkeypatch.setattr(scheduler, "_count_orders_since", lambda since_dt, currency=None: 100)
     monkeypatch.setattr(
         scheduler,
         "_count_long_window_orders_since",
-        lambda since_dt: 0,
+            lambda since_dt, currency=None: 0,
     )
-    monkeypatch.setattr(scheduler, "get_recent_execution_rate", lambda days=7, since_dt=None: 0.51)
+    monkeypatch.setattr(scheduler, "get_recent_execution_rate", lambda days=7, since_dt=None, currency=None: 0.51)
     monkeypatch.setattr(
         scheduler,
         "get_per_period_execution_anomalies",
-        lambda days=7, since_dt=None: [
+            lambda days=7, since_dt=None, currency=None: [
             {
                 "currency": "fUST",
                 "period": 120,
@@ -1194,7 +1365,7 @@ def test_should_retrain_skips_quality_triggers_during_post_deploy_grace(
     monkeypatch.setattr(
         scheduler,
         "_get_follow_stability_metrics",
-        lambda days=7, since_dt=None: {
+            lambda days=7, since_dt=None, currency=None: {
             "samples": 100,
             "follow_mae": 1.7,
             "follow_mae_ratio": 0.28,
@@ -1203,8 +1374,8 @@ def test_should_retrain_skips_quality_triggers_during_post_deploy_grace(
             "p120_step_p95": 0.20,
         },
     )
-    monkeypatch.setattr(scheduler, "_check_zero_liquidity_anomaly", lambda since_dt=None: [])
-    monkeypatch.setattr(scheduler, "_check_market_divergence_trigger", lambda since_dt=None: False)
+    monkeypatch.setattr(scheduler, "_check_zero_liquidity_anomaly", lambda since_dt=None, currency=None: [])
+    monkeypatch.setattr(scheduler, "_check_market_divergence_trigger", lambda since_dt=None, currency=None: False)
 
     should_retrain, reason = scheduler.should_retrain()
 
@@ -1348,11 +1519,11 @@ def test_should_retrain_uses_post_deploy_window_for_quality_triggers(
     monkeypatch.setattr(scheduler_module, "datetime", _FrozenDatetime)
     monkeypatch.setattr(scheduler, "count_new_execution_results", lambda since_date: 0)
 
-    def _recent_exec(days=7, since_dt=None):
+    def _recent_exec(days=7, since_dt=None, currency=None):
         captured["exec_since"] = since_dt
         return 0.51
 
-    def _period_anomalies(days=7, since_dt=None):
+    def _period_anomalies(days=7, since_dt=None, currency=None):
         captured["period_since"] = since_dt
         return [
             {
@@ -1369,7 +1540,7 @@ def test_should_retrain_uses_post_deploy_window_for_quality_triggers(
     monkeypatch.setattr(
         scheduler,
         "_get_follow_stability_metrics",
-        lambda days=7, since_dt=None: {
+        lambda days=7, since_dt=None, currency=None: {
             "samples": 20,
             "follow_mae": 0.0,
             "follow_mae_ratio": 0.0,
@@ -1378,17 +1549,17 @@ def test_should_retrain_uses_post_deploy_window_for_quality_triggers(
             "p120_step_p95": 0.0,
         },
     )
-    monkeypatch.setattr(scheduler, "_check_zero_liquidity_anomaly", lambda since_dt=None: [])
-    monkeypatch.setattr(scheduler, "_check_market_divergence_trigger", lambda since_dt=None: False)
+    monkeypatch.setattr(scheduler, "_check_zero_liquidity_anomaly", lambda since_dt=None, currency=None: [])
+    monkeypatch.setattr(scheduler, "_check_market_divergence_trigger", lambda since_dt=None, currency=None: False)
     monkeypatch.setattr(
         scheduler,
         "_count_orders_since",
-        lambda since_dt: 60,
+        lambda since_dt, currency=None: 60,
     )
     monkeypatch.setattr(
         scheduler,
         "_count_long_window_orders_since",
-        lambda since_dt: 0,
+        lambda since_dt, currency=None: 0,
     )
 
     should_retrain, reason = scheduler.should_retrain()
@@ -1439,22 +1610,22 @@ def test_should_retrain_defers_high_execution_until_full_validation_window(
     }
     monkeypatch.setattr(scheduler_module, "datetime", _FrozenDatetime)
     monkeypatch.setattr(scheduler, "count_new_execution_results", lambda since_date: 0)
-    monkeypatch.setattr(scheduler, "_count_orders_since", lambda since_dt: 100)
+    monkeypatch.setattr(scheduler, "_count_orders_since", lambda since_dt, currency=None: 100)
     monkeypatch.setattr(
         scheduler,
         "_count_long_window_orders_since",
-        lambda since_dt: 0,
+            lambda since_dt, currency=None: 0,
     )
-    monkeypatch.setattr(scheduler, "get_recent_execution_rate", lambda days=7, since_dt=None: 0.90)
+    monkeypatch.setattr(scheduler, "get_recent_execution_rate", lambda days=7, since_dt=None, currency=None: 0.90)
     monkeypatch.setattr(
         scheduler,
         "get_per_period_execution_anomalies",
-        lambda days=7, since_dt=None: [high_anomaly],
+            lambda days=7, since_dt=None, currency=None: [high_anomaly],
     )
     monkeypatch.setattr(
         scheduler,
         "_get_follow_stability_metrics",
-        lambda days=7, since_dt=None: {
+            lambda days=7, since_dt=None, currency=None: {
             "samples": 100,
             "follow_mae": 0.0,
             "follow_mae_ratio": 0.0,
@@ -1463,8 +1634,8 @@ def test_should_retrain_defers_high_execution_until_full_validation_window(
             "p120_step_p95": 0.0,
         },
     )
-    monkeypatch.setattr(scheduler, "_check_zero_liquidity_anomaly", lambda since_dt=None: [])
-    monkeypatch.setattr(scheduler, "_check_market_divergence_trigger", lambda since_dt=None: False)
+    monkeypatch.setattr(scheduler, "_check_zero_liquidity_anomaly", lambda since_dt=None, currency=None: [])
+    monkeypatch.setattr(scheduler, "_check_market_divergence_trigger", lambda since_dt=None, currency=None: False)
 
     should_retrain, reason = scheduler.should_retrain()
     output = capsys.readouterr().out
@@ -1509,18 +1680,18 @@ def test_should_retrain_allows_high_execution_after_full_validation_window(
 
     monkeypatch.setattr(scheduler_module, "datetime", _FrozenDatetime)
     monkeypatch.setattr(scheduler, "count_new_execution_results", lambda since_date: 0)
-    monkeypatch.setattr(scheduler, "_count_orders_since", lambda since_dt: 160)
+    monkeypatch.setattr(scheduler, "_count_orders_since", lambda since_dt, currency=None: 160)
     monkeypatch.setattr(
         scheduler,
         "_count_long_window_orders_since",
-        lambda since_dt: 25,
+            lambda since_dt, currency=None: 25,
     )
-    monkeypatch.setattr(scheduler, "get_recent_execution_rate", lambda days=7, since_dt=None: 0.90)
-    monkeypatch.setattr(scheduler, "get_per_period_execution_anomalies", lambda days=7, since_dt=None: [])
+    monkeypatch.setattr(scheduler, "get_recent_execution_rate", lambda days=7, since_dt=None, currency=None: 0.90)
+    monkeypatch.setattr(scheduler, "get_per_period_execution_anomalies", lambda days=7, since_dt=None, currency=None: [])
     monkeypatch.setattr(
         scheduler,
         "_get_follow_stability_metrics",
-        lambda days=7, since_dt=None: {
+            lambda days=7, since_dt=None, currency=None: {
             "samples": 160,
             "follow_mae": 0.0,
             "follow_mae_ratio": 0.0,

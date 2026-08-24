@@ -178,6 +178,256 @@ class RetrainingScheduler:
         entries.sort(key=_entry_ts)
         return entries
 
+    @staticmethod
+    def _deployment_model_version(entry: Dict) -> Optional[str]:
+        source = entry.get('source_model_version')
+        if source:
+            return str(source)
+        try:
+            deployed_at = datetime.strptime(
+                entry.get('timestamp', ''), '%Y-%m-%d %H:%M:%S'
+            )
+        except (TypeError, ValueError):
+            return None
+        return f"model_{deployed_at.strftime('%Y%m%d_%H%M%S')}"
+
+    def _currency_deployment_entries(self, currency: str) -> List[Dict]:
+        result = []
+        for entry in self._load_retraining_history_entries():
+            if entry.get('deployed') is not True:
+                continue
+            selected = entry.get('deployed_currencies')
+            if isinstance(selected, list) and currency not in selected:
+                continue
+            if self._deployment_model_version(entry):
+                result.append(entry)
+        return result
+
+    @staticmethod
+    def _expected_calibration_error(labels: List[int], scores: List[float]) -> Optional[float]:
+        if not labels:
+            return None
+        total = len(labels)
+        error = 0.0
+        for index in range(10):
+            lower = index / 10.0
+            upper = (index + 1) / 10.0
+            selected = [
+                (label, score)
+                for label, score in zip(labels, scores)
+                if lower <= score < upper or (index == 9 and score == 1.0)
+            ]
+            if not selected:
+                continue
+            observed = sum(label for label, _ in selected) / len(selected)
+            predicted = sum(score for _, score in selected) / len(selected)
+            error += len(selected) / total * abs(observed - predicted)
+        return float(error)
+
+    def _fetch_live_model_metrics(
+        self,
+        currency: str,
+        model_version: str,
+        since_dt: Optional[datetime] = None,
+        validation_windows: Optional[List[int]] = None,
+    ) -> Dict:
+        clauses = [
+            "v.currency = ?",
+            "v.model_version = ?",
+            "v.status IN ('EXECUTED', 'FAILED')",
+        ]
+        params: List = [currency, model_version]
+        if since_dt is not None:
+            clauses.append("v.created_at >= ?")
+            params.append(since_dt.strftime('%Y-%m-%d %H:%M:%S'))
+        if validation_windows:
+            placeholders = ", ".join("?" for _ in validation_windows)
+            clauses.append(f"v.validation_window_hours IN ({placeholders})")
+            params.extend(int(value) for value in validation_windows)
+
+        with sqlite3.connect(self.db_path) as conn:
+            columns = {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info(virtual_orders)"
+                ).fetchall()
+            }
+            if "decision_mode" in columns:
+                clauses.append("COALESCE(v.decision_mode, 'exploit') = 'exploit'")
+            rows = conn.execute(
+                f"""
+                SELECT
+                    v.status,
+                    v.validation_window_hours,
+                    p.calibrated_execution_probability
+                FROM virtual_orders AS v
+                LEFT JOIN prediction_history AS p
+                  ON p.rowid = (
+                      SELECT p2.rowid
+                      FROM prediction_history AS p2
+                      WHERE p2.update_cycle_id = v.update_cycle_id
+                        AND p2.currency = v.currency
+                        AND p2.period = v.period
+                        AND (
+                            v.candidate_id IS NULL
+                            OR p2.candidate_id = v.candidate_id
+                        )
+                      ORDER BY p2.rowid DESC
+                      LIMIT 1
+                  )
+                WHERE {' AND '.join(clauses)}
+                """,
+                tuple(params),
+            ).fetchall()
+
+        labels = [1 if row[0] == 'EXECUTED' else 0 for row in rows]
+        probabilities = [
+            float(row[2]) for row in rows if row[2] is not None
+        ]
+        probability_labels = [
+            label for label, row in zip(labels, rows) if row[2] is not None
+        ]
+        brier = None
+        if probability_labels:
+            brier = sum(
+                (score - label) ** 2
+                for label, score in zip(probability_labels, probabilities)
+            ) / len(probability_labels)
+        return {
+            "decided": len(rows),
+            "executed": sum(labels),
+            "execution_rate": (sum(labels) / len(rows)) if rows else None,
+            "brier": brier,
+            "ece": self._expected_calibration_error(
+                probability_labels, probabilities
+            ),
+            "validation_windows": sorted({int(row[1] or 0) for row in rows}),
+        }
+
+    def evaluate_live_model_gate(self, currency: str) -> Dict:
+        config = self.policy.get('live_model_gate', {})
+        deployments = self._currency_deployment_entries(currency)
+        result = {
+            "currency": currency,
+            "enabled": bool(config.get('enabled', True)),
+            "ready": False,
+            "rollback_required": False,
+        }
+        if not result["enabled"] or len(deployments) < 2:
+            result["reason"] = "insufficient_deployment_history"
+            return result
+
+        current_entry = deployments[-1]
+        previous_entry = deployments[-2]
+        current_version = self._deployment_model_version(current_entry)
+        previous_version = self._deployment_model_version(previous_entry)
+        deployed_at = datetime.strptime(
+            current_entry['timestamp'], '%Y-%m-%d %H:%M:%S'
+        )
+        current = self._fetch_live_model_metrics(
+            currency, current_version, since_dt=deployed_at
+        )
+        if current_entry.get('outcome') == 'rolled_back':
+            result.update({
+                "deployed_at": current_entry['timestamp'],
+                "age_hours": (datetime.now() - deployed_at).total_seconds() / 3600.0,
+                "current_model_version": current_version,
+                "current": current,
+                "ready": True,
+                "reason": "rollback_baseline_restored",
+            })
+            return result
+        previous = self._fetch_live_model_metrics(
+            currency,
+            previous_version,
+            validation_windows=current['validation_windows'],
+        )
+        result.update({
+            "deployed_at": current_entry['timestamp'],
+            "age_hours": (datetime.now() - deployed_at).total_seconds() / 3600.0,
+            "current_model_version": current_version,
+            "previous_model_version": previous_version,
+            "current": current,
+            "previous": previous,
+        })
+
+        if result["age_hours"] > float(config.get('max_observation_age_hours', 168.0)):
+            result["ready"] = True
+            result["reason"] = "observation_window_closed"
+            return result
+
+        min_current = int(config.get('min_current_decided', 40))
+        min_previous = int(config.get('min_champion_decided', 80))
+        result["ready"] = (
+            current['decided'] >= min_current
+            and previous['decided'] >= min_previous
+        )
+        if not result["ready"]:
+            result["reason"] = "insufficient_mature_labels"
+            return result
+
+        rate_drop = float(previous['execution_rate'] - current['execution_rate'])
+        brier_bad = current['brier'] is not None and current['brier'] > float(
+            config.get('max_brier', 0.25)
+        )
+        ece_bad = current['ece'] is not None and current['ece'] > float(
+            config.get('max_ece', 0.15)
+        )
+        result["execution_rate_drop"] = rate_drop
+        result["rollback_required"] = (
+            rate_drop >= float(config.get('min_execution_rate_drop', 0.15))
+            and (brier_bad or ece_bad)
+        )
+        result["reason"] = (
+            "live_quality_gate_failed"
+            if result["rollback_required"] else "live_quality_gate_passed"
+        )
+        return result
+
+    def evaluate_live_model_gates(self) -> Dict[str, Dict]:
+        return {
+            currency: self.evaluate_live_model_gate(currency)
+            for currency in ('fUSD', 'fUST')
+        }
+
+    def _currency_promotion_allowed(self, currency: str) -> Tuple[bool, Dict]:
+        gate = self.evaluate_live_model_gate(currency)
+        if not gate.get('enabled'):
+            return True, gate
+        if gate.get('reason') in {
+            'insufficient_deployment_history',
+            'observation_window_closed',
+            'rollback_baseline_restored',
+            'live_quality_gate_passed',
+        }:
+            return True, gate
+        return False, gate
+
+    def _currency_retrain_backoff_until(self, currency: str) -> Optional[datetime]:
+        config = self.policy.get('currency_retrain_backoff', {})
+        base_hours = float(config.get('base_hours', 24.0))
+        max_hours = float(config.get('max_hours', 168.0))
+        streak = 0
+        latest_rejection = None
+        for entry in reversed(self._load_retraining_history_entries()):
+            comparison = entry.get('comparison') or {}
+            rejected = comparison.get('rejected_currencies') or {}
+            approved = entry.get('deployed_currencies') or []
+            if currency in approved:
+                break
+            if currency in rejected:
+                streak += 1
+                if latest_rejection is None:
+                    try:
+                        latest_rejection = datetime.strptime(
+                            entry['timestamp'], '%Y-%m-%d %H:%M:%S'
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        return None
+        if not streak or latest_rejection is None:
+            return None
+        hours = min(base_hours * (2 ** (streak - 1)), max_hours)
+        return latest_rejection + timedelta(hours=hours)
+
     def get_last_training_date(self) -> datetime:
         """
         获取上次训练日期
@@ -210,7 +460,9 @@ class RetrainingScheduler:
             return base_since
         return max(base_since, since_dt)
 
-    def _count_orders_since(self, since_dt: datetime) -> int:
+    def _count_orders_since(
+        self, since_dt: datetime, currency: Optional[str] = None
+    ) -> int:
         """
         统计某个时间点之后的订单结果数量，用于判断新模型观察样本是否足够。
 
@@ -221,13 +473,18 @@ class RetrainingScheduler:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         try:
+            currency_clause = " AND currency = ?" if currency else ""
+            params = [since_dt.strftime('%Y-%m-%d %H:%M:%S')]
+            if currency:
+                params.append(currency)
             cursor.execute(
-                """
+                f"""
                 SELECT COUNT(*) FROM virtual_orders
                 WHERE created_at >= ?
                   AND status IN ('EXECUTED', 'FAILED')
+                  {currency_clause}
                 """,
-                (since_dt.strftime('%Y-%m-%d %H:%M:%S'),)
+                tuple(params),
             )
             row = cursor.fetchone()
             return int(row[0] or 0) if row else 0
@@ -238,22 +495,28 @@ class RetrainingScheduler:
         self,
         since_dt: datetime,
         min_window_hours: int = 72,
+        currency: Optional[str] = None,
     ) -> int:
         """Count uncensored outcomes from long validation windows."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         try:
+            currency_clause = " AND currency = ?" if currency else ""
+            params = [
+                since_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                int(min_window_hours),
+            ]
+            if currency:
+                params.append(currency)
             cursor.execute(
-                """
+                f"""
                 SELECT COUNT(*) FROM virtual_orders
                 WHERE created_at >= ?
                   AND validation_window_hours >= ?
                   AND status IN ('EXECUTED', 'FAILED')
+                  {currency_clause}
                 """,
-                (
-                    since_dt.strftime('%Y-%m-%d %H:%M:%S'),
-                    int(min_window_hours),
-                ),
+                tuple(params),
             )
             row = cursor.fetchone()
             return int(row[0] or 0) if row else 0
@@ -362,7 +625,12 @@ class RetrainingScheduler:
         })
         return snapshot
 
-    def get_recent_execution_rate(self, days: int = 7, since_dt: Optional[datetime] = None) -> float:
+    def get_recent_execution_rate(
+        self,
+        days: int = 7,
+        since_dt: Optional[datetime] = None,
+        currency: Optional[str] = None,
+    ) -> float:
         """
         获取近期全局成交率
 
@@ -379,16 +647,21 @@ class RetrainingScheduler:
         since_date = self._effective_since_dt(days=days, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
         time_column = "created_at" if since_dt is not None else "order_timestamp"
 
-        query = """
+        currency_clause = " AND currency = ?" if currency else ""
+        params = [since_date]
+        if currency:
+            params.append(currency)
+        query = f"""
         SELECT
             COUNT(*) as total,
             SUM(CASE WHEN status='EXECUTED' THEN 1 ELSE 0 END) as executed
         FROM virtual_orders
         WHERE {time_column} >= ?
           AND status IN ('EXECUTED', 'FAILED')
+          {currency_clause}
         """
 
-        cursor.execute(query.format(time_column=time_column), (since_date,))
+        cursor.execute(query.format(time_column=time_column), tuple(params))
         result = cursor.fetchone()
         conn.close()
 
@@ -401,7 +674,8 @@ class RetrainingScheduler:
     def get_per_period_execution_anomalies(
         self,
         days: int = 7,
-        since_dt: Optional[datetime] = None
+        since_dt: Optional[datetime] = None,
+        currency: Optional[str] = None,
     ) -> list:
         """
         按 currency+period 分组检查成交率异常
@@ -422,7 +696,11 @@ class RetrainingScheduler:
         since_date = self._effective_since_dt(days=days, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
         time_column = "created_at" if since_dt is not None else "order_timestamp"
 
-        query = """
+        currency_clause = " AND currency = ?" if currency else ""
+        params = [since_date]
+        if currency:
+            params.append(currency)
+        query = f"""
         SELECT
             currency, period,
             COUNT(*) as total,
@@ -430,11 +708,12 @@ class RetrainingScheduler:
         FROM virtual_orders
         WHERE {time_column} >= ?
           AND status IN ('EXECUTED', 'FAILED')
+          {currency_clause}
         GROUP BY currency, period
         HAVING COUNT(*) >= 3
         """
 
-        cursor.execute(query.format(time_column=time_column), (since_date,))
+        cursor.execute(query.format(time_column=time_column), tuple(params))
         rows = cursor.fetchall()
         conn.close()
 
@@ -466,7 +745,11 @@ class RetrainingScheduler:
 
         return anomalies
 
-    def _check_market_divergence_trigger(self, since_dt: Optional[datetime] = None) -> bool:
+    def _check_market_divergence_trigger(
+        self,
+        since_dt: Optional[datetime] = None,
+        currency: Optional[str] = None,
+    ) -> bool:
         """
         检测多数活跃 (currency, period) 的预测利率是否系统性高于市场 2 倍以上。
         市场崩塌后 Blend Zone 和 exec_rate 滞后时的补充保险触发器。
@@ -481,7 +764,11 @@ class RetrainingScheduler:
         try:
             since_date = self._effective_since_dt(days=7, since_dt=since_dt).strftime('%Y-%m-%d %H:%M:%S')
             time_column = "created_at" if since_dt is not None else "order_timestamp"
-            cursor.execute("""
+            currency_clause = " AND currency = ?" if currency else ""
+            params = [since_date]
+            if currency:
+                params.append(currency)
+            cursor.execute(f"""
                 SELECT currency, period,
                        AVG(predicted_rate) as avg_pred,
                        AVG(market_median) as avg_market
@@ -490,9 +777,10 @@ class RetrainingScheduler:
                   AND market_median IS NOT NULL
                   AND market_median > 0
                   AND predicted_rate IS NOT NULL
+                  {currency_clause}
                 GROUP BY currency, period
                 HAVING COUNT(*) >= 3
-            """.format(time_column=time_column), (since_date,))
+            """.format(time_column=time_column), tuple(params))
             rows = cursor.fetchall()
         finally:
             conn.close()
@@ -513,7 +801,11 @@ class RetrainingScheduler:
             return True
         return False
 
-    def _check_zero_liquidity_anomaly(self, since_dt: Optional[datetime] = None) -> list:
+    def _check_zero_liquidity_anomaly(
+        self,
+        since_dt: Optional[datetime] = None,
+        currency: Optional[str] = None,
+    ) -> list:
         """
         检测“有足够成熟结果但一次都未成交”的组合。
 
@@ -529,7 +821,12 @@ class RetrainingScheduler:
             min_decided = int(
                 self.policy.get("retrain_trigger", {}).get("zero_liq_min_decided_orders", 5)
             )
-            cursor.execute("""
+            currency_clause = " AND currency = ?" if currency else ""
+            params = [since_date]
+            if currency:
+                params.append(currency)
+            params.append(min_decided)
+            cursor.execute(f"""
                 SELECT
                     currency,
                     period,
@@ -538,9 +835,10 @@ class RetrainingScheduler:
                     SUM(CASE WHEN status = 'EXECUTED' THEN 1 ELSE 0 END) AS executed
                 FROM virtual_orders
                 WHERE created_at >= ?
+                  {currency_clause}
                 GROUP BY currency, period
                 HAVING decided >= ? AND executed = 0
-            """, (since_date, min_decided))
+            """, tuple(params))
             return cursor.fetchall()
         finally:
             conn.close()
@@ -668,10 +966,39 @@ class RetrainingScheduler:
         print("="*60)
 
         # 条件0（最高优先级）: 生产模型过期
-        model_age = self._get_production_model_age_days()
-        print(f"生产模型年龄: {model_age} 天")
-        if model_age > 14:
-            reason = f"生产模型已{model_age}天未更新，强制重训"
+        available_currencies = [
+            currency for currency in ('fUSD', 'fUST')
+            if os.path.isdir(self.production_model_dir)
+            and any(
+                name.startswith(f'{currency}_')
+                for name in os.listdir(self.production_model_dir)
+            )
+        ]
+        model_ages = {
+            currency: self._get_production_model_age_days(currency)
+            for currency in available_currencies
+        }
+        print(
+            "生产模型年龄: "
+            + ", ".join(f"{currency}={age}天" for currency, age in model_ages.items())
+        )
+        stale_ready = []
+        for currency, age in model_ages.items():
+            if age <= 14:
+                continue
+            backoff_until = self._currency_retrain_backoff_until(currency)
+            if backoff_until and datetime.now() < backoff_until:
+                print(
+                    f"⏳ {currency} 老化重训处于独立退避期，截止 "
+                    f"{backoff_until.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                continue
+            stale_ready.append((currency, age))
+        if stale_ready:
+            summary = ", ".join(
+                f"{currency}={age}天" for currency, age in stale_ready
+            )
+            reason = f"生产模型过期 ({summary})，强制重训"
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
 
@@ -699,7 +1026,20 @@ class RetrainingScheduler:
             return True, reason
 
         # 新模型部署后，质量信号只看“当前生产模型部署后的订单”，避免旧模型坏账反复触发重训。
-        deployed_at = self._get_production_model_deployed_at()
+        deployment_times = {
+            currency: self._get_production_model_deployed_at(currency)
+            for currency in ('fUSD', 'fUST')
+        }
+        available_deployments = {
+            currency: deployed_at
+            for currency, deployed_at in deployment_times.items()
+            if deployed_at is not None
+        }
+        quality_currency = (
+            max(available_deployments, key=available_deployments.get)
+            if available_deployments else None
+        )
+        deployed_at = available_deployments.get(quality_currency)
         quality_since_dt = deployed_at
         post_deploy_age_hours = None
         post_deploy_orders = None
@@ -707,14 +1047,21 @@ class RetrainingScheduler:
         high_exec_maturity_ready = True
         if deployed_at is not None:
             post_deploy_age_hours = (datetime.now() - deployed_at).total_seconds() / 3600.0
-            post_deploy_orders = self._count_orders_since(deployed_at)
-            post_deploy_72h_orders = self._count_long_window_orders_since(deployed_at)
+            post_deploy_orders = self._count_orders_since(
+                deployed_at, currency=quality_currency
+            )
+            post_deploy_72h_orders = self._count_long_window_orders_since(
+                deployed_at, currency=quality_currency
+            )
             high_exec_maturity_ready = (
                 post_deploy_age_hours >= th["post_deploy_high_exec_grace_hours"] and
                 post_deploy_orders >= th["post_deploy_high_exec_min_orders"] and
                 post_deploy_72h_orders >= th["post_deploy_high_exec_min_72h_orders"]
             )
-            print(f"当前生产模型部署时间: {deployed_at.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(
+                f"当前质量观察币种: {quality_currency}, 部署时间: "
+                f"{deployed_at.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
             print(
                 f"部署后已观察: {post_deploy_age_hours:.1f} 小时, "
                 f"订单结果: {post_deploy_orders} 条, 72h结果: {post_deploy_72h_orders} 条"
@@ -741,11 +1088,15 @@ class RetrainingScheduler:
                 return False, None
 
         # 条件2: 全局近期成交率（若新模型刚部署，则仅看部署后的订单）
-        exec_rate_7d = self.get_recent_execution_rate(days=7, since_dt=quality_since_dt)
-        print(f"近7天全局成交率: {exec_rate_7d:.2%}")
+        exec_rate_7d = self.get_recent_execution_rate(
+            days=7, since_dt=quality_since_dt, currency=quality_currency
+        )
+        print(f"{quality_currency or '全局'}近7天成交率: {exec_rate_7d:.2%}")
 
         # 条件3: 按 period 分组检查
-        period_anomalies = self.get_per_period_execution_anomalies(days=7, since_dt=quality_since_dt)
+        period_anomalies = self.get_per_period_execution_anomalies(
+            days=7, since_dt=quality_since_dt, currency=quality_currency
+        )
         if period_anomalies:
             print(f"按 period 分组异常:")
             for a in period_anomalies:
@@ -754,7 +1105,9 @@ class RetrainingScheduler:
             print(f"按 period 分组: 无异常")
 
         # 条件4: 跟随误差与120d稳定性 (闭环主质量指标)
-        follow_metrics = self._get_follow_stability_metrics(days=7, since_dt=quality_since_dt)
+        follow_metrics = self._get_follow_stability_metrics(
+            days=7, since_dt=quality_since_dt, currency=quality_currency
+        )
         if follow_metrics["samples"] > 0:
             print(
                 f"跟随误差(近7天): MAE={follow_metrics['follow_mae']:.4f}, "
@@ -791,7 +1144,9 @@ class RetrainingScheduler:
             )
 
         # 执行率快速下滑检测 (14d→7d 趋势漂移)
-        exec_rate_14d = self.get_recent_execution_rate(days=14, since_dt=quality_since_dt)
+        exec_rate_14d = self.get_recent_execution_rate(
+            days=14, since_dt=quality_since_dt, currency=quality_currency
+        )
         if exec_rate_14d is not None and exec_rate_7d is not None:
             drift = exec_rate_14d - exec_rate_7d  # 正值 = 近期恶化
             if drift > 0.15 and exec_rate_7d < exec_high:
@@ -809,7 +1164,9 @@ class RetrainingScheduler:
             )
         )
         if zero_liq_ready:
-            zero_liq = self._check_zero_liquidity_anomaly(since_dt=quality_since_dt)
+            zero_liq = self._check_zero_liquidity_anomaly(
+                since_dt=quality_since_dt, currency=quality_currency
+            )
             if zero_liq:
                 currencies = [
                     (r[0], r[1], int(r[3] or 0), int(r[4] or 0))
@@ -906,7 +1263,9 @@ class RetrainingScheduler:
                 return True, reason
 
         # 2天短窗口: 检测急剧崩溃（避免7天窗口稀释0%信号）
-        short_anomalies = self.get_per_period_execution_anomalies(days=2, since_dt=quality_since_dt)
+        short_anomalies = self.get_per_period_execution_anomalies(
+            days=2, since_dt=quality_since_dt, currency=quality_currency
+        )
         zero_rate_2d = [
             a for a in short_anomalies
             if a['exec_rate'] == 0.0
@@ -920,7 +1279,9 @@ class RetrainingScheduler:
             return True, reason
 
         # 市场偏离触发: 多数 pair 预测利率系统性高于市场 2 倍（market regime change）
-        if zero_liq_ready and self._check_market_divergence_trigger(since_dt=quality_since_dt):
+        if zero_liq_ready and self._check_market_divergence_trigger(
+            since_dt=quality_since_dt, currency=quality_currency
+        ):
             reason = "市场偏离触发: >=50% 活跃组合预测利率高于市场中位 2 倍以上"
             print(f"⚠️  需要重训练: {reason}")
             return True, reason
@@ -973,7 +1334,8 @@ class RetrainingScheduler:
     def _get_follow_stability_metrics(
         self,
         days: int = 7,
-        since_dt: Optional[datetime] = None
+        since_dt: Optional[datetime] = None,
+        currency: Optional[str] = None,
     ) -> Dict[str, float]:
         """
         Calculate closed-loop quality metrics from recent validated orders.
@@ -1009,14 +1371,19 @@ class RetrainingScheduler:
             if "step_change_pct" in columns:
                 select_cols.append("step_change_pct")
 
+            currency_clause = " AND currency = ?" if currency else ""
+            params = [since_date]
+            if currency:
+                params.append(currency)
             query = f"""
                 SELECT {", ".join(select_cols)}
                 FROM virtual_orders
                 WHERE {time_column} >= ?
                   AND status IN ('EXECUTED', 'FAILED')
                   AND market_median IS NOT NULL
+                  {currency_clause}
             """
-            cursor.execute(query, (since_date,))
+            cursor.execute(query, tuple(params))
             rows = cursor.fetchall()
         finally:
             conn.close()
@@ -2092,6 +2459,67 @@ class RetrainingScheduler:
             print(f"❌ 部署失败: {e}")
             return False
 
+    def rollback_live_model(self, currency: str) -> str:
+        gate = self.evaluate_live_model_gate(currency)
+        if not gate.get('rollback_required'):
+            print(
+                "LIVE_ROLLBACK_RESULT="
+                + json.dumps({"outcome": "not_needed", "gate": gate}, ensure_ascii=False)
+            )
+            return 'not_needed'
+
+        deployment_token = str(gate['deployed_at']).replace('-', '').replace(':', '').replace(' ', '_')
+        backup_dir = os.path.join(self.backup_dir, f"production_{deployment_token}")
+        if not os.path.isdir(backup_dir):
+            print(f"❌ live rollback backup missing: {backup_dir}")
+            return 'rollback_failed'
+
+        untouched_currency = 'fUST' if currency == 'fUSD' else 'fUSD'
+        untouched_before = self._currency_artifact_digest(
+            self.production_model_dir, untouched_currency
+        )
+        if not self.deploy_new_models(backup_dir, [currency]):
+            return 'rollback_failed'
+        untouched_after = self._currency_artifact_digest(
+            self.production_model_dir, untouched_currency
+        )
+        if untouched_before != untouched_after:
+            raise RuntimeError(
+                f"{untouched_currency} artifacts changed during {currency} rollback"
+            )
+
+        self.log_retraining_event(
+            trigger=f"live gate rollback: {currency}",
+            retrained=False,
+            deployed=True,
+            comparison={"live_model_gate": gate},
+            outcome='rolled_back',
+            deployed_currencies=[currency],
+            source_model_version=gate['previous_model_version'],
+            rollback_of_model_version=gate['current_model_version'],
+            rollback_backup_dir=backup_dir,
+        )
+        print(
+            "LIVE_ROLLBACK_RESULT="
+            + json.dumps({"outcome": "rolled_back", "gate": gate}, ensure_ascii=False)
+        )
+        return 'rolled_back'
+
+    @staticmethod
+    def _currency_artifact_digest(model_dir: str, currency: str) -> str:
+        digest = hashlib.sha256()
+        if not os.path.isdir(model_dir):
+            return digest.hexdigest()
+        for name in sorted(os.listdir(model_dir)):
+            path = os.path.join(model_dir, name)
+            if not name.startswith(f'{currency}_') or not os.path.isfile(path):
+                continue
+            digest.update(name.encode('utf-8'))
+            with open(path, 'rb') as artifact:
+                for chunk in iter(lambda: artifact.read(1024 * 1024), b''):
+                    digest.update(chunk)
+        return digest.hexdigest()
+
     def log_retraining_event(
         self,
         trigger: str,
@@ -2102,6 +2530,9 @@ class RetrainingScheduler:
         training_data: Optional[Dict] = None,
         challenger_dir: Optional[str] = None,
         deployed_currencies: Optional[List[str]] = None,
+        source_model_version: Optional[str] = None,
+        rollback_of_model_version: Optional[str] = None,
+        rollback_backup_dir: Optional[str] = None,
     ):
         """
         记录重训练事件到日志
@@ -2128,6 +2559,12 @@ class RetrainingScheduler:
             )
         if challenger_dir:
             event['challenger_dir'] = challenger_dir
+        if source_model_version:
+            event['source_model_version'] = source_model_version
+        if rollback_of_model_version:
+            event['rollback_of_model_version'] = rollback_of_model_version
+        if rollback_backup_dir:
+            event['rollback_backup_dir'] = rollback_backup_dir
         history.append(event)
 
         # 保存
@@ -2260,6 +2697,39 @@ class RetrainingScheduler:
         # Step 4: 部署决策
         if is_better:
             approved_currencies = comparison.get('approved_currencies', [])
+            promotion_blocks = {}
+            deployable_currencies = []
+            for currency in approved_currencies:
+                allowed, live_gate = self._currency_promotion_allowed(currency)
+                if allowed:
+                    deployable_currencies.append(currency)
+                else:
+                    promotion_blocks[currency] = live_gate
+                    comparison.setdefault('rejected_currencies', {}).setdefault(
+                        currency, []
+                    ).append('live_gate_unresolved')
+            if promotion_blocks:
+                comparison['promotion_blocked_currencies'] = promotion_blocks
+                comparison['approved_currencies'] = deployable_currencies
+                print(
+                    "⏳ 暂缓币种晋级，等待当前 live gate: "
+                    + ", ".join(sorted(promotion_blocks))
+                )
+            approved_currencies = deployable_currencies
+            if not approved_currencies:
+                self.log_retraining_event(
+                    trigger=reason,
+                    retrained=True,
+                    deployed=False,
+                    comparison=comparison,
+                    outcome='trained_not_deployed',
+                    training_data=training_snapshot,
+                    challenger_dir=retrained_dir,
+                )
+                self.cleanup_old_artifacts(
+                    retrained_dir, preserve_retrained=True
+                )
+                return 'trained_not_deployed'
             deploy_success = self.deploy_new_models(
                 retrained_dir, approved_currencies
             )
@@ -2331,13 +2801,24 @@ def main():
                        help='强制重训练(忽略判断条件)')
     parser.add_argument('--dry-run', action='store_true',
                        help='仅检查是否需要重训练,不执行')
+    parser.add_argument('--apply-live-rollback', choices=['fUSD', 'fUST'],
+                       help='重新校验 live gate 并按币种事务回滚')
 
     args = parser.parse_args()
 
     scheduler = RetrainingScheduler()
 
-    if args.dry_run:
+    if args.apply_live_rollback:
+        outcome = scheduler.rollback_live_model(args.apply_live_rollback)
+        exit_code = 0 if outcome in {'rolled_back', 'not_needed'} else 1
+        raise SystemExit(exit_code)
+    elif args.dry_run:
         # 仅检查
+        live_gates = scheduler.evaluate_live_model_gates()
+        print(
+            "LIVE_MODEL_GATES="
+            + json.dumps(live_gates, ensure_ascii=False, sort_keys=True)
+        )
         should_retrain, reason = scheduler.should_retrain()
         training_snapshot = scheduler.get_training_label_snapshot()
         print(

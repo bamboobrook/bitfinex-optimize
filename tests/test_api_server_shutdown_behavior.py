@@ -113,7 +113,54 @@ def test_calibration_runtime_status_reads_result_details(tmp_path, monkeypatch):
         "CALIBRATION_STATE_FILE",
         str(tmp_path / "missing-calibration-state.json"),
     )
+    monkeypatch.setattr(
+        api_server,
+        "DB_FILE",
+        str(tmp_path / "missing-runtime.db"),
+    )
 
     status = api_server._calibration_runtime_status()
 
     assert status["methods"] == ["v2_global_platt", "v2_global_platt_persisted"]
+
+
+def test_run_full_pipeline_applies_live_rollback_before_prediction(monkeypatch):
+    _install_api_server_import_stubs(monkeypatch)
+    sys.modules.pop("ml_engine.api_server", None)
+    import ml_engine.api_server as api_server
+
+    calls = []
+
+    async def fake_download_with_retry(cwd):
+        return True
+
+    async def fake_run_subprocess(cmd, cwd, timeout, step_name):
+        calls.append((step_name, cmd))
+        if step_name == "Order Validation":
+            return "", "", 0
+        if step_name == "Retraining Check":
+            return (
+                'LIVE_MODEL_GATES={"fUSD":{"rollback_required":true}}\n',
+                "",
+                0,
+            )
+        if step_name == "Live Rollback fUSD":
+            return 'LIVE_ROLLBACK_RESULT={"outcome":"rolled_back"}', "", 0
+        if step_name == "Prediction":
+            return "", "terminated", -signal.SIGTERM
+        raise AssertionError(step_name)
+
+    monkeypatch.setattr(api_server, "_download_with_retry", fake_download_with_retry)
+    monkeypatch.setattr(api_server, "_run_subprocess_with_timeout", fake_run_subprocess)
+    monkeypatch.setattr(api_server, "update_status", lambda *args: None)
+
+    asyncio.run(api_server.run_full_pipeline())
+
+    assert [name for name, _ in calls] == [
+        "Order Validation",
+        "Retraining Check",
+        "Live Rollback fUSD",
+        "Prediction",
+    ]
+    rollback_cmd = calls[2][1]
+    assert rollback_cmd[-2:] == ["--apply-live-rollback", "fUSD"]
