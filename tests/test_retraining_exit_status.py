@@ -1275,6 +1275,242 @@ def test_live_model_gate_waits_for_40_then_requires_rollback(
     assert gate["execution_rate_drop"] == pytest.approx(0.55)
 
 
+def _live_gate_scheduler_with_segments(
+    tmp_path,
+    scheduler_module,
+    old_segments,
+    current_segments,
+    policy_overrides=None,
+):
+    db_path = tmp_path / "segmented_live_gate.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE virtual_orders (
+                order_id TEXT PRIMARY KEY, currency TEXT, period INTEGER,
+                status TEXT, validation_window_hours INTEGER, created_at TEXT,
+                model_version TEXT, decision_mode TEXT, update_cycle_id TEXT,
+                candidate_id TEXT, realized_terminal_value_net_wait REAL,
+                market_median REAL, path_value_score REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE prediction_history (
+                id INTEGER PRIMARY KEY, update_cycle_id TEXT, currency TEXT,
+                period INTEGER, candidate_id TEXT,
+                calibrated_execution_probability REAL,
+                probability_calibration_method TEXT
+            )
+            """
+        )
+        order_rows = []
+        prediction_rows = []
+        sequence = 0
+        for prefix, version, created_at, segments in [
+            ("old", "model_20260819_223827", "2026-08-20 00:00:00", old_segments),
+            ("new", "model_20260823_003241", "2026-08-23 01:00:00", current_segments),
+        ]:
+            for segment in segments:
+                decided = int(segment.get("decided", 0))
+                pending = int(segment.get("pending", 0))
+                executed = int(segment.get("executed", 0))
+                premium = float(segment.get("premium", 0.5))
+                probability = float(segment.get("probability", 0.7))
+                method = segment.get("method", "traditional_fallback")
+                statuses = ["EXECUTED"] * executed
+                statuses += ["FAILED"] * max(decided - executed, 0)
+                statuses += ["PENDING"] * pending
+                for status in statuses:
+                    sequence += 1
+                    cycle = f"{prefix}_{sequence}"
+                    realized = 10.0 + premium if status != "PENDING" else None
+                    order_rows.append((
+                        cycle,
+                        "fUSD",
+                        int(segment["period"]),
+                        status,
+                        int(segment["window"]),
+                        created_at,
+                        version,
+                        "exploit",
+                        cycle,
+                        cycle,
+                        realized,
+                        10.0,
+                        realized,
+                    ))
+                    prediction_rows.append((
+                        cycle,
+                        "fUSD",
+                        int(segment["period"]),
+                        cycle,
+                        probability,
+                        method,
+                    ))
+        conn.executemany(
+            "INSERT INTO virtual_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            order_rows,
+        )
+        conn.executemany(
+            """
+            INSERT INTO prediction_history(
+                update_cycle_id, currency, period, candidate_id,
+                calibrated_execution_probability, probability_calibration_method
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            prediction_rows,
+        )
+
+    history = [
+        {
+            "timestamp": "2026-08-19 22:38:27",
+            "deployed": True,
+            "deployed_currencies": ["fUSD"],
+        },
+        {
+            "timestamp": "2026-08-23 00:32:41",
+            "deployed": True,
+            "deployed_currencies": ["fUSD"],
+        },
+    ]
+    (tmp_path / "retraining_history.json").write_text(
+        json.dumps(history), encoding="utf-8"
+    )
+    scheduler = scheduler_module.RetrainingScheduler(
+        db_path=str(db_path),
+        production_model_dir=str(tmp_path / "models"),
+        backup_dir=str(tmp_path / "backup"),
+        log_dir=str(tmp_path),
+    )
+    gate_policy = {
+        "enabled": True,
+        "min_current_decided": 40,
+        "min_champion_decided": 80,
+        "min_execution_rate_drop": 0.15,
+        "max_brier": 0.25,
+        "max_ece": 0.15,
+        "min_value_samples": 40,
+        "min_realized_premium_drop": 0.20,
+        "max_observation_age_hours": 100000,
+    }
+    gate_policy.update(policy_overrides or {})
+    scheduler.policy = {"live_model_gate": gate_policy}
+    return scheduler
+
+
+def test_live_model_gate_reweights_champion_to_current_period_window_mix(
+    tmp_path, scheduler_module
+):
+    scheduler = _live_gate_scheduler_with_segments(
+        tmp_path,
+        scheduler_module,
+        old_segments=[
+            {"period": 3, "window": 24, "decided": 100, "executed": 100},
+            {"period": 90, "window": 72, "decided": 100, "executed": 0},
+        ],
+        current_segments=[
+            {"period": 3, "window": 24, "decided": 10, "executed": 10},
+            {"period": 90, "window": 72, "decided": 30, "executed": 15},
+        ],
+    )
+
+    gate = scheduler.evaluate_live_model_gate("fUSD")
+
+    assert gate["ready"] is True
+    assert gate["comparison_mode"] == "current_period_and_window_reweighted"
+    assert gate["previous"]["source_execution_rate"] == pytest.approx(0.5)
+    assert gate["previous"]["execution_rate"] == pytest.approx(0.25)
+    assert gate["champion_segment_coverage"] == pytest.approx(1.0)
+
+
+def test_live_model_gate_requires_each_configured_window_to_mature(
+    tmp_path, scheduler_module
+):
+    scheduler = _live_gate_scheduler_with_segments(
+        tmp_path,
+        scheduler_module,
+        old_segments=[
+            {"period": 3, "window": 24, "decided": 100, "executed": 80},
+            {"period": 10, "window": 48, "decided": 100, "executed": 80},
+            {"period": 90, "window": 72, "decided": 100, "executed": 80},
+        ],
+        current_segments=[
+            {"period": 3, "window": 24, "decided": 30, "executed": 24},
+            {"period": 10, "window": 48, "decided": 9, "executed": 7},
+            {"period": 90, "window": 72, "decided": 1, "executed": 1},
+        ],
+        policy_overrides={
+            "required_validation_windows": [24, 48, 72],
+            "min_current_decided_by_window": {"24": 10, "48": 10, "72": 10},
+            "min_champion_decided_by_window": {"24": 20, "48": 20, "72": 20},
+        },
+    )
+
+    gate = scheduler.evaluate_live_model_gate("fUSD")
+
+    assert gate["ready"] is False
+    assert gate["reason"] == "insufficient_window_maturity"
+    assert gate["window_maturity"]["48"]["current_decided"] == 9
+    assert gate["window_maturity"]["72"]["current_decided"] == 1
+
+
+def test_live_model_gate_rolls_back_material_realized_value_drop(
+    tmp_path, scheduler_module
+):
+    scheduler = _live_gate_scheduler_with_segments(
+        tmp_path,
+        scheduler_module,
+        old_segments=[{
+            "period": 3, "window": 24, "decided": 80, "executed": 64,
+            "premium": 0.5, "probability": 0.8,
+        }],
+        current_segments=[{
+            "period": 3, "window": 24, "decided": 40, "executed": 32,
+            "premium": 0.1, "probability": 0.8,
+        }],
+    )
+
+    gate = scheduler.evaluate_live_model_gate("fUSD")
+
+    assert gate["ready"] is True
+    assert gate["execution_rate_drop"] == pytest.approx(0.0)
+    assert gate["value_gate"]["realized_premium_drop"] == pytest.approx(0.4)
+    assert gate["rollback_required"] is True
+    assert gate["rollback_trigger_reasons"] == ["realized_premium_degraded"]
+
+
+def test_live_model_gate_tracks_v2_identity_maturity_separately(
+    tmp_path, scheduler_module
+):
+    scheduler = _live_gate_scheduler_with_segments(
+        tmp_path,
+        scheduler_module,
+        old_segments=[{
+            "period": 3, "window": 24, "decided": 80, "executed": 64,
+        }],
+        current_segments=[
+            {
+                "period": 3, "window": 24, "decided": 40, "executed": 32,
+                "method": "traditional_fallback",
+            },
+            {
+                "period": 3, "window": 24, "pending": 12,
+                "method": "v2_identity_persisted",
+            },
+        ],
+    )
+
+    gate = scheduler.evaluate_live_model_gate("fUSD")
+    cohorts = gate["calibration_method_cohorts"]
+
+    assert cohorts["traditional_fallback"]["decided"] == 40
+    assert cohorts["v2_identity"]["decided"] == 0
+    assert cohorts["v2_identity"]["pending"] == 12
+    assert cohorts["v2_identity"]["ready"] is False
+
+
 def test_partial_deploy_rejection_backoff_is_currency_specific(
     tmp_path, scheduler_module
 ):

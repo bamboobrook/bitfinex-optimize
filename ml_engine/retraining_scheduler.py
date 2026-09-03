@@ -204,25 +204,259 @@ class RetrainingScheduler:
         return result
 
     @staticmethod
-    def _expected_calibration_error(labels: List[int], scores: List[float]) -> Optional[float]:
+    def _expected_calibration_error(
+        labels: List[int],
+        scores: List[float],
+        weights: Optional[List[float]] = None,
+    ) -> Optional[float]:
         if not labels:
             return None
-        total = len(labels)
+        if weights is None:
+            weights = [1.0] * len(labels)
+        total = float(sum(weights))
+        if total <= 0:
+            return None
         error = 0.0
         for index in range(10):
             lower = index / 10.0
             upper = (index + 1) / 10.0
             selected = [
-                (label, score)
-                for label, score in zip(labels, scores)
+                (label, score, weight)
+                for label, score, weight in zip(labels, scores, weights)
                 if lower <= score < upper or (index == 9 and score == 1.0)
             ]
             if not selected:
                 continue
-            observed = sum(label for label, _ in selected) / len(selected)
-            predicted = sum(score for _, score in selected) / len(selected)
-            error += len(selected) / total * abs(observed - predicted)
+            selected_weight = float(sum(weight for _, _, weight in selected))
+            if selected_weight <= 0:
+                continue
+            observed = sum(
+                label * weight for label, _, weight in selected
+            ) / selected_weight
+            predicted = sum(
+                score * weight for _, score, weight in selected
+            ) / selected_weight
+            error += selected_weight / total * abs(observed - predicted)
         return float(error)
+
+    @staticmethod
+    def _calibration_method_family(method: Optional[str]) -> str:
+        value = str(method or "unknown")
+        if value.startswith("v2_identity"):
+            return "v2_identity"
+        if value.startswith("v2_currency_platt"):
+            return "v2_currency_platt"
+        return value
+
+    @staticmethod
+    def _live_segment_key(row: Dict) -> Tuple[int, int]:
+        return int(row.get("period") or 0), int(row.get("validation_window_hours") or 0)
+
+    def _summarize_live_rows(
+        self,
+        rows: List[Dict],
+        target_segment_counts: Optional[Dict[Tuple[int, int], int]] = None,
+        include_breakdowns: bool = True,
+    ) -> Dict:
+        decided_statuses = {"EXECUTED", "FAILED"}
+        source_segment_counts: Dict[Tuple[int, int], int] = {}
+        for row in rows:
+            if row.get("status") not in decided_statuses:
+                continue
+            key = self._live_segment_key(row)
+            source_segment_counts[key] = source_segment_counts.get(key, 0) + 1
+
+        if target_segment_counts is None:
+            selected_keys = {self._live_segment_key(row) for row in rows}
+        else:
+            selected_keys = {
+                key for key, count in target_segment_counts.items() if int(count or 0) > 0
+            }
+
+        selected_rows = [
+            row for row in rows if self._live_segment_key(row) in selected_keys
+        ]
+        decided_rows = [
+            row for row in selected_rows if row.get("status") in decided_statuses
+        ]
+        pending_rows = [row for row in selected_rows if row.get("status") == "PENDING"]
+
+        def row_weight(row: Dict) -> float:
+            if target_segment_counts is None:
+                return 1.0
+            key = self._live_segment_key(row)
+            source_count = source_segment_counts.get(key, 0)
+            if source_count <= 0:
+                return 0.0
+            return float(target_segment_counts.get(key, 0)) / float(source_count)
+
+        decision_weights = [row_weight(row) for row in decided_rows]
+        effective_decided = float(sum(decision_weights))
+        labels = [1 if row.get("status") == "EXECUTED" else 0 for row in decided_rows]
+        effective_executed = float(sum(
+            label * weight for label, weight in zip(labels, decision_weights)
+        ))
+        source_executed = int(sum(labels))
+
+        probability_labels: List[int] = []
+        probabilities: List[float] = []
+        probability_weights: List[float] = []
+        premiums: List[float] = []
+        premium_weights: List[float] = []
+        path_errors: List[float] = []
+        path_weights: List[float] = []
+        for row, label, weight in zip(decided_rows, labels, decision_weights):
+            probability = row.get("calibrated_execution_probability")
+            if probability is not None:
+                probability_labels.append(label)
+                probabilities.append(float(probability))
+                probability_weights.append(weight)
+
+            realized_value = row.get("realized_terminal_value")
+            market_median = row.get("market_median")
+            if realized_value is not None and market_median is not None:
+                premiums.append(float(realized_value) - float(market_median))
+                premium_weights.append(weight)
+                path_value = row.get("path_value_score")
+                if path_value is not None:
+                    path_errors.append(abs(float(path_value) - float(realized_value)))
+                    path_weights.append(weight)
+
+        def weighted_mean(values: List[float], value_weights: List[float]) -> Optional[float]:
+            total_weight = float(sum(value_weights))
+            if not values or total_weight <= 0:
+                return None
+            return float(sum(
+                value * weight for value, weight in zip(values, value_weights)
+            ) / total_weight)
+
+        brier_values = [
+            (score - label) ** 2
+            for label, score in zip(probability_labels, probabilities)
+        ]
+        target_total = float(sum(target_segment_counts.values())) if target_segment_counts else 0.0
+        covered_target = (
+            float(sum(
+                target_segment_counts.get(key, 0)
+                for key in selected_keys
+                if source_segment_counts.get(key, 0) > 0
+            ))
+            if target_segment_counts else effective_decided
+        )
+        missing_segments = sorted(
+            f"{period}d/{window}h"
+            for (period, window), count in (target_segment_counts or {}).items()
+            if count > 0 and source_segment_counts.get((period, window), 0) <= 0
+        )
+
+        result = {
+            "decided": len(decided_rows),
+            "executed": source_executed,
+            "pending": len(pending_rows),
+            "execution_rate": (
+                effective_executed / effective_decided if effective_decided > 0 else None
+            ),
+            "brier": weighted_mean(brier_values, probability_weights),
+            "ece": self._expected_calibration_error(
+                probability_labels, probabilities, probability_weights
+            ),
+            "validation_windows": sorted({
+                int(row.get("validation_window_hours") or 0) for row in decided_rows
+            }),
+            "value_samples": len(premiums),
+            "realized_premium_vs_market": weighted_mean(premiums, premium_weights),
+            "path_mae": weighted_mean(path_errors, path_weights),
+            "comparison_mode": (
+                "current_segment_reweighted" if target_segment_counts else "observed"
+            ),
+            "segment_coverage": (
+                covered_target / target_total if target_total > 0 else 1.0
+            ),
+            "missing_segments": missing_segments,
+        }
+        if target_segment_counts is not None:
+            result.update({
+                "source_execution_rate": (
+                    source_executed / len(decided_rows) if decided_rows else None
+                ),
+                "matched_decided": effective_decided,
+                "matched_executed": effective_executed,
+            })
+
+        if not include_breakdowns:
+            return result
+
+        result["by_window"] = {}
+        windows = sorted({window for _, window in selected_keys})
+        for window in windows:
+            window_rows = [
+                row for row in selected_rows
+                if int(row.get("validation_window_hours") or 0) == window
+            ]
+            window_targets = None
+            if target_segment_counts is not None:
+                window_targets = {
+                    key: count for key, count in target_segment_counts.items()
+                    if key[1] == window
+                }
+            result["by_window"][str(window)] = self._summarize_live_rows(
+                window_rows,
+                target_segment_counts=window_targets,
+                include_breakdowns=False,
+            )
+
+        result["by_segment"] = {}
+        for period, window in sorted(selected_keys):
+            key = (period, window)
+            segment_rows = [
+                row for row in selected_rows if self._live_segment_key(row) == key
+            ]
+            segment_targets = None
+            if target_segment_counts is not None:
+                segment_targets = {key: target_segment_counts.get(key, 0)}
+            segment_summary = self._summarize_live_rows(
+                segment_rows,
+                target_segment_counts=segment_targets,
+                include_breakdowns=False,
+            )
+            segment_summary.update({
+                "period": period,
+                "validation_window_hours": window,
+            })
+            result["by_segment"][f"{period}d/{window}h"] = segment_summary
+
+        result["by_calibration_method"] = {}
+        method_groups: Dict[str, List[Dict]] = {}
+        for row in selected_rows:
+            family = self._calibration_method_family(
+                row.get("probability_calibration_method")
+            )
+            method_groups.setdefault(family, []).append(row)
+        for method, method_rows in sorted(method_groups.items()):
+            method_summary = self._summarize_live_rows(
+                method_rows,
+                include_breakdowns=False,
+            )
+            method_summary["maturity_by_window"] = {
+                str(window): {
+                    "decided": sum(
+                        row.get("status") in decided_statuses
+                        for row in method_rows
+                        if int(row.get("validation_window_hours") or 0) == window
+                    ),
+                    "pending": sum(
+                        row.get("status") == "PENDING"
+                        for row in method_rows
+                        if int(row.get("validation_window_hours") or 0) == window
+                    ),
+                }
+                for window in sorted({
+                    int(row.get("validation_window_hours") or 0) for row in method_rows
+                })
+            }
+            result["by_calibration_method"][method] = method_summary
+
+        return result
 
     def _fetch_live_model_metrics(
         self,
@@ -230,11 +464,12 @@ class RetrainingScheduler:
         model_version: str,
         since_dt: Optional[datetime] = None,
         validation_windows: Optional[List[int]] = None,
+        target_segment_counts: Optional[Dict[Tuple[int, int], int]] = None,
     ) -> Dict:
         clauses = [
             "v.currency = ?",
             "v.model_version = ?",
-            "v.status IN ('EXECUTED', 'FAILED')",
+            "v.status IN ('EXECUTED', 'FAILED', 'PENDING')",
         ]
         params: List = [currency, model_version]
         if since_dt is not None:
@@ -251,14 +486,38 @@ class RetrainingScheduler:
                     "PRAGMA table_info(virtual_orders)"
                 ).fetchall()
             }
+            prediction_columns = {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info(prediction_history)"
+                ).fetchall()
+            }
             if "decision_mode" in columns:
                 clauses.append("COALESCE(v.decision_mode, 'exploit') = 'exploit'")
+            realized_select = (
+                "v.realized_terminal_value_net_wait"
+                if "realized_terminal_value_net_wait" in columns
+                else "v.realized_terminal_value"
+                if "realized_terminal_value" in columns
+                else "NULL"
+            )
+            market_select = "v.market_median" if "market_median" in columns else "NULL"
+            path_select = "v.path_value_score" if "path_value_score" in columns else "NULL"
+            method_select = (
+                "p.probability_calibration_method"
+                if "probability_calibration_method" in prediction_columns
+                else "'unknown'"
+            )
             rows = conn.execute(
                 f"""
                 SELECT
                     v.status,
                     v.validation_window_hours,
-                    p.calibrated_execution_probability
+                    v.period,
+                    p.calibrated_execution_probability,
+                    {realized_select},
+                    {market_select},
+                    {path_select},
+                    {method_select}
                 FROM virtual_orders AS v
                 LEFT JOIN prediction_history AS p
                   ON p.rowid = (
@@ -279,29 +538,23 @@ class RetrainingScheduler:
                 tuple(params),
             ).fetchall()
 
-        labels = [1 if row[0] == 'EXECUTED' else 0 for row in rows]
-        probabilities = [
-            float(row[2]) for row in rows if row[2] is not None
+        normalized_rows = [
+            {
+                "status": row[0],
+                "validation_window_hours": int(row[1] or 0),
+                "period": int(row[2] or 0),
+                "calibrated_execution_probability": row[3],
+                "realized_terminal_value": row[4],
+                "market_median": row[5],
+                "path_value_score": row[6],
+                "probability_calibration_method": row[7],
+            }
+            for row in rows
         ]
-        probability_labels = [
-            label for label, row in zip(labels, rows) if row[2] is not None
-        ]
-        brier = None
-        if probability_labels:
-            brier = sum(
-                (score - label) ** 2
-                for label, score in zip(probability_labels, probabilities)
-            ) / len(probability_labels)
-        return {
-            "decided": len(rows),
-            "executed": sum(labels),
-            "execution_rate": (sum(labels) / len(rows)) if rows else None,
-            "brier": brier,
-            "ece": self._expected_calibration_error(
-                probability_labels, probabilities
-            ),
-            "validation_windows": sorted({int(row[1] or 0) for row in rows}),
-        }
+        return self._summarize_live_rows(
+            normalized_rows,
+            target_segment_counts=target_segment_counts,
+        )
 
     def evaluate_live_model_gate(self, currency: str) -> Dict:
         config = self.policy.get('live_model_gate', {})
@@ -326,6 +579,39 @@ class RetrainingScheduler:
         current = self._fetch_live_model_metrics(
             currency, current_version, since_dt=deployed_at
         )
+        method_min_decided = int(config.get('calibration_method_min_decided', 40))
+        method_window_minimums = config.get(
+            'calibration_method_min_decided_by_window', {}
+        )
+        required_windows = [
+            int(value) for value in config.get('required_validation_windows', [])
+        ]
+        for method_cohort in current.get('by_calibration_method', {}).values():
+            method_deficits = []
+            for window in required_windows:
+                required = int(
+                    method_window_minimums.get(
+                        str(window), method_window_minimums.get(window, 0)
+                    )
+                    if isinstance(method_window_minimums, dict) else 0
+                )
+                actual = int(
+                    method_cohort.get('maturity_by_window', {})
+                    .get(str(window), {})
+                    .get('decided', 0)
+                    or 0
+                )
+                if actual < required:
+                    method_deficits.append({
+                        'validation_window_hours': window,
+                        'decided': actual,
+                        'required': required,
+                    })
+            method_cohort['ready'] = (
+                int(method_cohort.get('decided', 0) or 0) >= method_min_decided
+                and not method_deficits
+            )
+            method_cohort['maturity_deficits'] = method_deficits
         if current_entry.get('outcome') == 'rolled_back':
             result.update({
                 "deployed_at": current_entry['timestamp'],
@@ -336,10 +622,20 @@ class RetrainingScheduler:
                 "reason": "rollback_baseline_restored",
             })
             return result
+
+        current_segment_counts = {
+            (
+                int(segment.get('period') or 0),
+                int(segment.get('validation_window_hours') or 0),
+            ): int(segment.get('decided', 0) or 0)
+            for segment in current.get('by_segment', {}).values()
+            if int(segment.get('decided', 0) or 0) > 0
+        }
         previous = self._fetch_live_model_metrics(
             currency,
             previous_version,
             validation_windows=current['validation_windows'],
+            target_segment_counts=current_segment_counts,
         )
         result.update({
             "deployed_at": current_entry['timestamp'],
@@ -348,21 +644,76 @@ class RetrainingScheduler:
             "previous_model_version": previous_version,
             "current": current,
             "previous": previous,
+            "comparison_mode": "current_period_and_window_reweighted",
+            "calibration_method_cohorts": current.get(
+                'by_calibration_method', {}
+            ),
         })
-
-        if result["age_hours"] > float(config.get('max_observation_age_hours', 168.0)):
-            result["ready"] = True
-            result["reason"] = "observation_window_closed"
-            return result
 
         min_current = int(config.get('min_current_decided', 40))
         min_previous = int(config.get('min_champion_decided', 80))
-        result["ready"] = (
-            current['decided'] >= min_current
-            and previous['decided'] >= min_previous
-        )
+        current_window_minimums = config.get('min_current_decided_by_window', {})
+        previous_window_minimums = config.get('min_champion_decided_by_window', {})
+        window_maturity = {}
+        current_window_deficits = []
+        previous_window_deficits = []
+        for window in required_windows:
+            current_required = int(
+                current_window_minimums.get(
+                    str(window), current_window_minimums.get(window, 0)
+                )
+                if isinstance(current_window_minimums, dict) else 0
+            )
+            previous_required = int(
+                previous_window_minimums.get(
+                    str(window), previous_window_minimums.get(window, 0)
+                )
+                if isinstance(previous_window_minimums, dict) else 0
+            )
+            current_decided = int(
+                current.get('by_window', {}).get(str(window), {}).get('decided', 0)
+                or 0
+            )
+            previous_decided = int(
+                previous.get('by_window', {}).get(str(window), {}).get('decided', 0)
+                or 0
+            )
+            window_maturity[str(window)] = {
+                'current_decided': current_decided,
+                'current_required': current_required,
+                'champion_decided': previous_decided,
+                'champion_required': previous_required,
+            }
+            if current_decided < current_required:
+                current_window_deficits.append(window)
+            if previous_decided < previous_required:
+                previous_window_deficits.append(window)
+
+        segment_coverage = float(previous.get('segment_coverage', 0.0) or 0.0)
+        min_segment_coverage = float(config.get('min_champion_segment_coverage', 1.0))
+        result['window_maturity'] = window_maturity
+        result['champion_segment_coverage'] = segment_coverage
+        readiness_failures = []
+        if current['decided'] < min_current or previous['decided'] < min_previous:
+            readiness_failures.append('insufficient_mature_labels')
+        if current_window_deficits:
+            readiness_failures.append('insufficient_current_window_maturity')
+        if previous_window_deficits:
+            readiness_failures.append('insufficient_champion_window_maturity')
+        if segment_coverage < min_segment_coverage:
+            readiness_failures.append('insufficient_champion_segment_coverage')
+        result['readiness_failures'] = readiness_failures
+        result["ready"] = not readiness_failures
         if not result["ready"]:
-            result["reason"] = "insufficient_mature_labels"
+            if result["age_hours"] > float(config.get('max_observation_age_hours', 168.0)):
+                result["ready"] = True
+                result["reason"] = "observation_window_closed"
+            elif any('window_maturity' in reason for reason in readiness_failures):
+                result["reason"] = "insufficient_window_maturity"
+            elif 'insufficient_champion_segment_coverage' in readiness_failures:
+                result["reason"] = "insufficient_champion_segment_coverage"
+            else:
+                result["reason"] = "insufficient_mature_labels"
             return result
 
         rate_drop = float(previous['execution_rate'] - current['execution_rate'])
@@ -372,14 +723,110 @@ class RetrainingScheduler:
         ece_bad = current['ece'] is not None and current['ece'] > float(
             config.get('max_ece', 0.15)
         )
-        result["execution_rate_drop"] = rate_drop
-        result["rollback_required"] = (
+        min_value_samples = int(config.get('min_value_samples', min_current))
+        current_premium = current.get('realized_premium_vs_market')
+        previous_premium = previous.get('realized_premium_vs_market')
+        premium_drop = (
+            float(previous_premium - current_premium)
+            if previous_premium is not None and current_premium is not None
+            else None
+        )
+        value_ready = (
+            int(current.get('value_samples', 0) or 0) >= min_value_samples
+            and int(previous.get('value_samples', 0) or 0) >= min_value_samples
+        )
+        value_bad = (
+            value_ready
+            and premium_drop is not None
+            and premium_drop >= float(config.get('min_realized_premium_drop', 0.20))
+        )
+
+        def degraded_groups(
+            current_groups: Dict,
+            previous_groups: Dict,
+            minimum_current: int,
+            minimum_previous: int,
+        ) -> List[Dict]:
+            degraded = []
+            for key, current_group in current_groups.items():
+                previous_group = previous_groups.get(key, {})
+                current_count = int(current_group.get('decided', 0) or 0)
+                previous_count = int(previous_group.get('decided', 0) or 0)
+                current_rate = current_group.get('execution_rate')
+                previous_rate = previous_group.get('execution_rate')
+                if (
+                    current_count < minimum_current
+                    or previous_count < minimum_previous
+                    or current_rate is None
+                    or previous_rate is None
+                ):
+                    continue
+                group_rate_drop = float(previous_rate - current_rate)
+                group_brier_bad = (
+                    current_group.get('brier') is not None
+                    and current_group['brier'] > float(config.get('max_brier', 0.25))
+                )
+                group_ece_bad = (
+                    current_group.get('ece') is not None
+                    and current_group['ece'] > float(config.get('max_ece', 0.15))
+                )
+                if (
+                    group_rate_drop >= float(config.get('min_execution_rate_drop', 0.15))
+                    and (group_brier_bad or group_ece_bad)
+                ):
+                    degraded.append({
+                        'cohort': key,
+                        'current_decided': current_count,
+                        'champion_decided': previous_count,
+                        'current_execution_rate': current_rate,
+                        'champion_execution_rate': previous_rate,
+                        'execution_rate_drop': group_rate_drop,
+                        'brier': current_group.get('brier'),
+                        'ece': current_group.get('ece'),
+                    })
+            return degraded
+
+        degraded_windows = degraded_groups(
+            current.get('by_window', {}),
+            previous.get('by_window', {}),
+            int(config.get('protection_min_current_decided_by_window', 20)),
+            int(config.get('protection_min_champion_decided_by_window', 20)),
+        )
+        degraded_segments = degraded_groups(
+            current.get('by_segment', {}),
+            previous.get('by_segment', {}),
+            int(config.get('protection_min_current_decided_per_segment', 12)),
+            int(config.get('protection_min_champion_decided_per_segment', 12)),
+        )
+        calibration_bad = (
             rate_drop >= float(config.get('min_execution_rate_drop', 0.15))
             and (brier_bad or ece_bad)
         )
+        rollback_reasons = []
+        if calibration_bad:
+            rollback_reasons.append('execution_and_calibration_degraded')
+        if value_bad:
+            rollback_reasons.append('realized_premium_degraded')
+        result["execution_rate_drop"] = rate_drop
+        result['value_gate'] = {
+            'ready': value_ready,
+            'current_realized_premium': current_premium,
+            'champion_realized_premium': previous_premium,
+            'realized_premium_drop': premium_drop,
+            'max_allowed_drop': float(config.get('min_realized_premium_drop', 0.20)),
+            'failed': bool(value_bad),
+        }
+        result['degraded_windows'] = degraded_windows
+        result['degraded_segments'] = degraded_segments
+        result['protection_required'] = bool(degraded_windows or degraded_segments)
+        result['rollback_trigger_reasons'] = rollback_reasons
+        result["rollback_required"] = bool(rollback_reasons)
         result["reason"] = (
             "live_quality_gate_failed"
-            if result["rollback_required"] else "live_quality_gate_passed"
+            if result["rollback_required"]
+            else "live_quality_gate_passed_with_protection"
+            if result['protection_required']
+            else "live_quality_gate_passed"
         )
         return result
 
@@ -398,6 +845,7 @@ class RetrainingScheduler:
             'observation_window_closed',
             'rollback_baseline_restored',
             'live_quality_gate_passed',
+            'live_quality_gate_passed_with_protection',
         }:
             return True, gate
         return False, gate

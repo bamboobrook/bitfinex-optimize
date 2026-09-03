@@ -247,3 +247,36 @@ def test_business_quality_allows_healthy_currency_scoped_state(
     )
 
     assert health_check.check_business_quality() is True
+
+
+def test_business_quality_reports_live_horizon_protection(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "optimal_combination.json").write_text(
+        json.dumps({"status": "success", "stale_data": False}),
+        encoding="utf-8",
+    )
+    status = {
+        "api_online": True,
+        "service_info": {
+            "model_age_days_by_currency": {"fUSD": 1, "fUST": 2},
+            "probability_calibration": {"by_currency": {}},
+            "live_model_gate_by_currency": {
+                "fUSD": {
+                    "rollback_required": False,
+                    "protection_required": True,
+                    "degraded_windows": [{"cohort": "48"}],
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(health_check, "DATA_DIR", str(data_dir))
+    monkeypatch.setattr(
+        health_check,
+        "_api_status_online",
+        lambda: (True, json.dumps(status), 0),
+    )
+
+    assert health_check.check_business_quality() is False

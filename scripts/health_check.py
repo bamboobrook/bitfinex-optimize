@@ -306,6 +306,14 @@ def check_business_quality():
     for currency, gate in (service.get("live_model_gate_by_currency") or {}).items():
         if isinstance(gate, dict) and gate.get("rollback_required") is True:
             issues.append(f"{currency} live gate 要求回滚")
+        elif isinstance(gate, dict) and gate.get("protection_required") is True:
+            windows = ", ".join(
+                str(item.get("cohort"))
+                for item in gate.get("degraded_windows", [])
+                if isinstance(item, dict)
+            )
+            details = f" ({windows})" if windows else ""
+            issues.append(f"{currency} live gate 要求期限保护{details}")
 
     result_path = os.path.join(DATA_DIR, "optimal_combination.json")
     try:

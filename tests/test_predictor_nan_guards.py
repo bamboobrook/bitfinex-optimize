@@ -174,6 +174,24 @@ def test_execution_quote_guard_leaves_recovered_pair_unchanged():
     assert meta["applied"] is False
 
 
+def test_execution_quote_guard_protects_degraded_medium_horizon():
+    predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+    predictor.policy = {"quote_guard": {}}
+
+    guarded, meta = predictor._apply_execution_quote_guard(
+        candidate_rate=7.56,
+        current_rate=5.18,
+        period=20,
+        execution_rate=0.371,
+        avg_rate_gap=3.59,
+        order_count=1107,
+    )
+
+    assert meta["activation_execution_rate"] == pytest.approx(0.45)
+    assert meta["applied"] is True
+    assert guarded < 7.56
+
+
 def test_quote_guard_cohort_uses_active_model_and_beta_smoothing(tmp_path):
     db_path = tmp_path / "cohort.db"
     with sqlite3.connect(db_path) as conn:

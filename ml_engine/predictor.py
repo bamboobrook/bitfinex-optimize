@@ -2272,12 +2272,26 @@ class EnsemblePredictor:
             "rate_before": rate_before,
             "cap": None,
             "allowed_premium_pct": None,
+            "activation_execution_rate": None,
         }
         if not bool(config.get("enabled", True)):
             return rate_before, meta
 
         min_orders = int(config.get("min_order_count", 10))
-        activation_rate = float(config.get("activation_execution_rate", 0.35))
+        default_activation_rate = float(config.get("activation_execution_rate", 0.35))
+        if period >= 60:
+            activation_rate = float(
+                config.get("long_activation_execution_rate", default_activation_rate)
+            )
+        elif period >= 8:
+            activation_rate = float(
+                config.get("medium_activation_execution_rate", 0.45)
+            )
+        else:
+            activation_rate = float(
+                config.get("short_activation_execution_rate", default_activation_rate)
+            )
+        meta["activation_execution_rate"] = activation_rate
         if (
             period <= 2
             or current_rate <= 0
